@@ -1,6 +1,5 @@
 import sounddevice as sd
 import numpy as np
-import sys
 
 fs = 16000
 T = 10
@@ -11,34 +10,29 @@ print("生成白噪声...")
 noise = np.random.randn(fs * T).astype(np.float32) * 0.3
 
 print("播放并录音中...")
-try:
-    rec = sd.playrec(noise, samplerate=fs, channels=1,
-                     blocking=True, device=dev_name)
-except Exception as e:
-    print(f"设备错误: {e}")
-    sys.exit(1)
+# 录制双声道，误差麦克风通常是第二个通道 (ch1)
+rec = sd.playrec(noise, samplerate=fs, channels=2, blocking=True, device=dev_name)
 
-e = rec[:, 0]
+# 检查录音形状
+print(f"录音形状: {rec.shape}")  # 应该是 (fs*T, 2)
 
-# ---------- 对齐长度 ----------
+# 取误差麦克风通道（索引1）
+e = rec[:, 1]
+
+# 对齐长度
 min_len = min(len(noise), len(e))
 noise = noise[:min_len]
 e = e[:min_len]
-
-# 如果录音开头有延迟，可以跳过前 N 个样本（通常不需要）
-# skip = 0  # 若需要可调整，例如 skip = 800 (50ms)
-# noise = noise[skip:]
-# e = e[skip:]
+print(f"对齐后 noise 长度: {len(noise)}, e 长度: {len(e)}")
 
 # 构造矩阵
-if len(noise) <= L:
-    print("录音长度不足，请增加 T 或检查声卡")
-    sys.exit(1)
-
 X = np.array([noise[i:i+L] for i in range(len(noise)-L)]).T
-S_est, residuals, rank, s = np.linalg.lstsq(X, e[:len(noise)-L], rcond=None)
+print(f"X shape: {X.shape}, e shape: {e[:len(noise)-L].shape}")
 
-# 保存头文件
+# 最小二乘辨识
+S_est, *_ = np.linalg.lstsq(X, e[:len(noise)-L], rcond=None)
+
+# 保存系数
 with open('S_coeffs.h', 'w') as f:
     f.write('#ifndef S_COEFFS_H\n#define S_COEFFS_H\n\n')
     f.write(f'#define S_LEN {L}\n')
