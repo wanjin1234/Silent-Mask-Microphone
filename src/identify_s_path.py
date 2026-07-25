@@ -3,8 +3,8 @@ import numpy as np
 import sys
 
 fs = 16000
-T = 10          # 白噪声时长
-L = 64          # 次级路径阶数
+T = 10
+L = 64
 dev_name = "seeed2micvoicec"
 
 print("生成白噪声...")
@@ -18,12 +18,25 @@ except Exception as e:
     print(f"设备错误: {e}")
     sys.exit(1)
 
-e = rec[:, 0]   # 误差麦克风信号
+e = rec[:, 0]
 
-# 最小二乘辨识
-print("计算 S 系数...")
+# ---------- 对齐长度 ----------
+min_len = min(len(noise), len(e))
+noise = noise[:min_len]
+e = e[:min_len]
+
+# 如果录音开头有延迟，可以跳过前 N 个样本（通常不需要）
+# skip = 0  # 若需要可调整，例如 skip = 800 (50ms)
+# noise = noise[skip:]
+# e = e[skip:]
+
+# 构造矩阵
+if len(noise) <= L:
+    print("录音长度不足，请增加 T 或检查声卡")
+    sys.exit(1)
+
 X = np.array([noise[i:i+L] for i in range(len(noise)-L)]).T
-S_est, *_ = np.linalg.lstsq(X, e[:len(noise)-L], rcond=None)
+S_est, residuals, rank, s = np.linalg.lstsq(X, e[:len(noise)-L], rcond=None)
 
 # 保存头文件
 with open('S_coeffs.h', 'w') as f:
