@@ -19,7 +19,7 @@ static float fxl_buf[FILTER_LEN];
 
 // ALSA 设备句柄
 static snd_pcm_t *cap_handle, *play_handle;
-static unsigned int period_size = 64;
+static snd_pcm_uframes_t period_size = 64;
 static unsigned int sample_rate = 16000;
 
 // ---------- 初始化自适应滤波器 ----------
@@ -83,7 +83,7 @@ void audio_setup() {
     snd_pcm_hw_params_set_rate_near(cap_handle, hw_params, &sample_rate, 0);
     snd_pcm_hw_params_set_channels(cap_handle, hw_params, 2);
     snd_pcm_hw_params_set_period_size_near(cap_handle, hw_params, &period_size, 0);
-    unsigned int buffer_size = period_size * 4; // 缓冲区略大，避免 xrun
+    snd_pcm_uframes_t buffer_size = period_size * 4;
     snd_pcm_hw_params_set_buffer_size_near(cap_handle, hw_params, &buffer_size);
     snd_pcm_hw_params(cap_handle, hw_params);
     snd_pcm_hw_params_get_period_size(hw_params, &period_size, 0);
