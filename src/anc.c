@@ -4,6 +4,10 @@
 #include <math.h>
 #include <alsa/asoundlib.h>
 #include "S_coeffs.h"
+#include <stdint.h>
+#include <sys/time.h>
+#include <signal.h>
+
 
 // ---------- 可调参数 ----------
 #define FILTER_LEN  128       // 自适应滤波器阶数
@@ -21,6 +25,41 @@ static float fxl_buf[FILTER_LEN];
 static snd_pcm_t *cap_handle, *play_handle;
 static snd_pcm_uframes_t period_size = 64;
 static unsigned int sample_rate = 16000;
+
+FILE *rec_file = NULL;
+int rec_duration = 10;         // 录制时长（秒）
+int rec_samples_target = 0;   // 目标样本数
+int rec_samples_written = 0;  // 已写入样本数
+struct timeval start_time;    // 程序启动时间
+
+// 写入 WAV 文件头（16kHz, 16bit, mono）
+void write_wav_header(FILE *f, int sample_rate, int num_samples) {
+    int byte_rate = sample_rate * 2;  // 16bit mono
+    int data_size = num_samples * 2;
+    // RIFF header
+    fwrite("RIFF", 1, 4, f);
+    int32_t chunk_size = 36 + data_size;
+    fwrite(&chunk_size, 4, 1, f);
+    fwrite("WAVE", 1, 4, f);
+    // fmt subchunk
+    fwrite("fmt ", 1, 4, f);
+    int32_t subchunk1_size = 16;
+    fwrite(&subchunk1_size, 4, 1, f);
+    int16_t audio_format = 1; // PCM
+    fwrite(&audio_format, 2, 1, f);
+    int16_t num_channels = 1;
+    fwrite(&num_channels, 2, 1, f);
+    fwrite(&sample_rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    int16_t block_align = 2;
+    fwrite(&block_align, 2, 1, f);
+    int16_t bits_per_sample = 16;
+    fwrite(&bits_per_sample, 2, 1, f);
+    // data subchunk
+    fwrite("data", 1, 4, f);
+    fwrite(&data_size, 4, 1, f);
+}
+
 
 // ---------- 初始化自适应滤波器 ----------
 void anc_init() {
@@ -107,14 +146,23 @@ void audio_setup() {
 // ---------- 主函数：实时循环 ----------
 int main() {
     anc_init();
+    gettimeofday(&start_time, NULL);
+rec_samples_target = sample_rate * rec_duration;
+rec_file = fopen("anc_rec.wav", "wb");
+if (rec_file) {
+    // 先预留 WAV 头空间，稍后更新
+    fseek(rec_file, 44, SEEK_SET);
+}
     audio_setup();
 
     short *cap_buf = malloc(period_size * 2 * sizeof(short)); // 双声道输入
     short *play_buf = malloc(period_size * 2 * sizeof(short)); // 双声道输出（左=反相波，右=误差）
 
     printf("ANC 实时降噪已启动，按 Ctrl+C 停止\n");
-
-    while (1) {
+volatile int keep_running = 1;
+void int_handler(int sig) { keep_running = 0; }
+signal(SIGINT, int_handler);
+    while (keep_running) {
         int frames = snd_pcm_readi(cap_handle, cap_buf, period_size);
         if (frames < 0) {
             frames = snd_pcm_recover(cap_handle, frames, 0);
@@ -132,6 +180,11 @@ int main() {
             short right = (short)(err * 32767.0f);
             play_buf[i*2]   = left;
             play_buf[i*2+1] = right;
+            if (rec_file && rec_samples_written < rec_samples_target) {
+    // 写入误差信号（右声道），16bit signed little-endian
+    fwrite(&right, sizeof(short), 1, rec_file);
+    rec_samples_written++;
+}
         }
 
         int written = snd_pcm_writei(play_handle, play_buf, frames);
@@ -139,6 +192,13 @@ int main() {
             snd_pcm_recover(play_handle, written, 0);
         }
     }
+if (rec_file) {
+    // 更新 WAV 头
+    fseek(rec_file, 0, SEEK_SET);
+    write_wav_header(rec_file, sample_rate, rec_samples_written);
+    fclose(rec_file);
+    printf("录音已保存为 anc_rec.wav (%d samples)\n", rec_samples_written);
+}
 
     free(cap_buf);
     free(play_buf);
