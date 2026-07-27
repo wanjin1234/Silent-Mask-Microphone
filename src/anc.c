@@ -102,7 +102,7 @@ float anc_process(float ref, float err) {
     // 6. 限幅并输出反相波
     if (y > 1.0f) y = 1.0f;
     if (y < -1.0f) y = -1.0f;
-    return -y;
+    return y;
 }
 
 // ---------- 设置 ALSA 实时音频 ----------
