@@ -25,20 +25,21 @@ def bluetoothctl_cmd(*args):
 def init_bluetooth():
     """初始化蓝牙：上电、可发现、可配对"""
     print("🔵 初始化蓝牙...")
-    # 先确保蓝牙服务已启动
     subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
     time.sleep(2)
 
-    # 设置名称
-    bluetoothctl_cmd("system-alias", BT_DEVICE_NAME)
-    # 上电
-    bluetoothctl_cmd("power", "on")
-    # 设置代理（自动接受配对）
-    bluetoothctl_cmd("agent", "NoInputNoOutput")
-    bluetoothctl_cmd("default-agent")
-    # 开启发现和配对
-    bluetoothctl_cmd("discoverable", "on")
-    bluetoothctl_cmd("pairable", "on")
+    # 设置名称和上电（这两个可以单独执行，因为会持久化）
+    subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=True)
+    subprocess.run(["bluetoothctl", "power", "on"], check=True)
+
+    # 关键：在同一会话中注册代理并设为默认
+    agent_commands = "agent NoInputNoOutput\ndefault-agent\n"
+    subprocess.run(["bluetoothctl"], input=agent_commands, text=True, check=True)
+
+    # 开启发现和配对（也可以在同一次会话中，但分开更清晰）
+    subprocess.run(["bluetoothctl", "discoverable", "on"], check=True)
+    subprocess.run(["bluetoothctl", "pairable", "on"], check=True)
+
     print("✅ 蓝牙已可被发现，名称：", BT_DEVICE_NAME)
 
 
@@ -75,34 +76,123 @@ def wait_for_connection():
 
 # ========== 音频桥接 ==========
 class AudioBridge:
-    def __init__(self):
-        self.process = None
+    def __init__(self, alsa_device, sample_rate, channels):
+        self.alsa_device = alsa_device
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.link_id = None
+        self.capture_node = None
+
+    def _find_node(self, pattern):
+        """查找匹配 pattern 的 PipeWire 节点名"""
+        try:
+            result = subprocess.run(
+                ["pw-cli", "ls", "Node"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if pattern in line:
+                    # 取该行的最后一列（节点名）
+                    return line.split('"')[1]
+        except Exception as e:
+            print(f"⚠️ 查找节点失败: {e}")
+        return None
+
+    def _find_port(self, node_name, direction):
+        """查找节点的一个端口（capture 或 playback）"""
+        try:
+            # 获取节点 ID
+            result = subprocess.run(
+                ["pw-cli", "info", node_name], capture_output=True, text=True, timeout=5
+            )
+            # 简单解析端口，这里用 pw-link -l 更可靠
+        except:
+            pass
+        # 用 pw-link 列端口并 grep
+        try:
+            result = subprocess.run(
+                ["pw-link", "-l"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if node_name in line and direction in line:
+                    return line.split()[0]
+        except:
+            pass
+        return None
 
     def start(self):
-        """启动 pw-loopback 桥接"""
-        print(f"🔄 启动音频桥接: {RESPEAKER_DEVICE} → 蓝牙 AG")
+        """建立音频桥接"""
+        print("🔄 查找蓝牙输出节点...")
+        # 等待 bluez_output 出现（最多等 10 秒）
+        for _ in range(10):
+            bt_sink = self._find_node("bluez_output")
+            if bt_sink:
+                break
+            time.sleep(1)
+        if not bt_sink:
+            print("❌ 未找到 bluez_output 节点，请确认蓝牙已连接且 HFP-AG 已激活")
+            return
+
+        print(f"✅ 找到蓝牙输出节点: {bt_sink}")
+
+        # 查找 ReSpeaker 节点
+        alsa_node = self._find_node("seeed")
+        if not alsa_node:
+            alsa_node = self._find_node("alsa_input")
+        if not alsa_node:
+            print("❌ 未找到 ReSpeaker 录音节点")
+            return
+
+        print(f"✅ 找到 ReSpeaker 节点: {alsa_node}")
+
+        # 构建连接命令（使用 pw-loopback 更简单，但需要确保 target 正确）
+        # 这里改用 pw-link 直接连接，更可靠
+        try:
+            # 获取两个节点的端口
+            subprocess.run(["pw-link", "-l"], capture_output=True, text=True)
+            # 直接尝试连接（假设端口名规则）
+            capture_port = f"{alsa_node}:capture_1"
+            playback_port = f"{bt_sink}:playback_1"
+
+            print(f"🔗 连接 {capture_port} → {playback_port}")
+            subprocess.run(
+                ["pw-link", capture_port, playback_port],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            print("✅ 音频桥接已建立")
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️ pw-link 连接失败: {e.stderr}")
+            # 备用方案：使用 pw-loopback
+            print("尝试备选方案: pw-loopback")
+            self._start_loopback(bt_sink)
+
+    def _start_loopback(self, bt_sink):
+        """备选：使用 pw-loopback 连接"""
         self.process = subprocess.Popen(
             [
                 "pw-loopback",
                 "--capture-props",
-                f"node.target={RESPEAKER_DEVICE}",
+                f"node.target={self.alsa_device}",
                 "--playback-props",
-                "media.class=Audio/Source",
+                f"node.target={bt_sink}",
                 "--rate",
-                SAMPLE_RATE,
+                str(self.sample_rate),
                 "--channels",
-                CHANNELS,
+                str(self.channels),
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        print(f"🔄 pw-loopback 已启动")
 
     def stop(self):
-        """停止桥接"""
+        """断开桥接"""
         if self.process:
             self.process.terminate()
             self.process.wait()
             print("⏹️ 音频桥接已停止")
+        # 如果用的是 pw-link，则断开连接（可选）
 
 
 # ========== 主循环 ==========
