@@ -25,20 +25,21 @@ def bluetoothctl_cmd(*args):
 def init_bluetooth():
     """初始化蓝牙：上电、可发现、可配对"""
     print("🔵 初始化蓝牙...")
-    # 先确保蓝牙服务已启动
     subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
     time.sleep(2)
 
-    # 设置名称
-    bluetoothctl_cmd("system-alias", BT_DEVICE_NAME)
-    # 上电
-    bluetoothctl_cmd("power", "on")
-    # 设置代理（自动接受配对）
-    bluetoothctl_cmd("agent", "NoInputNoOutput")
-    bluetoothctl_cmd("default-agent")
-    # 开启发现和配对
-    bluetoothctl_cmd("discoverable", "on")
-    bluetoothctl_cmd("pairable", "on")
+    # 设置名称和上电（这两个可以单独执行，因为会持久化）
+    subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=True)
+    subprocess.run(["bluetoothctl", "power", "on"], check=True)
+
+    # 关键：在同一会话中注册代理并设为默认
+    agent_commands = "agent NoInputNoOutput\ndefault-agent\n"
+    subprocess.run(["bluetoothctl"], input=agent_commands, text=True, check=True)
+
+    # 开启发现和配对（也可以在同一次会话中，但分开更清晰）
+    subprocess.run(["bluetoothctl", "discoverable", "on"], check=True)
+    subprocess.run(["bluetoothctl", "pairable", "on"], check=True)
+
     print("✅ 蓝牙已可被发现，名称：", BT_DEVICE_NAME)
 
 
