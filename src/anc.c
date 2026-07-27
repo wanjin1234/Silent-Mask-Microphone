@@ -179,7 +179,8 @@ play_buf[i*2]   = 0;                  // 左声道静音（你的左耳不响）
 play_buf[i*2+1] = anti_out;           // 右声道：反相波
             if (rec_file && rec_samples_written < rec_samples_target) {
     // 写入误差信号（右声道），16bit signed little-endian
-    fwrite(&right, sizeof(short), 1, rec_file);
+    short err_short = (short)(err * 32767.0f);
+fwrite(&err_short, sizeof(short), 1, rec_file);
     rec_samples_written++;
 }
         }
