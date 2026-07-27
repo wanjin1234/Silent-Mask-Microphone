@@ -174,12 +174,9 @@ signal(SIGINT, int_handler);
             float err = cap_buf[i*2+1] / 32768.0f;   // 误差麦克风
             float anti = anc_process(ref, err);
 
-            // 左声道：反相消噪信号
-            short left = (short)(anti * 32767.0f);
-            // 右声道：误差信号（纯净人声）
-            short right = (short)(err * 32767.0f);
-            play_buf[i*2]   = left;
-            play_buf[i*2+1] = right;
+            short anti_out = (short)(anti * 32767.0f);
+play_buf[i*2]   = 0;                  // 左声道静音（你的左耳不响）
+play_buf[i*2+1] = anti_out;           // 右声道：反相波
             if (rec_file && rec_samples_written < rec_samples_target) {
     // 写入误差信号（右声道），16bit signed little-endian
     fwrite(&right, sizeof(short), 1, rec_file);
