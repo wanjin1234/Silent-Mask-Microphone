@@ -111,7 +111,7 @@ void audio_setup() {
     snd_pcm_hw_params_t *hw_params;
 
     // 打开录音设备（双声道）
-    if ((err = snd_pcm_open(&cap_handle, "default", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+    if ((err = snd_pcm_open(&cap_handle, "plughw:seeed2micvoicec", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
         fprintf(stderr, "无法打开录音设备: %s\n", snd_strerror(err));
         exit(1);
     }
@@ -129,7 +129,7 @@ void audio_setup() {
     printf("录音 period_size = %u, buffer_size = %u\n", period_size, buffer_size);
 
     // 打开播放设备（双声道，左：反相波，右：误差信号）
-    if ((err = snd_pcm_open(&play_handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+    if ((err = snd_pcm_open(&play_handle, "plughw:seeed2micvoicec", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
         fprintf(stderr, "无法打开播放设备: %s\n", snd_strerror(err));
         exit(1);
     }
