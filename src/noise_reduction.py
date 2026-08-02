@@ -1,127 +1,109 @@
 """
-实时麦克风降噪演示（基于 RNNoise + CFFI）
-已修复帧不匹配、指针安全、多线程退出等问题。
+实时麦克风降噪（基于 noisereduce）
+纯 Python 实现，无需任何 C 库，树莓派/PC 均可直接运行。
+
+原理：频谱减法（非深度学习），通过采集一段“噪声基线”，
+      从后续音频中减去该噪声的频谱分量，达到降噪效果。
+
 使用前请戴好耳机，避免啸叫。
 """
 
-import threading
+import argparse
 import time
-from collections import deque
 
+import noisereduce as nr
 import numpy as np
 import pyaudio
 
-# 从自定义 CFFI 模块导入
-from rnnoise_cffi import RNNoise
-
 # ========== 参数配置 ==========
-SAMPLE_RATE = 48000  # RNNoise 使用 48kHz
-FRAME_SIZE = 480  # 10ms 帧长（采样点数）
+SAMPLE_RATE = 48000  # 采样率（可改为 16000 以降低计算量）
+FRAME_SIZE = 512  # 每次处理的帧长（采样点数）
+# 512@48kHz ≈ 10.7ms，延迟完全可接受
 CHANNELS = 1  # 单声道
-DEVICE_INDEX_IN = None  # 输入设备索引，None 为系统默认
+NOISE_DURATION = 1.0  # 噪声基线采集时长（秒）
+PROP_DECREASE = 0.85  # 降噪强度：0（无降噪）～ 1（最大降噪）
+# 建议 0.7～0.95，根据噪声环境调整
+STATIONARY = False  # True：稳态噪声（如风扇）；False：非稳态噪声
+DEVICE_INDEX_IN = None  # 输入设备索引（None = 系统默认）
 DEVICE_INDEX_OUT = None  # 输出设备索引
 
-# ========== 初始化 RNNoise ==========
-denoiser = RNNoise()
-denoiser_lock = threading.Lock()  # 线程锁，保护滤镜状态
-
-# ========== 初始化 PyAudio ==========
+# ========== 音频设备初始化 ==========
 p = pyaudio.PyAudio()
 
-# 打印可选设备列表（方便调试）
+# 打印可用设备列表
+print("可用音频设备：")
 for i in range(p.get_device_count()):
     dev = p.get_device_info_by_index(i)
     print(
-        f"{i}: {dev['name']} (in: {dev['maxInputChannels']}, out: {dev['maxOutputChannels']})"
+        f"  {i}: {dev['name']} (输入: {dev['maxInputChannels']}ch, 输出: {dev['maxOutputChannels']}ch)"
     )
 
+# 打开流
 try:
-    # 注意：frames_per_buffer 只是个建议值，实际读取可能返回任意数量
-    stream_in = p.open(
+    stream = p.open(
         format=pyaudio.paInt16,
         channels=CHANNELS,
         rate=SAMPLE_RATE,
         input=True,
-        input_device_index=DEVICE_INDEX_IN,
-        frames_per_buffer=FRAME_SIZE,
-    )
-    stream_out = p.open(
-        format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=SAMPLE_RATE,
         output=True,
+        input_device_index=DEVICE_INDEX_IN,
         output_device_index=DEVICE_INDEX_OUT,
         frames_per_buffer=FRAME_SIZE,
     )
 except Exception as e:
     print(f"音频设备打开失败: {e}")
+    p.terminate()
     exit(1)
 
-print("开始实时降噪，按 Ctrl+C 停止...")
+# ========== 采集噪声基线 ==========
+print(f"\n正在采集 {NOISE_DURATION} 秒环境噪声，请保持安静...")
+noise_frames = []
+num_frames = int(SAMPLE_RATE * NOISE_DURATION / FRAME_SIZE)
+for i in range(num_frames):
+    data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+    noise_frames.append(np.frombuffer(data, dtype=np.int16))
+    # 显示进度
+    if i % 10 == 0:
+        print(f"  采集进度: {i}/{num_frames} 帧", end="\r")
+noise_signal = np.concatenate(noise_frames)
+print(f"\n噪声基线采集完成（共 {len(noise_signal)} 个采样点）")
 
-# 音频帧队列（每个元素是 bytes，长度恰好为 FRAME_SIZE*2 字节）
-audio_in_queue = deque(maxlen=20)
-running = True
+# ========== 实时降噪循环 ==========
+print(f"开始实时降噪（降噪强度={PROP_DECREASE}），按 Ctrl+C 停止...")
+print("请对着麦克风说话，戴上耳机监听效果。")
 
-
-def capture_thread():
-    """音频采集线程：不断读取原始 PCM 数据，按固定帧长切分后入队"""
-    global running
-    buf = b""  # 字节缓冲区，用于拼凑完整帧
-    while running:
-        try:
-            data = stream_in.read(FRAME_SIZE, exception_on_overflow=False)
-            buf += data
-            # 只要缓冲区足够一个完整帧（480 采样点 × 2 字节 = 960 字节），就切出一帧
-            while len(buf) >= FRAME_SIZE * 2:
-                frame = buf[: FRAME_SIZE * 2]
-                buf = buf[FRAME_SIZE * 2 :]
-                audio_in_queue.append(frame)
-        except Exception as e:
-            print(f"采集错误: {e}")
-            break
-
-
-# 启动采集线程
-t = threading.Thread(target=capture_thread, daemon=True)
-t.start()
+# 用于统计的变量
+frame_count = 0
+start_time = time.time()
 
 try:
-    while running:
-        if audio_in_queue:
-            # 从队列取出一帧 bytes
-            frame_bytes = audio_in_queue.popleft()
-        else:
-            time.sleep(0.001)  # 队列空时短暂休眠，避免忙等待
-            continue
+    while True:
+        # 读取一帧音频
+        data = stream.read(FRAME_SIZE, exception_on_overflow=False)
+        audio = np.frombuffer(data, dtype=np.int16)
 
-        # 转换为 float32 数组并归一化
-        audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
-        audio_float = audio_int16.astype(np.float32) / 32768.0
+        # 降噪
+        reduced = nr.reduce_noise(
+            y=audio,
+            y_noise=noise_signal,
+            sr=SAMPLE_RATE,
+            stationary=STATIONARY,
+            prop_decrease=PROP_DECREASE,
+        )
 
-        # 降噪（加锁确保线程安全，尽管当前只有主线程调用）
-        with denoiser_lock:
-            denoised_float = denoiser.filter(audio_float.copy())
+        # 输出降噪后的音频
+        stream.write(reduced.astype(np.int16).tobytes())
 
-        # 转换回 int16 并播放
-        denoised_int16 = (denoised_float * 32767).astype(np.int16)
-        stream_out.write(denoised_int16.tobytes())
+        # 定期打印运行状态
+        frame_count += 1
+        if frame_count % 100 == 0:
+            elapsed = time.time() - start_time
+            print(f"  已运行 {elapsed:.1f} 秒，处理 {frame_count} 帧", end="\r")
 
 except KeyboardInterrupt:
-    print("\n停止降噪...")
-    running = False
+    print("\n\n收到停止信号，正在退出...")
 finally:
-    # 等待采集线程结束
-    t.join(timeout=1)
-
-    # 清理音频资源
-    stream_in.stop_stream()
-    stream_out.stop_stream()
-    stream_in.close()
-    stream_out.close()
+    stream.stop_stream()
+    stream.close()
     p.terminate()
-
-    # 释放 RNNoise 状态（重要！避免段错误）
-    denoiser.close()
-
-    print("资源已释放")
+    print("音频设备已关闭，资源已释放。")
