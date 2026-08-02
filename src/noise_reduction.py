@@ -9,7 +9,8 @@ from collections import deque
 
 import numpy as np
 import pyaudio
-from rnnoise import RNNoise
+
+from rnnoise_cffi import RNNoise
 
 # ========== 参数配置 ==========
 SAMPLE_RATE = 48000  # RNNoise 要求 48kHz（也可以是 16kHz，但需对应训练模型）
