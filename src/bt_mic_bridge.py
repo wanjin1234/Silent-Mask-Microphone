@@ -43,6 +43,8 @@ class DenoiseBTBridge:
         self.running = True
         self.audio_thread = None
         self.noise_signal = None  # 采集的噪声基线
+        self.noise_energy_thresh = None  # 噪声能量阈值
+        self.noise_update_counter = 0
 
     # ---------- 蓝牙管理 ----------
     def start_agent(self):
@@ -88,17 +90,19 @@ class DenoiseBTBridge:
         return None, None
 
     def _capture_noise_baseline(self):
-        """采集环境噪声基线（阻塞调用，几秒钟）"""
-        print(f"正在采集 {NOISE_DURATION} 秒环境噪声，请保持安静...")
+        """采集初始噪声基线，并计算能量阈值"""
+        print(f"正在采集 {NOISE_DURATION} 秒环境噪声...")
         frames = []
         num_frames = int(self.sample_rate * NOISE_DURATION / self.frame_size)
         for i in range(num_frames):
-            data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
+            data = self.stream_in.read(self.frame_size)
             frames.append(np.frombuffer(data, dtype=np.int16))
-            if i % 20 == 0:
-                print(f"  采集进度: {i}/{num_frames} 帧", end="\r")
         self.noise_signal = np.concatenate(frames)
-        print(f"\n噪声基线采集完成（{len(self.noise_signal)} 采样点）")
+        # 计算噪声 RMS 作为 VAD 阈值
+        self.noise_energy_thresh = (
+            np.sqrt(np.mean(self.noise_signal.astype(np.float32) ** 2)) * 1.5
+        )
+        print(f"噪声基线采集完成，能量阈值={self.noise_energy_thresh:.1f}")
 
     def _find_bt_node(self):
         """查找蓝牙输出节点名（bluez_output.*）"""
@@ -117,37 +121,53 @@ class DenoiseBTBridge:
             time.sleep(1)
         return None
 
-    def _audio_processing_loop(self):
-        """
-        音频处理线程：
-        - 从 ReSpeaker 读取帧
-        - 降噪
-        - 写入 pw-cat 的 stdin（即发送到蓝牙）
-        """
-        print("🎤 音频处理线程启动")
-        try:
-            while self.running:
-                data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
-                audio = np.frombuffer(data, dtype=np.int16)
-                # 降噪
-                reduced = nr.reduce_noise(
-                    y=audio,
-                    y_noise=self.noise_signal,
-                    sr=self.sample_rate,
-                    stationary=self.stationary,
-                    prop_decrease=self.prop_decrease,
-                )
-                # 写入 pw-cat 管道
-                try:
-                    self.pwcat_proc.stdin.write(reduced.astype(np.int16).tobytes())
-                    self.pwcat_proc.stdin.flush()
-                except BrokenPipeError:
-                    print("⚠️ pw-cat 管道已关闭，可能蓝牙已断开")
-                    break
-        except Exception as e:
-            print(f"音频处理错误: {e}")
-        finally:
-            print("音频处理线程退出")
+
+def _audio_processing_loop(self):
+    print("🎤 音频处理线程启动")
+    noise_update_frames = []  # 暂存潜在的噪声帧
+    try:
+        while self.running:
+            data = self.stream_in.read(self.frame_size)
+            audio = np.frombuffer(data, dtype=np.int16)
+            # 简单能量 VAD
+            rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+            if rms < self.noise_energy_thresh:
+                # 认为是噪声帧，收集用于更新基线
+                noise_update_frames.append(audio.copy())
+                # 每积累约 0.5 秒（16帧 @ 512/16k ≈ 0.5s）更新一次基线
+                if len(noise_update_frames) >= 16:
+                    new_noise = np.concatenate(noise_update_frames)
+                    # 与旧基线按比例混合（避免突变）
+                    self.noise_signal = (
+                        0.7 * self.noise_signal[-len(new_noise) :] + 0.3 * new_noise
+                    ).astype(np.int16)
+                    noise_update_frames.clear()
+                    self.noise_energy_thresh = (
+                        np.sqrt(np.mean(new_noise.astype(np.float32) ** 2)) * 1.5
+                    )
+            else:
+                # 语音帧，清空积累
+                noise_update_frames.clear()
+            # 降噪（使用当前最新的 noise_signal）
+            reduced = nr.reduce_noise(
+                y=audio,
+                y_noise=self.noise_signal,
+                sr=self.sample_rate,
+                stationary=False,
+                prop_decrease=0.75,
+                n_fft=512,
+                hop_length=128,
+                win_length=512,
+                n_std_thresh_stationary=1.5,
+                freq_mask_smooth_hz=200,
+                time_mask_smooth_ms=50,
+            )
+            self.pwcat_proc.stdin.write(reduced.astype(np.int16).tobytes())
+            self.pwcat_proc.stdin.flush()
+    except Exception as e:
+        print(f"音频处理错误: {e}")
+    finally:
+        print("音频处理线程退出")
 
     # ---------- 桥接控制 ----------
     def start_bridge(self):
