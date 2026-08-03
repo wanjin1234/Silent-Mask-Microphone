@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-树莓派蓝牙麦克风桥接（立体声双声道 + 开机自启动）
-通过 subprocess 调用 bt-agent 和 pw-link 实现
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑
+整合了蓝牙管理、降噪处理、pw-cat 输出。
 """
 
 import atexit
@@ -9,28 +9,44 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
+import noisereduce as nr
+import numpy as np
+import pyaudio
+
 # ========== 配置 ==========
-RESPEAKER_DEVICE = "hw:seeed2micvoicec,0"
-SAMPLE_RATE = "16000"  # 若使用 A2DP 可改为 48000
-CHANNELS = "2"  # 立体声
-BT_DEVICE_NAME = "RaspberryPi-Mic"
-BT_NODE_PATTERN = "bluez_output"  # 若实际为 bluez_input 请修改
+RESPEAKER_DEVICE_NAME = "seeed"  # 用于识别 ReSpeaker 的关键词
+SAMPLE_RATE = 16000  # 16 kHz（HFP 常用，A2DP 也可用 48kHz）
+FRAME_SIZE = 512  # 帧长（@16kHz ≈ 32 ms）
+CHANNELS = 1  # 单声道降噪
+NOISE_DURATION = 2.0  # 噪声基线采集时长（秒）
+PROP_DECREASE = 0.85  # 降噪强度 0~1
+STATIONARY = False  # 非稳态噪声
+BT_DEVICE_NAME = "RaspberryPi-Mic"  # 蓝牙设备名称
+BT_NODE_PATTERN = "bluez_output"  # 蓝牙输出节点标识
 
 
-class AudioBridge:
-    def __init__(self, alsa_device, sample_rate, channels):
-        self.alsa_device = alsa_device
+class DenoiseBTBridge:
+    def __init__(
+        self, sample_rate=16000, frame_size=512, prop_decrease=0.85, stationary=False
+    ):
         self.sample_rate = sample_rate
-        self.channels = int(channels)
-        self.loopback_process = None
-        self.link_count = 0
-        self.agent_process = None  # bt-agent 子进程
+        self.frame_size = frame_size
+        self.prop_decrease = prop_decrease
+        self.stationary = stationary
+        self.agent_process = None
+        self.pyaudio_instance = None
+        self.stream_in = None
+        self.pwcat_proc = None
+        self.running = True
+        self.audio_thread = None
+        self.noise_signal = None  # 采集的噪声基线
 
+    # ---------- 蓝牙管理 ----------
     def start_agent(self):
-        """启动 bt-agent 作为后台配对代理（自动接受配对）"""
-        # 先杀掉可能残留的 bt-agent
+        """启动 bt-agent 作为配对代理（自动接受配对）"""
         subprocess.run(["killall", "bt-agent"], capture_output=True, check=False)
         try:
             self.agent_process = subprocess.Popen(
@@ -54,117 +70,179 @@ class AudioBridge:
         subprocess.run(["bluetoothctl", "pairable", "on"], check=True)
         print(f"✅ 蓝牙已可被发现，名称：{BT_DEVICE_NAME}")
 
-        # 启动配对代理
         self.start_agent()
 
-    def _find_node(self, pattern):
-        """查找 PipeWire 节点名"""
-        try:
-            result = subprocess.run(
-                ["pw-cli", "ls", "Node"], capture_output=True, text=True, timeout=5
-            )
-            for line in result.stdout.splitlines():
-                if pattern in line:
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        return match.group(1)
-        except Exception as e:
-            print(f"⚠️ 查找节点失败: {e}")
+    # ---------- 音频设备与降噪 ----------
+    def _find_respeaker_index(self):
+        """在 PyAudio 中查找 ReSpeaker 输入设备索引"""
+        p = pyaudio.PyAudio()
+        for i in range(p.get_device_count()):
+            dev = p.get_device_info_by_index(i)
+            if (
+                RESPEAKER_DEVICE_NAME in dev["name"].lower()
+                and dev["maxInputChannels"] > 0
+            ):
+                p.terminate()
+                return i, dev
+        p.terminate()
+        return None, None
+
+    def _capture_noise_baseline(self):
+        """采集环境噪声基线（阻塞调用，几秒钟）"""
+        print(f"正在采集 {NOISE_DURATION} 秒环境噪声，请保持安静...")
+        frames = []
+        num_frames = int(self.sample_rate * NOISE_DURATION / self.frame_size)
+        for i in range(num_frames):
+            data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
+            frames.append(np.frombuffer(data, dtype=np.int16))
+            if i % 20 == 0:
+                print(f"  采集进度: {i}/{num_frames} 帧", end="\r")
+        self.noise_signal = np.concatenate(frames)
+        print(f"\n噪声基线采集完成（{len(self.noise_signal)} 采样点）")
+
+    def _find_bt_node(self):
+        """查找蓝牙输出节点名（bluez_output.*）"""
+        for _ in range(10):
+            try:
+                result = subprocess.run(
+                    ["pw-cli", "ls", "Node"], capture_output=True, text=True, timeout=5
+                )
+                for line in result.stdout.splitlines():
+                    if BT_NODE_PATTERN in line:
+                        match = re.search(r'"([^"]+)"', line)
+                        if match:
+                            return match.group(1)
+            except Exception as e:
+                print(f"⚠️ 查找节点失败: {e}")
+            time.sleep(1)
         return None
 
-    def _get_ports(self, node_name, direction):
-        """获取节点端口列表"""
-        ports = []
+    def _audio_processing_loop(self):
+        """
+        音频处理线程：
+        - 从 ReSpeaker 读取帧
+        - 降噪
+        - 写入 pw-cat 的 stdin（即发送到蓝牙）
+        """
+        print("🎤 音频处理线程启动")
         try:
-            result = subprocess.run(
-                ["pw-link", "-l"], capture_output=True, text=True, timeout=5
-            )
-            for line in result.stdout.splitlines():
-                if node_name in line and direction in line:
-                    port_id = line.split()[0]
-                    ports.append(port_id)
-        except Exception as e:
-            print(f"⚠️ 获取端口失败: {e}")
-        return ports
-
-    def start_bridge(self):
-        """建立音频桥接"""
-        print("🔄 查找蓝牙目标节点...")
-        bt_node = None
-        for _ in range(10):
-            bt_node = self._find_node(BT_NODE_PATTERN)
-            if bt_node:
-                break
-            time.sleep(1)
-        if not bt_node:
-            print(f"❌ 未找到包含 '{BT_NODE_PATTERN}' 的节点")
-            return False
-
-        print(f"✅ 蓝牙目标节点: {bt_node}")
-
-        # 查找 ReSpeaker 节点
-        alsa_node = self._find_node("seeed")
-        if not alsa_node:
-            alsa_node = self._find_node("alsa_input")
-        if not alsa_node:
-            print("❌ 未找到 ReSpeaker 录音节点")
-            return False
-
-        print(f"✅ ReSpeaker 节点: {alsa_node}")
-
-        cap_ports = self._get_ports(alsa_node, "capture")
-        pb_ports = self._get_ports(bt_node, "playback")
-        if not cap_ports or not pb_ports:
-            print("❌ 未找到有效端口")
-            return False
-
-        num_channels = min(self.channels, len(cap_ports), len(pb_ports))
-        success = 0
-        for i in range(num_channels):
-            try:
-                subprocess.run(
-                    ["pw-link", cap_ports[i], pb_ports[i]],
-                    check=True,
-                    capture_output=True,
-                    text=True,
+            while self.running:
+                data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
+                audio = np.frombuffer(data, dtype=np.int16)
+                # 降噪
+                reduced = nr.reduce_noise(
+                    y=audio,
+                    y_noise=self.noise_signal,
+                    sr=self.sample_rate,
+                    stationary=self.stationary,
+                    prop_decrease=self.prop_decrease,
                 )
-                print(f"   已连接: {cap_ports[i]} -> {pb_ports[i]}")
-                success += 1
-            except subprocess.CalledProcessError as e:
-                print(f"   ⚠️ 连接失败: {e.stderr.strip()}")
+                # 写入 pw-cat 管道
+                try:
+                    self.pwcat_proc.stdin.write(reduced.astype(np.int16).tobytes())
+                    self.pwcat_proc.stdin.flush()
+                except BrokenPipeError:
+                    print("⚠️ pw-cat 管道已关闭，可能蓝牙已断开")
+                    break
+        except Exception as e:
+            print(f"音频处理错误: {e}")
+        finally:
+            print("音频处理线程退出")
 
-        if success > 0:
-            self.link_count = success
-            print(f"✅ 音频桥接已建立（{success}/{num_channels} 声道）")
-            return True
-        else:
-            # 备选方案：pw-loopback
-            cmd = [
-                "pw-loopback",
-                "--capture-props",
-                f"node.target={self.alsa_device}",
-                "--playback-props",
-                f"node.target={bt_node}",
-                "--rate",
-                str(self.sample_rate),
-                "--channels",
-                str(self.channels),
-            ]
-            try:
-                self.loopback_process = subprocess.Popen(cmd)
-                print("🔄 备选方案 pw-loopback 已启动")
-                return True
-            except Exception as e:
-                print(f"❌ pw-loopback 失败: {e}")
-                return False
+    # ---------- 桥接控制 ----------
+    def start_bridge(self):
+        """建立降噪桥接：采集噪声 → 启动 pw-cat → 启动处理线程"""
+        # 1. 找到蓝牙节点
+        bt_node = self._find_bt_node()
+        if not bt_node:
+            print("❌ 未找到蓝牙输出节点")
+            return False
+        print(f"✅ 蓝牙输出节点: {bt_node}")
+
+        # 2. 打开 ReSpeaker 麦克风
+        p = pyaudio.PyAudio()
+        idx, dev = self._find_respeaker_index()
+        if idx is None:
+            print("❌ 未找到 ReSpeaker 设备")
+            p.terminate()
+            return False
+        print(f"✅ ReSpeaker 设备: {dev['name']} (索引 {idx})")
+
+        try:
+            self.stream_in = p.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=idx,
+                frames_per_buffer=self.frame_size,
+            )
+        except Exception as e:
+            print(f"❌ 无法打开 ReSpeaker 输入流: {e}")
+            p.terminate()
+            return False
+
+        # 3. 采集噪声基线（阻塞，但此时蓝牙刚刚连接，电脑端还没开始接收，所以无妨）
+        self._capture_noise_baseline()
+
+        # 4. 启动 pw-cat，将降噪后数据播放到蓝牙节点
+        cmd = [
+            "pw-cat",
+            "--playback",
+            "--rate",
+            str(self.sample_rate),
+            "--channels",
+            str(CHANNELS),
+            "--format",
+            "s16",
+            "--target",
+            bt_node,
+        ]
+        try:
+            self.pwcat_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"✅ pw-cat 已启动，目标：{bt_node}")
+        except Exception as e:
+            print(f"❌ 启动 pw-cat 失败: {e}")
+            self.stream_in.close()
+            p.terminate()
+            return False
+
+        # 5. 启动音频处理线程
+        self.running = True
+        self.audio_thread = threading.Thread(
+            target=self._audio_processing_loop, daemon=True
+        )
+        self.audio_thread.start()
+
+        print("✅ 降噪桥接已建立！电脑现在收到的是降噪后的麦克风信号。")
+        return True
 
     def stop_bridge(self):
         """停止桥接"""
-        if self.loopback_process and self.loopback_process.poll() is None:
-            self.loopback_process.terminate()
-            self.loopback_process.wait(timeout=2)
-            print("⏹️ pw-loopback 已停止")
-        self.link_count = 0
+        # 告知处理线程停止
+        self.running = False
+        if self.audio_thread and self.audio_thread.is_alive():
+            self.audio_thread.join(timeout=2)
+        # 关闭 pw-cat
+        if self.pwcat_proc and self.pwcat_proc.poll() is None:
+            self.pwcat_proc.stdin.close()
+            self.pwcat_proc.terminate()
+            self.pwcat_proc.wait()
+            print("⏹️ pw-cat 已停止")
+        # 关闭音频输入流
+        if self.stream_in:
+            self.stream_in.stop_stream()
+            self.stream_in.close()
+            self.stream_in = None
+        if self.pyaudio_instance:
+            self.pyaudio_instance.terminate()
+            self.pyaudio_instance = None
+        print("⏹️ 音频桥接已停止")
 
     def cleanup(self):
         """退出清理"""
@@ -177,10 +255,15 @@ class AudioBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派蓝牙麦克风桥接（双声道）")
+    print("树莓派降噪蓝牙麦克风")
     print("=" * 50)
 
-    bridge = AudioBridge(RESPEAKER_DEVICE, SAMPLE_RATE, CHANNELS)
+    bridge = DenoiseBTBridge(
+        sample_rate=SAMPLE_RATE,
+        frame_size=FRAME_SIZE,
+        prop_decrease=PROP_DECREASE,
+        stationary=STATIONARY,
+    )
     atexit.register(bridge.cleanup)
 
     def handle_exit(signum, frame):
@@ -236,7 +319,7 @@ def main():
             print("再次尝试建立桥接...")
             last_addr = None  # 下次循环重试
         else:
-            print("🎤 Windows 现在应该能收到立体声麦克风信号")
+            print("🎤 电脑现在应能收到降噪后的立体声/单声道麦克风信号")
 
 
 if __name__ == "__main__":
