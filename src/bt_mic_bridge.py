@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑
-整合了蓝牙管理、降噪处理、pw-cat 输出。
+降噪引擎：DeepFilterNet2_ll（轻量 AI 模型，实时处理）
+整合了蓝牙管理、音频采集、降噪、pw-cat 输出。
 """
 
 import atexit
@@ -12,41 +13,42 @@ import sys
 import threading
 import time
 
-import noisereduce as nr
+# ---------- AI 降噪核心（替代 noisereduce） ----------
+try:
+    from df import enhance, init_df
+except ImportError:
+    print("请先安装 deepfilternet：pip install deepfilternet")
+    sys.exit(1)
+
 import numpy as np
 import pyaudio
 
 # ========== 配置 ==========
 RESPEAKER_DEVICE_NAME = "seeed"  # 用于识别 ReSpeaker 的关键词
-SAMPLE_RATE = 16000  # 16 kHz（HFP 常用，A2DP 也可用 48kHz）
+SAMPLE_RATE = 16000  # 16 kHz（推荐，性能与效果均衡）
 FRAME_SIZE = 512  # 帧长（@16kHz ≈ 32 ms）
-CHANNELS = 1  # 单声道降噪
-NOISE_DURATION = 2.0  # 噪声基线采集时长（秒）
-PROP_DECREASE = 0.85  # 降噪强度 0~1
-STATIONARY = False  # 非稳态噪声
+CHANNELS = 1  # 单声道
 BT_DEVICE_NAME = "RaspberryPi-Mic"  # 蓝牙设备名称
 BT_NODE_PATTERN = "bluez_output"  # 蓝牙输出节点标识
 
 
 class DenoiseBTBridge:
-    def __init__(
-        self, sample_rate=16000, frame_size=512, prop_decrease=0.85, stationary=False
-    ):
+    def __init__(self, sample_rate=16000, frame_size=512):
         self.sample_rate = sample_rate
         self.frame_size = frame_size
-        self.prop_decrease = prop_decrease
-        self.stationary = stationary
         self.agent_process = None
         self.pyaudio_instance = None
         self.stream_in = None
         self.pwcat_proc = None
         self.running = True
         self.audio_thread = None
-        self.noise_signal = None  # 采集的噪声基线
-        self.noise_energy_thresh = None  # 噪声能量阈值
-        self.noise_update_counter = 0
 
-    # ---------- 蓝牙管理 ----------
+        # ---------- 加载 DeepFilterNet 模型（轻量版，降低 CPU 占用）----------
+        print("正在加载 DeepFilterNet2_ll 降噪模型...")
+        self.df_model, self.df_state, _ = init_df("DeepFilterNet2_ll")
+        print("✅ 模型加载完成，AI 降噪引擎已就绪")
+
+    # ---------- 蓝牙管理（与之前完全一致） ----------
     def start_agent(self):
         """启动 bt-agent 作为配对代理（自动接受配对）"""
         subprocess.run(["killall", "bt-agent"], capture_output=True, check=False)
@@ -74,7 +76,7 @@ class DenoiseBTBridge:
 
         self.start_agent()
 
-    # ---------- 音频设备与降噪 ----------
+    # ---------- 音频设备识别 ----------
     def _find_respeaker_index(self):
         """在 PyAudio 中查找 ReSpeaker 输入设备索引"""
         p = pyaudio.PyAudio()
@@ -88,21 +90,6 @@ class DenoiseBTBridge:
                 return i, dev
         p.terminate()
         return None, None
-
-    def _capture_noise_baseline(self):
-        """采集初始噪声基线，并计算能量阈值"""
-        print(f"正在采集 {NOISE_DURATION} 秒环境噪声...")
-        frames = []
-        num_frames = int(self.sample_rate * NOISE_DURATION / self.frame_size)
-        for i in range(num_frames):
-            data = self.stream_in.read(self.frame_size)
-            frames.append(np.frombuffer(data, dtype=np.int16))
-        self.noise_signal = np.concatenate(frames)
-        # 计算噪声 RMS 作为 VAD 阈值
-        self.noise_energy_thresh = (
-            np.sqrt(np.mean(self.noise_signal.astype(np.float32) ** 2)) * 1.5
-        )
-        print(f"噪声基线采集完成，能量阈值={self.noise_energy_thresh:.1f}")
 
     def _find_bt_node(self):
         """查找蓝牙输出节点名（bluez_output.*）"""
@@ -121,57 +108,37 @@ class DenoiseBTBridge:
             time.sleep(1)
         return None
 
+    # ---------- AI 降噪处理线程 ----------
+    def _audio_processing_loop(self):
+        """实时采集 → DeepFilterNet 降噪 → 写入蓝牙管道"""
+        print("🎤 AI 降噪线程启动（DeepFilterNet）")
+        try:
+            while self.running:
+                # 1. 读取一帧原始 PCM 数据
+                data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
+                audio_int16 = np.frombuffer(data, dtype=np.int16)
 
-def _audio_processing_loop(self):
-    print("🎤 音频处理线程启动")
-    noise_update_frames = []  # 暂存潜在的噪声帧
-    try:
-        while self.running:
-            data = self.stream_in.read(self.frame_size)
-            audio = np.frombuffer(data, dtype=np.int16)
-            # 简单能量 VAD
-            rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-            if rms < self.noise_energy_thresh:
-                # 认为是噪声帧，收集用于更新基线
-                noise_update_frames.append(audio.copy())
-                # 每积累约 0.5 秒（16帧 @ 512/16k ≈ 0.5s）更新一次基线
-                if len(noise_update_frames) >= 16:
-                    new_noise = np.concatenate(noise_update_frames)
-                    # 与旧基线按比例混合（避免突变）
-                    self.noise_signal = (
-                        0.7 * self.noise_signal[-len(new_noise) :] + 0.3 * new_noise
-                    ).astype(np.int16)
-                    noise_update_frames.clear()
-                    self.noise_energy_thresh = (
-                        np.sqrt(np.mean(new_noise.astype(np.float32) ** 2)) * 1.5
-                    )
-            else:
-                # 语音帧，清空积累
-                noise_update_frames.clear()
-            # 降噪（使用当前最新的 noise_signal）
-            reduced = nr.reduce_noise(
-                y=audio,
-                y_noise=self.noise_signal,
-                sr=self.sample_rate,
-                stationary=False,
-                prop_decrease=0.75,
-                n_fft=512,
-                hop_length=128,
-                win_length=512,
-                n_std_thresh_stationary=1.5,
-                freq_mask_smooth_hz=200,
-                time_mask_smooth_ms=50,
-            )
-            self.pwcat_proc.stdin.write(reduced.astype(np.int16).tobytes())
-            self.pwcat_proc.stdin.flush()
-    except Exception as e:
-        print(f"音频处理错误: {e}")
-    finally:
-        print("音频处理线程退出")
+                # 2. 转换为 float32，归一化到 [-1, 1]（DeepFilterNet 要求）
+                audio_float = audio_int16.astype(np.float32) / 32768.0
+
+                # 3. AI 降噪
+                #    enhance() 内部会维护状态，支持连续流式处理
+                enhanced_float = enhance(self.df_model, self.df_state, audio_float)
+
+                # 4. 转回 int16，写入管道送到蓝牙
+                enhanced_int16 = (
+                    (enhanced_float * 32767).clip(-32768, 32767).astype(np.int16)
+                )
+                self.pwcat_proc.stdin.write(enhanced_int16.tobytes())
+                self.pwcat_proc.stdin.flush()
+        except Exception as e:
+            print(f"音频处理错误: {e}")
+        finally:
+            print("音频处理线程退出")
 
     # ---------- 桥接控制 ----------
     def start_bridge(self):
-        """建立降噪桥接：采集噪声 → 启动 pw-cat → 启动处理线程"""
+        """建立降噪桥接：打开麦克风 → 启动 pw-cat → 启动处理线程"""
         # 1. 找到蓝牙节点
         bt_node = self._find_bt_node()
         if not bt_node:
@@ -180,7 +147,8 @@ def _audio_processing_loop(self):
         print(f"✅ 蓝牙输出节点: {bt_node}")
 
         # 2. 打开 ReSpeaker 麦克风
-        p = pyaudio.PyAudio()
+        p = pyaudio.PyAudio()  # 注意：这里实例化后要在退出时释放
+        self.pyaudio_instance = p  # 保存以便后续关闭
         idx, dev = self._find_respeaker_index()
         if idx is None:
             print("❌ 未找到 ReSpeaker 设备")
@@ -202,10 +170,7 @@ def _audio_processing_loop(self):
             p.terminate()
             return False
 
-        # 3. 采集噪声基线（阻塞，但此时蓝牙刚刚连接，电脑端还没开始接收，所以无妨）
-        self._capture_noise_baseline()
-
-        # 4. 启动 pw-cat，将降噪后数据播放到蓝牙节点
+        # 3. 启动 pw-cat，将降噪后数据播放到蓝牙节点
         cmd = [
             "pw-cat",
             "--playback",
@@ -232,29 +197,26 @@ def _audio_processing_loop(self):
             p.terminate()
             return False
 
-        # 5. 启动音频处理线程
+        # 4. 启动音频处理线程（无需噪声基线采集）
         self.running = True
         self.audio_thread = threading.Thread(
             target=self._audio_processing_loop, daemon=True
         )
         self.audio_thread.start()
 
-        print("✅ 降噪桥接已建立！电脑现在收到的是降噪后的麦克风信号。")
+        print("✅ AI 降噪桥接已建立！电脑端收到的是降噪后的清晰语音。")
         return True
 
     def stop_bridge(self):
         """停止桥接"""
-        # 告知处理线程停止
         self.running = False
         if self.audio_thread and self.audio_thread.is_alive():
             self.audio_thread.join(timeout=2)
-        # 关闭 pw-cat
         if self.pwcat_proc and self.pwcat_proc.poll() is None:
             self.pwcat_proc.stdin.close()
             self.pwcat_proc.terminate()
             self.pwcat_proc.wait()
             print("⏹️ pw-cat 已停止")
-        # 关闭音频输入流
         if self.stream_in:
             self.stream_in.stop_stream()
             self.stream_in.close()
@@ -275,15 +237,11 @@ def _audio_processing_loop(self):
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风")
+    print("树莓派降噪蓝牙麦克风（DeepFilterNet AI 版）")
     print("=" * 50)
 
-    bridge = DenoiseBTBridge(
-        sample_rate=SAMPLE_RATE,
-        frame_size=FRAME_SIZE,
-        prop_decrease=PROP_DECREASE,
-        stationary=STATIONARY,
-    )
+    # 初始化桥接对象（只需采样率和帧长，不再需要降噪参数）
+    bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE, frame_size=FRAME_SIZE)
     atexit.register(bridge.cleanup)
 
     def handle_exit(signum, frame):
@@ -300,7 +258,6 @@ def main():
     # 循环监听连接
     last_addr = None
     while True:
-        # 获取当前连接的第一个设备
         try:
             result = subprocess.run(
                 ["bluetoothctl", "devices", "Connected"],
@@ -339,7 +296,7 @@ def main():
             print("再次尝试建立桥接...")
             last_addr = None  # 下次循环重试
         else:
-            print("🎤 电脑现在应能收到降噪后的立体声/单声道麦克风信号")
+            print("🎤 电脑端现在应能收到 AI 降噪后的麦克风信号")
 
 
 if __name__ == "__main__":
