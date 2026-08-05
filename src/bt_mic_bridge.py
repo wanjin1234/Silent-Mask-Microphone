@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑
-版本: v4.0 (稳定版)
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.1
 修复:
-  - webrtcvad 导入错误（需 setuptools<81 或手动修补 webrtcvad.py）
-  - 蓝牙节点检测改用 MAC 地址直接构造，100% 可靠
-  - 集成瞬态噪声抑制与自适应门限
+  - DeepFilterNet enhance 要求 Tensor，添加 numpy → Tensor 转换
+  - 扩大麦克风增益控件搜索范围
+  - 增加更详细的错误日志
+  - 修正 VAD 帧长匹配问题（320 样本 20ms）
 """
 
 import atexit
@@ -19,7 +19,7 @@ import threading
 import time
 from collections import deque
 
-# ---------- AI 降噪 ----------
+# ---------- 降噪引擎 ----------
 try:
     from df import enhance, init_df
 except ImportError:
@@ -28,6 +28,7 @@ except ImportError:
 
 import numpy as np
 import pyaudio
+import torch
 
 # ========== 配置 ==========
 RESPEAKER_DEVICE_NAME = "seeed"
@@ -44,13 +45,13 @@ TRANSIENT_ENERGY_RATIO = 3.0
 TRANSIENT_HIGH_FREQ_RATIO = 0.6
 DEBUG_AUDIO_LEVELS = True
 
-TARGET_MIC_GAIN = 50  # 0-100，建议 40-60
+TARGET_MIC_GAIN = 50  # 0-100
 
 
 class DenoiseBTBridge:
     def __init__(self, sample_rate=16000):
         self.sample_rate = sample_rate
-        self.vad_frame_size = 320  # 20ms@16kHz
+        self.vad_frame_size = 320  # 20ms@16kHz（webrtcvad 要求 10/20/30ms）
         self.frame_size = self.vad_frame_size
         self.channels = CHANNELS
 
@@ -74,8 +75,6 @@ class DenoiseBTBridge:
                 print(f"✅ WebRTC VAD 已启用 (激进度={VAD_AGGRESSIVENESS})")
             except ImportError as e:
                 print(f"❌ webrtcvad 不可用: {e}")
-                print("   修复方法一：pip install 'setuptools<81'")
-                print("   修复方法二：手动编辑 webrtcvad.py 删除 pkg_resources 导入")
                 self.vad = None
 
         # ---------- DeepFilterNet ----------
@@ -125,7 +124,7 @@ class DenoiseBTBridge:
         return None, None
 
     def _find_bt_node(self):
-        """根据已连接蓝牙的 MAC 地址直接构造 PipeWire 节点名（最高可靠性）"""
+        """根据已连接蓝牙的 MAC 地址构造 PipeWire 节点名"""
         print("🔍 查找蓝牙输出节点...")
         try:
             result = subprocess.run(
@@ -138,11 +137,9 @@ class DenoiseBTBridge:
                 parts = line.split()
                 if len(parts) >= 2 and parts[0] == "Device":
                     mac = parts[1]
-                    # PipeWire 节点命名规则：bluez_output.<MAC替换冒号为下划线>.a2dp-sink
                     expected_node = f"bluez_output.{mac.replace(':', '_')}.a2dp-sink"
                     print(f"   预期节点: {expected_node}")
-
-                    # 快速验证：检查 pw-dump 中是否存在（即便不存在也可尝试使用）
+                    # 尝试验证
                     try:
                         data = subprocess.check_output(
                             ["pw-dump"], text=True, timeout=5
@@ -154,10 +151,9 @@ class DenoiseBTBridge:
                             ):
                                 print(f"   ✅ 节点已确认存在")
                                 return expected_node
-                    except Exception as e:
-                        print(f"   pw-dump 验证跳过: {e}")
-
-                    print("   ⚠️ 未通过 pw-dump 验证，但将直接使用构造的节点名")
+                    except Exception:
+                        pass
+                    print("   ⚠️ 将直接使用构造的节点名")
                     return expected_node
             print("   ❌ 未发现已连接的蓝牙设备")
             return None
@@ -165,7 +161,7 @@ class DenoiseBTBridge:
             print(f"   bluetoothctl 查询失败: {e}")
             return None
 
-    # ===================== 麦克风增益 =====================
+    # ===================== 麦克风增益（扩大搜索） =====================
     def _set_mic_gain(self):
         try:
             result = subprocess.run(
@@ -174,15 +170,30 @@ class DenoiseBTBridge:
                 text=True,
                 timeout=5,
             )
+            print("🔍 当前系统所有 ALSA 控件:")
+            print(result.stdout)
             lines = result.stdout.splitlines()
             control_name = None
+            # 扩大关键字匹配范围
+            keywords = [
+                "Mic",
+                "Capture",
+                "PGA",
+                "ADC",
+                "PCM",
+                "Digital",
+                "Master",
+                "Line",
+            ]
             for line in lines:
-                for keyword in ["Mic", "Capture", "PGA", "ADC"]:
-                    if keyword in line:
+                for kw in keywords:
+                    if kw in line:
                         match = re.search(r"'([^']+)'", line)
                         if match:
                             control_name = match.group(1)
-                            break
+                            # 排除明显是播放（Playback）的控件
+                            if "Playback" not in line:
+                                break
                 if control_name:
                     break
             if control_name:
@@ -193,7 +204,9 @@ class DenoiseBTBridge:
                 )
                 print(f"✅ 麦克风增益: {control_name} = {TARGET_MIC_GAIN}%")
             else:
-                print("⚠️ 未找到麦克风增益控件，跳过")
+                print(
+                    "⚠️ 未找到麦克风增益控件，请手动设置（例如 amixer sset 'PCM' 50%）"
+                )
         except Exception as e:
             print(f"⚠️ 设置增益失败: {e}")
 
@@ -275,13 +288,35 @@ class DenoiseBTBridge:
                     self.pwcat_proc.stdin.flush()
                     continue
 
-                # AI 降噪
-                enhanced = enhance(self.df_model, self.df_state, audio_float)
-                enhanced_int16 = (enhanced * 32767).clip(-32768, 32767).astype(np.int16)
+                # ---- AI 降噪（关键修复：转换为 Tensor） ----
+                # DeepFilterNet 要求输入为 (1, T) 形状的 float32 Tensor
+                audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)  # (1, T)
+                enhanced_tensor = enhance(self.df_model, self.df_state, audio_tensor)
+                # 增强后的输出通常也是 (1, T) Tensor，取第一个通道并转为 numpy
+                if isinstance(enhanced_tensor, torch.Tensor):
+                    enhanced_float = enhanced_tensor.squeeze(0).numpy()
+                else:
+                    # 如果返回的已经是 numpy，直接使用
+                    enhanced_float = np.asarray(enhanced_tensor).flatten()
+
+                # 确保长度与原帧一致（增强可能改变长度）
+                if len(enhanced_float) > self.frame_size:
+                    enhanced_float = enhanced_float[: self.frame_size]
+                elif len(enhanced_float) < self.frame_size:
+                    enhanced_float = np.pad(
+                        enhanced_float, (0, self.frame_size - len(enhanced_float))
+                    )
+
+                enhanced_int16 = (
+                    (enhanced_float * 32767).clip(-32768, 32767).astype(np.int16)
+                )
                 self.pwcat_proc.stdin.write(enhanced_int16.tobytes())
                 self.pwcat_proc.stdin.flush()
         except Exception as e:
             print(f"音频处理错误: {e}")
+            import traceback
+
+            traceback.print_exc()
         finally:
             print("音频处理线程退出")
 
@@ -378,7 +413,7 @@ class DenoiseBTBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v4.0")
+    print("树莓派降噪蓝牙麦克风 v4.1")
     print("=" * 50)
 
     bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
