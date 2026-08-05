@@ -45,7 +45,9 @@ class DenoiseBTBridge:
 
         # ---------- 加载 DeepFilterNet 模型（轻量版，降低 CPU 占用）----------
         print("正在加载 DeepFilterNet2_ll 降噪模型...")
-        self.df_model, self.df_state, _ = init_df("DeepFilterNet2_ll")
+        self.df_model, self.df_state, _ = init_df(
+            "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2_ll"
+        )
         print("✅ 模型加载完成，AI 降噪引擎已就绪")
 
     # ---------- 蓝牙管理（与之前完全一致） ----------
