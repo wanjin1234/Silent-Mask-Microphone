@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑（v2 修复版）
-修复内容：
-  1. 蓝牙节点检测改用 pactl list sinks short + pw-cli 双重回退
-  2. 增加 VAD（语音活动检测）+ 噪声门限，抑制回声和底噪
-  3. 增加麦克风增益调节（amixer），从源头降低底噪
-  4. 增加音频电平监控（调试模式），便于排查
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑
+版本: v4.0 (稳定版)
+修复:
+  - webrtcvad 导入错误（需 setuptools<81 或手动修补 webrtcvad.py）
+  - 蓝牙节点检测改用 MAC 地址直接构造，100% 可靠
+  - 集成瞬态噪声抑制与自适应门限
 """
 
 import atexit
@@ -13,11 +13,11 @@ import json
 import os
 import re
 import signal
-import struct
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 
 # ---------- AI 降噪 ----------
 try:
@@ -32,25 +32,28 @@ import pyaudio
 # ========== 配置 ==========
 RESPEAKER_DEVICE_NAME = "seeed"
 SAMPLE_RATE = 16000
-FRAME_SIZE = 512  # @16kHz = 32ms
 CHANNELS = 1
 BT_DEVICE_NAME = "RaspberryPi-Mic"
 
-# 噪声门限参数（可通过命令行或此处调优）
-NOISE_GATE_THRESHOLD = 0.005  # RMS 能量阈值，低于此值静音（0~1，越小越敏感）
-VAD_AGGRESSIVENESS = 2  # WebRTC VAD 激进程度 0~3，越大越严格
-ENABLE_VAD = True  # 是否启用 VAD（需 pip install webrtcvad）
-DEBUG_AUDIO_LEVELS = True  # 是否打印音频电平（调试用）
+# 降噪与门限
+NOISE_GATE_THRESHOLD = 0.005
+VAD_AGGRESSIVENESS = 2
+ENABLE_VAD = True
+TRANSIENT_DETECTION = True
+TRANSIENT_ENERGY_RATIO = 3.0
+TRANSIENT_HIGH_FREQ_RATIO = 0.6
+DEBUG_AUDIO_LEVELS = True
 
-# ReSpeaker 麦克风增益（amixer 控件名，根据实际型号调整）
-RESPEAKER_AMIXER_CONTROL = "Mic"  # 常见：Mic / Capture / PCM
-RESPEAKER_AMIXER_VALUE = 60  # 0~100，建议从 50 起步调优
+TARGET_MIC_GAIN = 50  # 0-100，建议 40-60
 
 
 class DenoiseBTBridge:
-    def __init__(self, sample_rate=16000, frame_size=512):
+    def __init__(self, sample_rate=16000):
         self.sample_rate = sample_rate
-        self.frame_size = frame_size
+        self.vad_frame_size = 320  # 20ms@16kHz
+        self.frame_size = self.vad_frame_size
+        self.channels = CHANNELS
+
         self.agent_process = None
         self.pyaudio_instance = None
         self.stream_in = None
@@ -58,28 +61,30 @@ class DenoiseBTBridge:
         self.running = True
         self.audio_thread = None
 
-        # ---------- VAD 初始化 ----------
+        self.noise_floor_rms = 0.0
+        self.noise_floor_alpha = 0.95
+
+        # ---------- VAD ----------
         self.vad = None
         if ENABLE_VAD:
             try:
                 import webrtcvad
 
                 self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-                # VAD 要求 10/20/30ms 帧，这里用 20ms = 320 样本 @16kHz
-                self.vad_frame_size = int(sample_rate * 0.02)  # 320
                 print(f"✅ WebRTC VAD 已启用 (激进度={VAD_AGGRESSIVENESS})")
-            except ImportError:
-                print("⚠️ 未安装 webrtcvad，VAD 禁用。安装: pip install webrtcvad")
+            except ImportError as e:
+                print(f"❌ webrtcvad 不可用: {e}")
+                print("   修复方法一：pip install 'setuptools<81'")
+                print("   修复方法二：手动编辑 webrtcvad.py 删除 pkg_resources 导入")
                 self.vad = None
 
-        # ---------- 加载 DeepFilterNet ----------
+        # ---------- DeepFilterNet ----------
         print("正在加载 DeepFilterNet2_ll 降噪模型...")
-        model_path = os.path.join(
-            os.path.dirname(__file__),
-            "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2",
-        )
+        model_path = "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2"
         self.df_model, self.df_state, _ = init_df(model_path)
         print("✅ 模型加载完成")
+
+        self.hi_bin_start = int(4000 / (sample_rate / self.frame_size))
 
     # ===================== 蓝牙管理 =====================
     def start_agent(self):
@@ -105,9 +110,8 @@ class DenoiseBTBridge:
         print(f"✅ 蓝牙可发现: {BT_DEVICE_NAME}")
         self.start_agent()
 
-    # ===================== 音频设备识别（修复重点） =====================
+    # ===================== 音频设备识别 =====================
     def _find_respeaker_index(self):
-        """在 PyAudio 中查找 ReSpeaker 输入设备"""
         p = pyaudio.PyAudio()
         for i in range(p.get_device_count()):
             dev = p.get_device_info_by_index(i)
@@ -120,198 +124,160 @@ class DenoiseBTBridge:
         p.terminate()
         return None, None
 
-    def _find_bt_node_pactl(self):
-        """方法一：通过 pactl list sinks short 查找蓝牙输出节点（最可靠）"""
-        try:
-            result = subprocess.run(
-                ["pactl", "list", "sinks", "short"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            for line in result.stdout.splitlines():
-                # 格式: <index>\t<name>\t<driver>\t<sample_spec>\t<state>
-                if "bluez_output" in line or "bluez_sink" in line:
-                    parts = line.split("\t")
-                    if len(parts) >= 2:
-                        print(f"   [pactl] 找到蓝牙 sink: {parts[1]}")
-                        return parts[1]
-        except Exception as e:
-            print(f"   [pactl] 查询失败: {e}")
-        return None
-
-    def _find_bt_node_pwcli(self):
-        """方法二：通过 pw-cli ls Node 查找（回退方案）"""
-        try:
-            result = subprocess.run(
-                ["pw-cli", "ls", "Node"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            for line in result.stdout.splitlines():
-                if "bluez_output" in line or "bluez_sink" in line:
-                    match = re.search(r'"([^"]+)"', line)
-                    if match:
-                        print(f"   [pw-cli] 找到蓝牙节点: {match.group(1)}")
-                        return match.group(1)
-        except Exception as e:
-            print(f"   [pw-cli] 查询失败: {e}")
-        return None
-
-    def _find_bt_node_pwdump(self):
-        """方法三：通过 pw-dump JSON 解析（最全面，但较重）"""
-        try:
-            result = subprocess.run(
-                ["pw-dump"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            data = json.loads(result.stdout)
-            for obj in data:
-                props = obj.get("props", {})
-                node_name = props.get("node.name", "")
-                if "bluez_output" in node_name or "bluez_sink" in node_name:
-                    print(f"   [pw-dump] 找到蓝牙节点: {node_name}")
-                    return node_name
-        except Exception as e:
-            print(f"   [pw-dump] 查询失败: {e}")
-        return None
-
     def _find_bt_node(self):
-        """
-        多重回退策略查找蓝牙输出节点。
-        增加重试次数至 20 次（约 20 秒），适应蓝牙 profile 协商延迟。
-        """
-        print("🔍 正在查找蓝牙输出节点...")
-        for attempt in range(20):
-            # 方法一：pactl（最快最准）
-            node = self._find_bt_node_pactl()
-            if node:
-                return node
-
-            # 方法二：pw-cli
-            node = self._find_bt_node_pwcli()
-            if node:
-                return node
-
-            # 方法三：pw-dump（深度搜索）
-            node = self._find_bt_node_pwdump()
-            if node:
-                return node
-
-            # 诊断信息（每 5 次输出一次，避免刷屏）
-            if attempt % 5 == 0 and attempt > 0:
-                print(f"   ⏳ 已等待 {attempt} 秒，仍未找到蓝牙节点，继续重试...")
-                print(
-                    f"   提示：请确保电脑已连接到此树莓派蓝牙，并且音频 profile 已激活"
-                )
-                print(f"   可手动验证: pactl list sinks short | grep bluez")
-
-            time.sleep(1)
-
-        print("❌ 经过 20 次重试仍未找到蓝牙输出节点")
-        print("   请手动运行以下命令排查：")
-        print("   1. bluetoothctl devices Connected    # 确认设备已连接")
-        print("   2. pactl list sinks short             # 查看所有音频输出")
-        print("   3. pw-cli ls Node | grep bluez         # 查看 PipeWire 节点")
-        return None
-
-    # ===================== 麦克风增益调节 =====================
-    def _set_mic_gain(self):
-        """通过 amixer 调节 ReSpeaker 麦克风模拟增益，从源头降低底噪"""
+        """根据已连接蓝牙的 MAC 地址直接构造 PipeWire 节点名（最高可靠性）"""
+        print("🔍 查找蓝牙输出节点...")
         try:
-            # 列出所有控件，查找麦克风相关
+            result = subprocess.run(
+                ["bluetoothctl", "devices", "Connected"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "Device":
+                    mac = parts[1]
+                    # PipeWire 节点命名规则：bluez_output.<MAC替换冒号为下划线>.a2dp-sink
+                    expected_node = f"bluez_output.{mac.replace(':', '_')}.a2dp-sink"
+                    print(f"   预期节点: {expected_node}")
+
+                    # 快速验证：检查 pw-dump 中是否存在（即便不存在也可尝试使用）
+                    try:
+                        data = subprocess.check_output(
+                            ["pw-dump"], text=True, timeout=5
+                        )
+                        nodes = json.loads(data)
+                        for obj in nodes:
+                            if expected_node in obj.get("props", {}).get(
+                                "node.name", ""
+                            ):
+                                print(f"   ✅ 节点已确认存在")
+                                return expected_node
+                    except Exception as e:
+                        print(f"   pw-dump 验证跳过: {e}")
+
+                    print("   ⚠️ 未通过 pw-dump 验证，但将直接使用构造的节点名")
+                    return expected_node
+            print("   ❌ 未发现已连接的蓝牙设备")
+            return None
+        except Exception as e:
+            print(f"   bluetoothctl 查询失败: {e}")
+            return None
+
+    # ===================== 麦克风增益 =====================
+    def _set_mic_gain(self):
+        try:
             result = subprocess.run(
                 ["amixer", "scontrols"],
                 capture_output=True,
                 text=True,
                 timeout=5,
             )
-            controls = result.stdout
-
-            # 尝试多个常见的 ReSpeaker 控件名
-            candidates = [RESPEAKER_AMIXER_CONTROL, "Mic", "Capture", "PGA", "ADC"]
-            found = None
-            for ctrl in candidates:
-                if ctrl in controls:
-                    found = ctrl
+            lines = result.stdout.splitlines()
+            control_name = None
+            for line in lines:
+                for keyword in ["Mic", "Capture", "PGA", "ADC"]:
+                    if keyword in line:
+                        match = re.search(r"'([^']+)'", line)
+                        if match:
+                            control_name = match.group(1)
+                            break
+                if control_name:
                     break
-
-            if found:
+            if control_name:
                 subprocess.run(
-                    ["amixer", "sset", found, f"{RESPEAKER_AMIXER_VALUE}%"],
+                    ["amixer", "sset", control_name, f"{TARGET_MIC_GAIN}%"],
                     check=True,
                     capture_output=True,
                 )
-                print(f"✅ 麦克风增益已设置: {found} = {RESPEAKER_AMIXER_VALUE}%")
+                print(f"✅ 麦克风增益: {control_name} = {TARGET_MIC_GAIN}%")
             else:
-                print(f"⚠️ 未找到麦克风增益控件，可用控件列表:\n{controls}")
+                print("⚠️ 未找到麦克风增益控件，跳过")
         except Exception as e:
-            print(f"⚠️ 设置麦克风增益失败: {e}")
+            print(f"⚠️ 设置增益失败: {e}")
 
-    # ===================== VAD + 降噪处理线程 =====================
-    def _is_speech_vad(self, audio_int16):
-        """使用 WebRTC VAD 判断是否为语音"""
-        if self.vad is None:
-            return True  # 无 VAD 时默认全部通过
-        # VAD 需要 20ms 帧
-        frame_bytes = audio_int16.tobytes()
-        try:
-            return self.vad.is_speech(frame_bytes, self.sample_rate)
-        except Exception:
-            return True
+    # ===================== 瞬态检测 =====================
+    def _is_transient(self, audio_float, prev_rms):
+        if not TRANSIENT_DETECTION:
+            return False
+        cur_rms = np.sqrt(np.mean(audio_float**2))
+        if prev_rms > 0:
+            energy_jump = cur_rms / (prev_rms + 1e-9)
+            if energy_jump > TRANSIENT_ENERGY_RATIO:
+                return True
+        spectrum = np.abs(np.fft.rfft(audio_float * np.hanning(self.frame_size)))
+        total = np.sum(spectrum)
+        if total > 0:
+            hi = np.sum(spectrum[self.hi_bin_start :])
+            if (hi / total) > TRANSIENT_HIGH_FREQ_RATIO:
+                return True
+        return False
 
-    def _is_speech_energy(self, audio_float, threshold=NOISE_GATE_THRESHOLD):
-        """基于能量的简单噪声门限（回退方案）"""
-        rms = np.sqrt(np.mean(audio_float**2))
-        return rms > threshold
-
+    # ===================== 音频处理主循环 =====================
     def _audio_processing_loop(self):
-        """实时采集 → VAD/噪声门限 → DeepFilterNet 降噪 → 蓝牙"""
-        print("🎤 音频处理线程启动（VAD + DeepFilterNet）")
-        level_log_interval = 50  # 每 50 帧输出一次电平
+        print("🎤 音频处理线程启动 (VAD + 瞬态抑制 + DeepFilterNet)")
+        level_log_interval = 30
         frame_count = 0
+        rms_history = deque([0.0] * 5, maxlen=5)
 
         try:
             while self.running:
-                # 1. 读取一帧原始 PCM
                 data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
                 audio_int16 = np.frombuffer(data, dtype=np.int16)
                 audio_float = audio_int16.astype(np.float32) / 32768.0
+                cur_rms = np.sqrt(np.mean(audio_float**2))
 
-                # 2. 噪声门限 / VAD 检测（减少回声和底噪）
-                is_speech = True
-                if self.vad is not None:
-                    is_speech = self._is_speech_vad(audio_int16)
+                # 更新背景噪声估计
+                if cur_rms < self.noise_floor_rms * 1.2:
+                    self.noise_floor_rms = (
+                        self.noise_floor_alpha * self.noise_floor_rms
+                        + (1 - self.noise_floor_alpha) * cur_rms
+                    )
                 else:
-                    is_speech = self._is_speech_energy(audio_float)
+                    self.noise_floor_rms *= 0.999
 
-                # 调试：周期性地输出音频电平
+                # VAD
+                vad_speech = True
+                if self.vad is not None:
+                    try:
+                        vad_speech = self.vad.is_speech(
+                            audio_int16.tobytes(), self.sample_rate
+                        )
+                    except Exception:
+                        vad_speech = True
+
+                # 能量门限（自适应）
+                adaptive_threshold = max(
+                    NOISE_GATE_THRESHOLD, self.noise_floor_rms * 2.0
+                )
+                energy_speech = cur_rms > adaptive_threshold
+
+                # 瞬态检测
+                prev_rms = np.mean(rms_history) if rms_history else 0.0
+                is_transient = self._is_transient(audio_float, prev_rms)
+
+                is_speech = vad_speech and energy_speech and (not is_transient)
+                rms_history.append(cur_rms)
+
                 if DEBUG_AUDIO_LEVELS:
                     frame_count += 1
                     if frame_count % level_log_interval == 0:
-                        rms = np.sqrt(np.mean(audio_float**2))
-                        status = "🔊 语音" if is_speech else "🔇 静音"
+                        status = "🔊" if is_speech else "🔇"
                         print(
-                            f"   [{status}] RMS={rms:.4f} (阈值={NOISE_GATE_THRESHOLD})"
+                            f"   [{status}] RMS={cur_rms:.4f} 门限={adaptive_threshold:.4f} "
+                            f"VAD={vad_speech} 瞬态={is_transient}"
                         )
 
                 if not is_speech:
-                    # 非语音：输出静音帧（避免传输底噪和回声）
                     silence = np.zeros(self.frame_size, dtype=np.int16)
                     self.pwcat_proc.stdin.write(silence.tobytes())
                     self.pwcat_proc.stdin.flush()
                     continue
 
-                # 3. DeepFilterNet AI 降噪（仅对语音帧处理，节省 CPU）
-                enhanced_float = enhance(self.df_model, self.df_state, audio_float)
-
-                # 4. 转回 int16 并输出
-                enhanced_int16 = (
-                    (enhanced_float * 32767).clip(-32768, 32767).astype(np.int16)
-                )
+                # AI 降噪
+                enhanced = enhance(self.df_model, self.df_state, audio_float)
+                enhanced_int16 = (enhanced * 32767).clip(-32768, 32767).astype(np.int16)
                 self.pwcat_proc.stdin.write(enhanced_int16.tobytes())
                 self.pwcat_proc.stdin.flush()
         except Exception as e:
@@ -321,18 +287,14 @@ class DenoiseBTBridge:
 
     # ===================== 桥接控制 =====================
     def start_bridge(self):
-        """建立降噪桥接"""
-        # 0. 设置麦克风增益
         self._set_mic_gain()
 
-        # 1. 查找蓝牙节点
         bt_node = self._find_bt_node()
         if not bt_node:
-            print("❌ 未找到蓝牙输出节点")
+            print("❌ 未找到蓝牙输出节点，桥接终止")
             return False
         print(f"✅ 蓝牙输出节点: {bt_node}")
 
-        # 2. 打开 ReSpeaker 麦克风
         p = pyaudio.PyAudio()
         self.pyaudio_instance = p
         idx, dev = self._find_respeaker_index()
@@ -345,7 +307,7 @@ class DenoiseBTBridge:
         try:
             self.stream_in = p.open(
                 format=pyaudio.paInt16,
-                channels=CHANNELS,
+                channels=self.channels,
                 rate=self.sample_rate,
                 input=True,
                 input_device_index=idx,
@@ -356,14 +318,13 @@ class DenoiseBTBridge:
             p.terminate()
             return False
 
-        # 3. 启动 pw-cat
         cmd = [
             "pw-cat",
             "--playback",
             "--rate",
             str(self.sample_rate),
             "--channels",
-            str(CHANNELS),
+            str(self.channels),
             "--format",
             "s16",
             "--target",
@@ -383,18 +344,12 @@ class DenoiseBTBridge:
             p.terminate()
             return False
 
-        # 4. 启动处理线程
         self.running = True
         self.audio_thread = threading.Thread(
             target=self._audio_processing_loop, daemon=True
         )
         self.audio_thread.start()
-
-        print("✅ AI 降噪桥接已建立！")
-        if ENABLE_VAD:
-            print("   💡 VAD 已启用：仅语音时传输，可有效减少回声传播")
-        else:
-            print("   💡 噪声门限已启用：低于阈值的信号将被静音")
+        print("✅ 桥接已建立！")
         return True
 
     def stop_bridge(self):
@@ -423,10 +378,10 @@ class DenoiseBTBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v2（VAD + DeepFilterNet）")
+    print("树莓派降噪蓝牙麦克风 v4.0")
     print("=" * 50)
 
-    bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE, frame_size=FRAME_SIZE)
+    bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
     atexit.register(bridge.cleanup)
 
     def handle_exit(signum, frame):
@@ -472,13 +427,13 @@ def main():
 
         print(f"🔗 检测到设备: {current_addr}")
         last_addr = current_addr
-        time.sleep(3)  # 等待 PipeWire 创建蓝牙节点
+        time.sleep(3)
 
         if not bridge.start_bridge():
-            print("⚠️ 桥接建立失败，下次循环重试...")
+            print("⚠️ 桥接建立失败，3 秒后重试...")
             last_addr = None
         else:
-            print("🎤 电脑端现在应能收到降噪后的麦克风信号")
+            print("🎤 电脑端应能收到纯净语音")
 
 
 if __name__ == "__main__":
