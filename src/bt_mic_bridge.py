@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.3
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.4
 修复:
-  - 蓝牙上电采用状态检查循环，彻底解决 Busy/Failed 错误
-  - 抑制 webrtcvad 的 pkg_resources 警告
-  - 所有蓝牙命令容错执行，避免因未就绪导致程序崩溃
+  - pw-cat 崩溃导致 BrokenPipeError，增加进程存活检查与自动重连
+  - 捕获 pw-cat stderr 以便诊断
+  - 抑制 webrtcvad 警告
+  - 蓝牙上电容错
 """
 
 import atexit
@@ -19,10 +20,8 @@ import time
 import warnings
 from collections import deque
 
-# 抑制 webrtcvad 的 pkg_resources 警告
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
-# ---------- 降噪引擎 ----------
 try:
     from df import enhance, init_df
 except ImportError:
@@ -33,7 +32,6 @@ import numpy as np
 import pyaudio
 import torch
 
-# ========== 配置 ==========
 RESPEAKER_DEVICE_NAME = "seeed"
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -62,6 +60,8 @@ class DenoiseBTBridge:
         self.pwcat_proc = None
         self.running = True
         self.audio_thread = None
+        self.bt_node = None  # 保存蓝牙节点名，用于重连
+        self.pwcat_cmd = None  # 保存 pw-cat 命令
 
         self.noise_floor_rms = 0.0
         self.noise_floor_alpha = 0.95
@@ -258,15 +258,71 @@ class DenoiseBTBridge:
                 return True
         return False
 
+    # ===================== pw-cat 管理（自动重连） =====================
+    def _ensure_pwcat_running(self):
+        """检查 pw-cat 是否仍在运行，如果已退出则重新启动"""
+        if self.pwcat_proc is not None and self.pwcat_proc.poll() is not None:
+            # 进程已退出，捕获错误信息
+            out, err = self.pwcat_proc.communicate()  # 获取 stdout/stderr（可能为空）
+            print(f"⚠️ pw-cat 意外退出 (退出码: {self.pwcat_proc.returncode})")
+            if err:
+                print(f"   stderr: {err.decode()}")
+            self.pwcat_proc = None
+
+        if self.pwcat_proc is None and self.bt_node:
+            print("🔄 正在重新启动 pw-cat ...")
+            cmd = [
+                "pw-cat",
+                "--playback",
+                "--rate",
+                str(self.sample_rate),
+                "--channels",
+                str(self.channels),
+                "--format",
+                "s16",
+                "--target",
+                self.bt_node,
+            ]
+            try:
+                # 保留 stderr 以便查看错误
+                self.pwcat_proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,  # 捕获错误输出
+                    bufsize=0,
+                )
+                time.sleep(0.5)  # 给予短暂启动时间
+                if self.pwcat_proc.poll() is not None:
+                    # 立即退出，读取错误
+                    _, err = self.pwcat_proc.communicate()
+                    print(f"❌ pw-cat 启动失败: {err.decode() if err else '未知'}")
+                    self.pwcat_proc = None
+                    return False
+                print("✅ pw-cat 已重新启动")
+                return True
+            except Exception as e:
+                print(f"❌ pw-cat 启动异常: {e}")
+                self.pwcat_proc = None
+                return False
+        return self.pwcat_proc is not None
+
     # ===================== 音频处理主循环 =====================
     def _audio_processing_loop(self):
         print("🎤 音频处理线程启动 (VAD + 瞬态抑制 + DeepFilterNet)")
         level_log_interval = 30
         frame_count = 0
         rms_history = deque([0.0] * 5, maxlen=5)
+        consecutive_pipe_errors = 0
 
         try:
             while self.running:
+                # 确保 pw-cat 进程正常
+                if not self._ensure_pwcat_running():
+                    print("⏳ pw-cat 不可用，等待重试...")
+                    time.sleep(1)
+                    continue
+
                 data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
                 audio_int16 = np.frombuffer(data, dtype=np.int16)
                 audio_float = audio_int16.astype(np.float32) / 32768.0
@@ -310,11 +366,21 @@ class DenoiseBTBridge:
 
                 if not is_speech:
                     silence = np.zeros(self.frame_size, dtype=np.int16)
-                    self.pwcat_proc.stdin.write(silence.tobytes())
-                    self.pwcat_proc.stdin.flush()
+                    try:
+                        self.pwcat_proc.stdin.write(silence.tobytes())
+                        self.pwcat_proc.stdin.flush()
+                        consecutive_pipe_errors = 0
+                    except (BrokenPipeError, OSError):
+                        print("⚠️ 写入静音时管道破裂，标记 pw-cat 已失效")
+                        self.pwcat_proc = None  # 触发重连
+                        consecutive_pipe_errors += 1
+                        if consecutive_pipe_errors > 3:
+                            print("❌ 连续管道错误，退出处理循环")
+                            break
+                        continue
                     continue
 
-                # AI 降噪（Tensor 输入）
+                # AI 降噪
                 audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)
                 enhanced_tensor = enhance(self.df_model, self.df_state, audio_tensor)
                 if isinstance(enhanced_tensor, torch.Tensor):
@@ -332,8 +398,16 @@ class DenoiseBTBridge:
                 enhanced_int16 = (
                     (enhanced_float * 32767).clip(-32768, 32767).astype(np.int16)
                 )
-                self.pwcat_proc.stdin.write(enhanced_int16.tobytes())
-                self.pwcat_proc.stdin.flush()
+                try:
+                    self.pwcat_proc.stdin.write(enhanced_int16.tobytes())
+                    self.pwcat_proc.stdin.flush()
+                    consecutive_pipe_errors = 0
+                except (BrokenPipeError, OSError):
+                    print("⚠️ 写入音频时管道破裂，标记 pw-cat 已失效")
+                    self.pwcat_proc = None
+                    consecutive_pipe_errors += 1
+                    if consecutive_pipe_errors > 3:
+                        break
         except Exception as e:
             print(f"音频处理错误: {e}")
             import traceback
@@ -346,11 +420,11 @@ class DenoiseBTBridge:
     def start_bridge(self):
         self._set_mic_gain()
 
-        bt_node = self._find_bt_node()
-        if not bt_node:
+        self.bt_node = self._find_bt_node()
+        if not self.bt_node:
             print("❌ 未找到蓝牙输出节点，桥接终止")
             return False
-        print(f"✅ 蓝牙输出节点: {bt_node}")
+        print(f"✅ 蓝牙输出节点: {self.bt_node}")
 
         p = pyaudio.PyAudio()
         self.pyaudio_instance = p
@@ -375,28 +449,9 @@ class DenoiseBTBridge:
             p.terminate()
             return False
 
-        cmd = [
-            "pw-cat",
-            "--playback",
-            "--rate",
-            str(self.sample_rate),
-            "--channels",
-            str(self.channels),
-            "--format",
-            "s16",
-            "--target",
-            bt_node,
-        ]
-        try:
-            self.pwcat_proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(f"✅ pw-cat 已启动 → {bt_node}")
-        except Exception as e:
-            print(f"❌ pw-cat 启动失败: {e}")
+        # 第一次启动 pw-cat
+        if not self._ensure_pwcat_running():
+            print("❌ 未能启动 pw-cat，请检查 PipeWire 服务")
             self.stream_in.close()
             p.terminate()
             return False
@@ -435,7 +490,7 @@ class DenoiseBTBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v4.3")
+    print("树莓派降噪蓝牙麦克风 v4.4")
     print("=" * 50)
 
     bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
