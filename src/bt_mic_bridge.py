@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v5.2
-修复 v5.1 找不到 ReSpeaker 的问题：
-  - 不再依赖 PyAudio 宿主内索引，直接全局枚举
-  - 每次查找时新建独立 PyAudio 实例，避免状态污染
-  - 打印完整设备列表用于诊断
-  - 修复管道错误计数器的作用域问题
+树莓派 ReSpeaker 降噪 → 蓝牙输出 v6.0
+完全基于 PipeWire，避免 ALSA 设备冲突。
+使用管道: pw-cat --record -> Python 降噪 -> pw-cat --playback
 """
 
+import argparse
 import atexit
 import json
 import os
@@ -20,7 +18,7 @@ import time
 import warnings
 from collections import deque
 
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+warnings.filterwarnings("ignore")
 
 try:
     from df import enhance, init_df
@@ -29,26 +27,21 @@ except ImportError:
     sys.exit(1)
 
 import numpy as np
-import pyaudio
 import torch
 
 # ====== 可调参数 ======
-RESPEAKER_DEVICE_KEYWORD = "seeed"  # 设备名中包含此关键词
 SAMPLE_RATE = 16000
-CHANNELS = 1  # 单声道
+CHANNELS = 1
+FRAME_SIZE = 320  # 20ms @ 16kHz
 BT_DEVICE_NAME = "RaspberryPi-Mic"
 
 NOISE_GATE_THRESHOLD = 0.005
 VAD_AGGRESSIVENESS = 2
 ENABLE_VAD = True
-TRANSIENT_DETECTION = True
-TRANSIENT_ENERGY_RATIO = 3.0
-TRANSIENT_HIGH_FREQ_RATIO = 0.6
-DEBUG_AUDIO_LEVELS = True
-TARGET_MIC_GAIN = 30
+DEBUG_LEVELS = False  # 设为 True 可查看音频电平
 
 
-def _run_cmd(cmd, timeout=5):
+def run_cmd(cmd, timeout=5):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout
@@ -56,25 +49,13 @@ def _run_cmd(cmd, timeout=5):
         return ""
 
 
-class DenoiseBTBridge:
-    def __init__(self, sample_rate=16000):
-        self.sample_rate = sample_rate
-        self.vad_frame_size = 320
-        self.frame_size = self.vad_frame_size
-        self.channels = CHANNELS
-
-        self.agent_process = None
-        self.pyaudio_instance = None  # 用于打开音频流
-        self.stream_in = None
-        self.pwcat_proc = None
-        self.running = True
-        self.audio_thread = None
-        self.bt_node = None
-        self.respeaker_idx = None
-
-        self.noise_floor_rms = 0.0
-        self.noise_floor_alpha = 0.95
-        self._consecutive_pipe_errors = 0  # 实例级管道错误计数器
+class PipeWireDenoiseBridge:
+    def __init__(self):
+        # 降噪模型
+        print("加载 DeepFilterNet2 模型...")
+        model_path = "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2"
+        self.df_model, self.df_state, _ = init_df(model_path)
+        print("✅ 模型加载完成")
 
         # VAD
         self.vad = None
@@ -83,58 +64,43 @@ class DenoiseBTBridge:
                 import webrtcvad
 
                 self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-                print(f"✅ WebRTC VAD 已启用 (激进度={VAD_AGGRESSIVENESS})")
             except ImportError:
-                print("⚠️ webrtcvad 不可用，VAD 将被禁用")
-                self.vad = None
+                pass
 
-        # DeepFilterNet
-        print("正在加载 DeepFilterNet2_ll 降噪模型...")
-        model_path = "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2"
-        self.df_model, self.df_state, _ = init_df(model_path)
-        print("✅ 模型加载完成")
-        self.hi_bin_start = int(4000 / (sample_rate / self.frame_size))
+        # 进程管理
+        self.rec_proc = None  # pw-cat --record
+        self.play_proc = None  # pw-cat --playback
+        self.agent_proc = None
+        self.running = True
+        self.bt_sink = None
+        self.respeaker_source = None
 
-    # ==================== 蓝牙管理 ====================
-    def start_agent(self):
-        subprocess.run(["killall", "bt-agent"], capture_output=True, check=False)
-        if subprocess.run(["which", "bt-agent"], capture_output=True).returncode != 0:
-            print("❌ bt-agent 未安装，请执行: sudo apt install bluez-tools")
-            return
-        try:
-            self.agent_process = subprocess.Popen(
-                ["bt-agent", "-c", "NoInputNoOutput"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print("✅ bt-agent 配对代理已启动")
-        except Exception as e:
-            print(f"⚠️ 启动 bt-agent 失败: {e}")
-
-    def init_bluetooth(self):
+    # ==================== 蓝牙初始化 ====================
+    def _init_bluetooth(self):
         print("🔵 初始化蓝牙...")
-        subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
+        subprocess.run(
+            ["sudo", "systemctl", "restart", "bluetooth"],
+            check=False,
+            capture_output=True,
+        )
         time.sleep(3)
-        subprocess.run(["sudo", "rfkill", "unblock", "bluetooth"], check=False)
-        subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=False)
+        subprocess.run(
+            ["sudo", "rfkill", "unblock", "bluetooth"], check=False, capture_output=True
+        )
+        subprocess.run(
+            ["bluetoothctl", "system-alias", BT_DEVICE_NAME],
+            check=False,
+            capture_output=True,
+        )
 
-        print("⏳ 等待蓝牙上电...")
-        for attempt in range(20):
-            show = _run_cmd(["bluetoothctl", "show"])
-            if "Powered: yes" in show:
+        for _ in range(10):
+            if "Powered: yes" in run_cmd(["bluetoothctl", "show"]):
                 print("✅ 蓝牙已上电")
                 break
             subprocess.run(
-                ["bluetoothctl", "power", "on"],
-                check=False,
-                capture_output=True,
-                timeout=5,
+                ["bluetoothctl", "power", "on"], check=False, capture_output=True
             )
-            if attempt % 5 == 0:
-                print(f"   重试 {attempt + 1}/20 ...")
             time.sleep(2)
-        else:
-            print("⚠️ 蓝牙未能上电，继续尝试...")
 
         subprocess.run(
             ["bluetoothctl", "discoverable", "on"], check=False, capture_output=True
@@ -142,486 +108,334 @@ class DenoiseBTBridge:
         subprocess.run(
             ["bluetoothctl", "pairable", "on"], check=False, capture_output=True
         )
-        print(f"✅ 蓝牙初始化完成（名称: {BT_DEVICE_NAME}）")
-        self.start_agent()
 
-    # ==================== 音频设备查找（彻底修复） ====================
-    def _find_respeaker_index(self):
-        """
-        每次调用都创建全新的 PyAudio 实例，全局枚举所有设备，
-        打印完整列表，查找 ReSpeaker。
-        """
-        print("🔍 全局扫描音频设备（新建 PyAudio 实例）...")
-        p = pyaudio.PyAudio()
-        found = []
-        target_idx = None
-        for i in range(p.get_device_count()):
-            try:
-                dev = p.get_device_info_by_index(i)
-                name = dev["name"]
-                in_ch = dev["maxInputChannels"]
-                found.append(f"  [{i}] {name} (in={in_ch})")
-                if RESPEAKER_DEVICE_KEYWORD in name.lower() and in_ch > 0:
-                    print(f"   ✅ 找到 ReSpeaker: {name} (索引 {i})")
-                    target_idx = i
-            except Exception as e:
-                found.append(f"  [{i}] 查询异常: {e}")
+        # bt-agent
+        subprocess.run(["killall", "bt-agent"], capture_output=True, check=False)
+        if subprocess.run(["which", "bt-agent"], capture_output=True).returncode == 0:
+            self.agent_proc = subprocess.Popen(
+                ["bt-agent", "-c", "NoInputNoOutput"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print("✅ bt-agent 已启动")
+        else:
+            print("⚠️  bt-agent 未安装 (sudo apt install bluez-tools)")
 
-        # 打印所有设备列表方便诊断
-        print("📋 全部设备列表:")
-        for line in found:
-            print(line)
-
-        p.terminate()
-        return target_idx
-
-    def _wait_a2dp_ready(self, mac, timeout=15):
-        print("⏳ 等待 A2DP 协议激活...")
-        start = time.time()
-        while time.time() - start < timeout:
-            out = _run_cmd(["pactl", "list", "cards"], timeout=5)
-            if "a2dp" in out.lower() and mac.replace(":", "_") in out.replace(":", "_"):
-                print("✅ A2DP 已激活 (pactl)")
-                return True
-            info = _run_cmd(["bluetoothctl", "info", mac], timeout=5)
-            if "Audio Sink" in info or "A2DP" in info:
-                print("✅ A2DP 已激活 (bluetoothctl)")
-                return True
-            time.sleep(1.5)
-        print("⚠️ A2DP 等待超时，仍尝试查找...")
-        return False
-
-    def _find_bt_node(self):
-        print("🔍 查找蓝牙输出节点...")
+    # ==================== 节点查找 ====================
+    def _find_bt_sink(self):
+        """查找蓝牙输出 sink（优先 pactl）"""
+        # 等待 A2DP
         mac = None
-        out = _run_cmd(["bluetoothctl", "devices", "Connected"], timeout=5)
+        out = run_cmd(["bluetoothctl", "devices", "Connected"])
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[0] == "Device":
                 mac = parts[1]
                 break
         if mac:
-            print(f"   已连接设备 MAC: {mac}")
-            self._wait_a2dp_ready(mac)
+            print(f"   已连接 MAC: {mac}")
+            # 等待 A2DP 配置
+            for _ in range(10):
+                if "a2dp" in run_cmd(["pactl", "list", "cards"], 5).lower():
+                    break
+                time.sleep(1)
 
-        for _ in range(15):
-            try:
-                data = subprocess.check_output(["pw-dump"], text=True, timeout=5)
-                try:
-                    nodes = json.loads(data)
-                    for obj in nodes:
-                        props = obj.get("props", {})
-                        name = props.get("node.name", "")
-                        if (
-                            "bluez_output" in name or "bluez_sink" in name
-                        ) and "a2dp" in name.lower():
-                            print(f"   ✅ 找到蓝牙节点: {name}")
-                            return name
-                    for obj in nodes:
-                        props = obj.get("props", {})
-                        name = props.get("node.name", "")
-                        if "bluez_output" in name or "bluez_sink" in name:
-                            print(f"   ✅ 找到蓝牙节点: {name}")
-                            return name
-                except json.JSONDecodeError:
-                    pass
-                matches = re.findall(r'"node\.name":\s*"(bluez_output[^"]+)"', data)
-                if matches:
-                    preferred = [m for m in matches if "a2dp" in m or "sink" in m]
-                    node = (preferred or matches)[0]
-                    print(f"   ✅ 找到蓝牙节点: {node}")
-                    return node
-            except Exception as e:
-                print(f"   pw-dump 失败: {e}")
-            time.sleep(1)
+        # pactl sinks
+        out = run_cmd(["pactl", "list", "short", "sinks"])
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and "bluez" in parts[1]:
+                name = parts[1]
+                print(f"   ✅ 蓝牙 sink: {name}")
+                return name
 
-        print("   尝试 pw-cli ...")
-        out = _run_cmd(["pw-cli", "ls", "Node"], timeout=5)
-        matches = re.findall(r'node\.name\s*=\s*"(bluez_output[^"]+)"', out)
-        if matches:
-            preferred = [m for m in matches if "a2dp" in m]
-            node = (preferred or matches)[0]
-            print(f"   ✅ 找到蓝牙节点: {node}")
-            return node
+        # pw-cli 备用
+        out = run_cmd(["pw-cli", "ls", "Node"])
+        m = re.findall(r'node\.name\s*=\s*"(bluez[^"]+)"', out)
+        for name in m:
+            if "output" in name or "sink" in name:
+                print(f"   ✅ 蓝牙 sink (pw-cli): {name}")
+                return name
 
-        if mac:
-            for suffix in [".1", ".a2dp-sink", ".2", ""]:
-                candidate = f"bluez_output.{mac.replace(':', '_')}{suffix}"
-                info = _run_cmd(["pw-cli", "info", candidate], timeout=3)
-                if "node.name" in info:
-                    print(f"   ✅ 找到蓝牙节点: {candidate}")
-                    return candidate
-
-        print("❌ 未找到蓝牙输出节点")
+        print("❌ 未找到蓝牙输出 sink")
+        print("   请确保电脑已连接并选择为音频输出设备")
         return None
 
-    # ==================== 麦克风增益 ====================
-    def _set_mic_gain(self):
+    def _find_respeaker_source(self):
+        """查找 ReSpeaker 输入节点（PipeWire）"""
+        out = run_cmd(["pw-cli", "ls", "Node"])
+        # 尝试多种正则
+        patterns = [
+            rf'node\.description\s*=\s*"({re.escape("seeed2micvoicec")}[^"]*)"',
+            rf'node\.name\s*=\s*"(alsa_input[^"]*seeed[^"]*)"',
+            rf'node\.name\s*=\s*"(alsa_input[^"]*tlv320aic3x[^"]*)"',
+            rf'node\.description\s*=\s*"(.*ReSpeaker.*)"',
+        ]
+        for pat in patterns:
+            m = re.search(pat, out, re.IGNORECASE)
+            if m:
+                name = m.group(1)
+                # 需要取 node.name 而不是 description
+                # 若匹配到 description，需要再找到对应的 node.name
+                # 简化：我们已经匹配到语句，可模糊提取 node.name
+                # 这里改进：直接获取所有 node.name 并判断是否包含关键词
+                pass
+
+        # 更简单的方法：用 pactl sources
+        out = run_cmd(["pactl", "list", "short", "sources"])
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and "seeed" in parts[1].lower():
+                name = parts[1]
+                print(f"   ✅ ReSpeaker 输入源: {name}")
+                return name
+
+        # 最后用 pw-cli 列出所有节点，选第一个包含 seeed 的
+        lines = out.splitlines()
+        collect = {}
+        current = None
+        for line in lines:
+            if "node.name" in line:
+                m = re.search(r'"([^"]+)"', line)
+                if m:
+                    current = m.group(1)
+                    collect[current] = ""
+            elif "node.description" in line and current:
+                desc = re.search(r'"([^"]+)"', line)
+                if desc:
+                    collect[current] = desc.group(1)
+        for name, desc in collect.items():
+            if "seeed" in desc.lower() or "seeed" in name.lower():
+                print(f"   ✅ ReSpeaker 节点: {name}")
+                return name
+
+        print("❌ 未找到 ReSpeaker 输入节点")
+        print("   请检查驱动：arecord -l 及 pw-cli ls Node | grep -i seeed")
+        return None
+
+    # ==================== 音频处理核心 ====================
+    def _start_pipewire_capture(self, source):
+        """启动 pw-cat --record，捕获指定源，输出到 stdout"""
+        cmd = [
+            "pw-cat",
+            "--record",
+            "--rate",
+            str(SAMPLE_RATE),
+            "--channels",
+            str(CHANNELS),
+            "--format",
+            "s16",
+            "--target",
+            source,
+            "-",
+        ]
+        print(f"🔄 启动录制: {' '.join(cmd)}")
         try:
-            result = subprocess.run(
-                ["amixer", "scontrols"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            self.rec_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            lines = result.stdout.splitlines()
-            control_name = None
-            keywords = [
-                "Mic",
-                "Capture",
-                "PGA",
-                "ADC",
-                "PCM",
-                "Digital",
-                "Master",
-                "Line",
-            ]
-            for line in lines:
-                for kw in keywords:
-                    if kw in line:
-                        match = re.search(r"'([^']+)'", line)
-                        if match:
-                            control_name = match.group(1)
-                            if "Playback" not in line:
-                                break
-                if control_name:
-                    break
-            if control_name:
-                subprocess.run(
-                    ["amixer", "sset", control_name, f"{TARGET_MIC_GAIN}%"],
-                    check=True,
-                    capture_output=True,
-                )
-                print(f"✅ 麦克风增益: {control_name} = {TARGET_MIC_GAIN}%")
-            else:
-                print("⚠️ 未找到麦克风增益控件")
-        except Exception as e:
-            print(f"⚠️ 设置增益失败: {e}")
-
-    # ==================== 瞬态检测 ====================
-    def _is_transient(self, audio_float, prev_rms):
-        if not TRANSIENT_DETECTION:
-            return False
-        cur_rms = np.sqrt(np.mean(audio_float**2))
-        if prev_rms > 0:
-            energy_jump = cur_rms / (prev_rms + 1e-9)
-            if energy_jump > TRANSIENT_ENERGY_RATIO:
-                return True
-        spectrum = np.abs(np.fft.rfft(audio_float * np.hanning(self.frame_size)))
-        total = np.sum(spectrum)
-        if total > 0:
-            hi = np.sum(spectrum[self.hi_bin_start :])
-            if (hi / total) > TRANSIENT_HIGH_FREQ_RATIO:
-                return True
-        return False
-
-    # ==================== pw-cat 管理 ====================
-    def _ensure_pwcat_running(self):
-        if self.pwcat_proc is not None and self.pwcat_proc.poll() is not None:
-            _, err = self.pwcat_proc.communicate()
-            print(f"⚠️ pw-cat 退出 (码={self.pwcat_proc.returncode})")
-            if err:
-                print(f"   stderr: {err.decode()}")
-            self.pwcat_proc = None
-
-        if self.pwcat_proc is None and self.bt_node:
-            print("🔄 启动 pw-cat ...")
-            cmd = [
-                "pw-cat",
-                "--playback",
-                "--rate",
-                str(self.sample_rate),
-                "--channels",
-                str(self.channels),
-                "--format",
-                "s16",
-                "--target",
-                self.bt_node,
-                "-",
-            ]
-            try:
-                self.pwcat_proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                time.sleep(1.5)
-                if self.pwcat_proc.poll() is not None:
-                    _, err = self.pwcat_proc.communicate()
-                    print(f"❌ pw-cat 启动失败: {err.decode() if err else '未知'}")
-                    self.pwcat_proc = None
-                    return False
-                print("✅ pw-cat 已启动")
-                return True
-            except Exception as e:
-                print(f"❌ pw-cat 异常: {e}")
-                self.pwcat_proc = None
+            # 等待开始
+            time.sleep(1)
+            if self.rec_proc.poll() is not None:
+                err = self.rec_proc.stderr.read().decode()
+                print(f"❌ pw-cat 录制失败: {err}")
                 return False
-        return self.pwcat_proc is not None
+            return True
+        except Exception as e:
+            print(f"❌ 无法启动录制: {e}")
+            return False
 
-    # ==================== 音频处理主循环 ====================
-    def _audio_processing_loop(self):
-        print("🎤 音频处理线程启动")
-        level_log_interval = 30
-        frame_count = 0
+    def _start_pipewire_playback(self, sink):
+        """启动 pw-cat --playback，输出到蓝牙 sink"""
+        cmd = [
+            "pw-cat",
+            "--playback",
+            "--rate",
+            str(SAMPLE_RATE),
+            "--channels",
+            str(CHANNELS),
+            "--format",
+            "s16",
+            "--target",
+            sink,
+            "-",
+        ]
+        print(f"🔄 启动播放: {' '.join(cmd)}")
+        try:
+            self.play_proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            time.sleep(1)
+            if self.play_proc.poll() is not None:
+                err = self.play_proc.stderr.read().decode()
+                print(f"❌ pw-cat 播放失败: {err}")
+                return False
+            return True
+        except Exception as e:
+            print(f"❌ 无法启动播放: {e}")
+            return False
+
+    def _process_loop(self):
+        """读取录制数据，降噪，写入播放"""
+        print("🎤 开始降噪处理...")
+        frame_bytes = FRAME_SIZE * CHANNELS * 2  # s16 = 2 bytes
         rms_history = deque([0.0] * 5, maxlen=5)
+        consecutive_errors = 0
 
+        while self.running:
+            # 检查进程健康
+            if self.rec_proc and self.rec_proc.poll() is not None:
+                print("录制进程退出，尝试重启...")
+                if not self._start_pipewire_capture(self.respeaker_source):
+                    break
+            if self.play_proc and self.play_proc.poll() is not None:
+                print("播放进程退出，尝试重启...")
+                if not self._start_pipewire_playback(self.bt_sink):
+                    break
+
+            try:
+                raw = self.rec_proc.stdout.read(frame_bytes)
+                if len(raw) < frame_bytes:
+                    break  # EOF
+            except Exception:
+                break
+
+            # 转为浮点
+            audio_int = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            cur_rms = np.sqrt(np.mean(audio_int**2))
+
+            # 简单 VAD
+            is_speech = True
+            if self.vad:
+                try:
+                    is_speech = self.vad.is_speech(raw, SAMPLE_RATE)
+                except:
+                    pass
+            if cur_rms < NOISE_GATE_THRESHOLD:
+                is_speech = False
+
+            if not is_speech:
+                silence = np.zeros(FRAME_SIZE, dtype=np.int16)
+                self._write_playback(silence.tobytes())
+                continue
+
+            # DeepFilterNet 降噪
+            audio_tensor = torch.from_numpy(audio_int).unsqueeze(0)
+            enhanced = enhance(self.df_model, self.df_state, audio_tensor)
+            if isinstance(enhanced, torch.Tensor):
+                enhanced = enhanced.squeeze(0).numpy()
+            else:
+                enhanced = np.asarray(enhanced).flatten()
+            if len(enhanced) > FRAME_SIZE:
+                enhanced = enhanced[:FRAME_SIZE]
+            elif len(enhanced) < FRAME_SIZE:
+                enhanced = np.pad(enhanced, (0, FRAME_SIZE - len(enhanced)))
+
+            enhanced_int = (enhanced * 32767).clip(-32768, 32767).astype(np.int16)
+            self._write_playback(enhanced_int.tobytes())
+
+        print("处理循环退出")
+
+    def _write_playback(self, data):
         try:
-            while self.running:
-                if not self._ensure_pwcat_running():
-                    time.sleep(2)
-                    continue
-
-                data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
-                audio_int16 = np.frombuffer(data, dtype=np.int16)
-                audio_float = audio_int16.astype(np.float32) / 32768.0
-                cur_rms = np.sqrt(np.mean(audio_float**2))
-
-                if cur_rms < self.noise_floor_rms * 1.2:
-                    self.noise_floor_rms = (
-                        self.noise_floor_alpha * self.noise_floor_rms
-                        + (1 - self.noise_floor_alpha) * cur_rms
-                    )
-                else:
-                    self.noise_floor_rms *= 0.999
-
-                vad_speech = True
-                if self.vad:
-                    try:
-                        vad_speech = self.vad.is_speech(
-                            audio_int16.tobytes(), self.sample_rate
-                        )
-                    except Exception:
-                        vad_speech = True
-
-                adaptive_threshold = max(
-                    NOISE_GATE_THRESHOLD, self.noise_floor_rms * 2.0
-                )
-                energy_speech = cur_rms > adaptive_threshold
-
-                prev_rms = np.mean(rms_history) if rms_history else 0.0
-                is_transient = self._is_transient(audio_float, prev_rms)
-                is_speech = vad_speech and energy_speech and (not is_transient)
-                rms_history.append(cur_rms)
-
-                if DEBUG_AUDIO_LEVELS:
-                    frame_count += 1
-                    if frame_count % level_log_interval == 0:
-                        status = "🔊" if is_speech else "🔇"
-                        print(
-                            f"   [{status}] RMS={cur_rms:.4f} 门限={adaptive_threshold:.4f} "
-                            f"VAD={vad_speech} 瞬态={is_transient}"
-                        )
-
-                if not is_speech:
-                    silence = np.zeros(self.frame_size, dtype=np.int16)
-                    self._write_to_pwcat(silence.tobytes())
-                    continue
-
-                # 降噪处理
-                audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)
-                enhanced_tensor = enhance(self.df_model, self.df_state, audio_tensor)
-                if isinstance(enhanced_tensor, torch.Tensor):
-                    enhanced_float = enhanced_tensor.squeeze(0).numpy()
-                else:
-                    enhanced_float = np.asarray(enhanced_tensor).flatten()
-
-                if len(enhanced_float) > self.frame_size:
-                    enhanced_float = enhanced_float[: self.frame_size]
-                elif len(enhanced_float) < self.frame_size:
-                    enhanced_float = np.pad(
-                        enhanced_float, (0, self.frame_size - len(enhanced_float))
-                    )
-
-                enhanced_int16 = (
-                    (enhanced_float * 32767).clip(-32768, 32767).astype(np.int16)
-                )
-                self._write_to_pwcat(enhanced_int16.tobytes())
-        except Exception as e:
-            print(f"音频处理错误: {e}")
-            import traceback
-
-            traceback.print_exc()
-        finally:
-            print("音频处理线程退出")
-
-    def _write_to_pwcat(self, data_bytes):
-        """写入 pw-cat 并处理管道错误"""
-        try:
-            if self.pwcat_proc and self.pwcat_proc.poll() is None:
-                self.pwcat_proc.stdin.write(data_bytes)
-                self.pwcat_proc.stdin.flush()
-                self._consecutive_pipe_errors = 0
+            self.play_proc.stdin.write(data)
+            self.play_proc.stdin.flush()
         except (BrokenPipeError, OSError):
-            self.pwcat_proc = None
-            self._consecutive_pipe_errors += 1
-            if self._consecutive_pipe_errors > 5:
-                self.running = False
+            print("播放管道断开")
+            self.play_proc = None
 
-    # ==================== 桥接控制 ====================
     def start_bridge(self):
-        self._set_mic_gain()
-
-        self.bt_node = self._find_bt_node()
-        if not self.bt_node:
-            print("❌ 未找到蓝牙输出节点，桥接失败")
+        # 查找节点
+        self.bt_sink = self._find_bt_sink()
+        if not self.bt_sink:
+            return False
+        self.respeaker_source = self._find_respeaker_source()
+        if not self.respeaker_source:
             return False
 
-        # 新建 PyAudio 实例用于音频采集（之前若有则先停掉）
-        if self.pyaudio_instance:
-            self.pyaudio_instance.terminate()
-            self.pyaudio_instance = None
-
-        # 查找 ReSpeaker（使用新的独立实例）
-        idx = self._find_respeaker_index()
-        if idx is None:
-            print("❌ 未找到 ReSpeaker 设备")
-            print(
-                "   请检查: 1) 驱动安装  2) /boot/config.txt 禁用 1-Wire  3) arecord -l 输出"
-            )
+        # 启动录制和播放
+        if not self._start_pipewire_capture(self.respeaker_source):
+            return False
+        if not self._start_pipewire_playback(self.bt_sink):
             return False
 
-        # 用找到的索引打开音频流
-        try:
-            self.pyaudio_instance = pyaudio.PyAudio()
-            self.stream_in = self.pyaudio_instance.open(
-                format=pyaudio.paInt16,
-                channels=self.channels,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=idx,
-                frames_per_buffer=self.frame_size,
-            )
-        except Exception as e:
-            print(f"❌ 无法打开 ReSpeaker 音频流: {e}")
-            if self.pyaudio_instance:
-                self.pyaudio_instance.terminate()
-                self.pyaudio_instance = None
-            return False
-
-        if not self._ensure_pwcat_running():
-            print("❌ 未能启动 pw-cat 播放")
-            self.stream_in.close()
-            self.stream_in = None
-            self.pyaudio_instance.terminate()
-            self.pyaudio_instance = None
-            return False
-
-        self.running = True
-        self._consecutive_pipe_errors = 0
-        self.audio_thread = threading.Thread(
-            target=self._audio_processing_loop, daemon=True
-        )
-        self.audio_thread.start()
-        print("✅ 桥接已建立！")
+        # 启动处理线程
+        self.proc_thread = threading.Thread(target=self._process_loop, daemon=True)
+        self.proc_thread.start()
+        print("✅ 桥接成功！降噪音频正在发送到电脑。")
         return True
 
     def stop_bridge(self):
         self.running = False
-        if self.audio_thread and self.audio_thread.is_alive():
-            self.audio_thread.join(timeout=2)
-        if self.pwcat_proc and self.pwcat_proc.poll() is None:
-            try:
-                self.pwcat_proc.stdin.close()
-            except Exception:
-                pass
-            self.pwcat_proc.terminate()
-            try:
-                self.pwcat_proc.wait(timeout=2)
-            except Exception:
-                self.pwcat_proc.kill()
-            self.pwcat_proc = None
-        if self.stream_in:
-            self.stream_in.stop_stream()
-            self.stream_in.close()
-            self.stream_in = None
-        if self.pyaudio_instance:
-            self.pyaudio_instance.terminate()
-            self.pyaudio_instance = None
-        print("⏹️ 音频桥接已停止")
-
-    def cleanup(self):
-        self.stop_bridge()
-        if self.agent_process:
-            self.agent_process.terminate()
-            try:
-                self.agent_process.wait(timeout=2)
-            except Exception:
-                pass
+        if self.rec_proc:
+            self.rec_proc.terminate()
+        if self.play_proc:
+            self.play_proc.terminate()
+        if self.agent_proc:
+            self.agent_proc.terminate()
+        print("🛑 桥接已停止")
 
 
 def main():
-    print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v5.2")
-    print("=" * 50)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bt-sink", help="手动指定蓝牙 sink 名称")
+    parser.add_argument("--source", help="手动指定 ReSpeaker 输入源名称")
+    args = parser.parse_args()
 
-    # 确保 PipeWire 用户服务运行
-    if subprocess.run(["pgrep", "pipewire"], capture_output=True).returncode != 0:
-        print("⚠️ PipeWire 未运行，尝试启动...")
-        subprocess.run(
-            ["systemctl", "--user", "start", "pipewire", "wireplumber"], check=False
-        )
-        time.sleep(2)
+    bridge = PipeWireDenoiseBridge()
+    atexit.register(bridge.stop_bridge)
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
 
-    bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
-    atexit.register(bridge.cleanup)
+    # 蓝牙初始化
+    bridge._init_bluetooth()
 
-    def handle_exit(signum, frame):
-        print("\n🛑 正在退出...")
-        bridge.cleanup()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-
-    bridge.init_bluetooth()
+    # 如果手动指定节点，覆盖查找
+    if args.bt_sink:
+        bridge.bt_sink = args.bt_sink
+    if args.source:
+        bridge.respeaker_source = args.source
 
     last_addr = None
     fail_count = 0
     while True:
-        try:
-            res = subprocess.run(
-                ["bluetoothctl", "devices", "Connected"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            lines = res.stdout.splitlines()
-            current_addr = None
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == "Device":
-                    current_addr = parts[1]
-                    break
-        except Exception:
-            current_addr = None
+        out = run_cmd(["bluetoothctl", "devices", "Connected"])
+        current_addr = None
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "Device":
+                current_addr = parts[1]
+                break
 
         if not current_addr:
             if last_addr:
-                print(f"🔌 设备 {last_addr} 已断开")
+                print(f"🔌 设备 {last_addr} 断开")
                 bridge.stop_bridge()
                 last_addr = None
-                fail_count = 0
             time.sleep(3)
             continue
 
         if current_addr != last_addr or fail_count > 0:
             if current_addr != last_addr:
-                print(f"🔗 检测到新设备: {current_addr}")
+                print(f"🔗 新连接: {current_addr}")
                 bridge.stop_bridge()
                 last_addr = current_addr
                 fail_count = 0
                 time.sleep(3)
 
             if bridge.start_bridge():
-                print("🎤 电脑端应能收到纯净语音")
                 fail_count = 0
+                # 保持运行，直到断开
+                while last_addr == current_addr:
+                    time.sleep(2)
+                    out2 = run_cmd(["bluetoothctl", "devices", "Connected"])
+                    if current_addr not in out2:
+                        break
+                print("设备断开，重新监听...")
             else:
                 fail_count += 1
                 backoff = min(fail_count * 5, 30)
-                print(f"⚠️ 桥接建立失败 (第 {fail_count} 次)，{backoff} 秒后重试...")
-                bridge.stop_bridge()
+                print(f"桥接失败，{backoff}秒后重试...")
                 time.sleep(backoff)
         else:
             time.sleep(3)
