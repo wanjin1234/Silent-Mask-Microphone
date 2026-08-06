@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.1
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.3
 修复:
-  - DeepFilterNet enhance 要求 Tensor，添加 numpy → Tensor 转换
-  - 扩大麦克风增益控件搜索范围
-  - 增加更详细的错误日志
-  - 修正 VAD 帧长匹配问题（320 样本 20ms）
+  - 蓝牙上电采用状态检查循环，彻底解决 Busy/Failed 错误
+  - 抑制 webrtcvad 的 pkg_resources 警告
+  - 所有蓝牙命令容错执行，避免因未就绪导致程序崩溃
 """
 
 import atexit
@@ -17,7 +16,11 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from collections import deque
+
+# 抑制 webrtcvad 的 pkg_resources 警告
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
 # ---------- 降噪引擎 ----------
 try:
@@ -36,7 +39,6 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BT_DEVICE_NAME = "RaspberryPi-Mic"
 
-# 降噪与门限
 NOISE_GATE_THRESHOLD = 0.005
 VAD_AGGRESSIVENESS = 2
 ENABLE_VAD = True
@@ -44,14 +46,13 @@ TRANSIENT_DETECTION = True
 TRANSIENT_ENERGY_RATIO = 3.0
 TRANSIENT_HIGH_FREQ_RATIO = 0.6
 DEBUG_AUDIO_LEVELS = True
-
-TARGET_MIC_GAIN = 50  # 0-100
+TARGET_MIC_GAIN = 50
 
 
 class DenoiseBTBridge:
     def __init__(self, sample_rate=16000):
         self.sample_rate = sample_rate
-        self.vad_frame_size = 320  # 20ms@16kHz（webrtcvad 要求 10/20/30ms）
+        self.vad_frame_size = 320
         self.frame_size = self.vad_frame_size
         self.channels = CHANNELS
 
@@ -65,7 +66,7 @@ class DenoiseBTBridge:
         self.noise_floor_rms = 0.0
         self.noise_floor_alpha = 0.95
 
-        # ---------- VAD ----------
+        # VAD
         self.vad = None
         if ENABLE_VAD:
             try:
@@ -77,12 +78,11 @@ class DenoiseBTBridge:
                 print(f"❌ webrtcvad 不可用: {e}")
                 self.vad = None
 
-        # ---------- DeepFilterNet ----------
+        # DeepFilterNet
         print("正在加载 DeepFilterNet2_ll 降噪模型...")
         model_path = "/home/wanjin1234/.pyenv/versions/3.10.14/lib/python3.10/site-packages/pretrained_models/DeepFilterNet2"
         self.df_model, self.df_state, _ = init_df(model_path)
         print("✅ 模型加载完成")
-
         self.hi_bin_start = int(4000 / (sample_rate / self.frame_size))
 
     # ===================== 蓝牙管理 =====================
@@ -101,38 +101,49 @@ class DenoiseBTBridge:
     def init_bluetooth(self):
         print("🔵 初始化蓝牙...")
         subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
-        time.sleep(3)  # 增加等待时间
-        # 确保蓝牙不被 rfkill 阻塞
+        time.sleep(3)
         subprocess.run(["sudo", "rfkill", "unblock", "bluetooth"], check=False)
-        # 设置别名
-        subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=True)
-        # 带重试的 power on
-        for attempt in range(5):
+
+        subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=False)
+
+        print("⏳ 等待蓝牙上电...")
+        for attempt in range(15):
             try:
-                subprocess.run(
-                    ["bluetoothctl", "power", "on"],
-                    check=True,
+                show = subprocess.run(
+                    ["bluetoothctl", "show"],
                     capture_output=True,
                     text=True,
                     timeout=5,
                 )
-                print("✅ 蓝牙已上电")
-                break
-            except subprocess.CalledProcessError as e:
-                error_msg = e.stderr if e.stderr else e.stdout
-                if "Busy" in error_msg:
-                    print(f"⏳ 蓝牙适配器繁忙，重试 {attempt + 1}/5 ...")
-                    time.sleep(2)
-                else:
-                    print(f"⚠️ power on 失败: {error_msg.strip()}")
-                    raise  # 其他错误直接抛出
+                if "Powered: yes" in show.stdout:
+                    print("✅ 蓝牙已上电")
+                    break
+            except Exception:
+                pass
+
+            try:
+                subprocess.run(
+                    ["bluetoothctl", "power", "on"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+            print(f"   ⏳ 仍未上电，重试 {attempt + 1}/15 ...")
+            time.sleep(2)
         else:
-            print("❌ 蓝牙上电失败，请检查蓝牙适配器状态（rfkill list）")
-            # 不终止程序，允许后续 continue 重试
-        # 可发现、可配对
-        subprocess.run(["bluetoothctl", "discoverable", "on"], check=True)
-        subprocess.run(["bluetoothctl", "pairable", "on"], check=True)
-        print(f"✅ 蓝牙可发现: {BT_DEVICE_NAME}")
+            print("⚠️ 蓝牙最终未能上电，但继续尝试其他设置")
+
+        subprocess.run(
+            ["bluetoothctl", "discoverable", "on"], check=False, capture_output=True
+        )
+        subprocess.run(
+            ["bluetoothctl", "pairable", "on"], check=False, capture_output=True
+        )
+        print(f"✅ 蓝牙初始化完成（名称: {BT_DEVICE_NAME}）")
         self.start_agent()
 
     # ===================== 音频设备识别 =====================
@@ -150,7 +161,6 @@ class DenoiseBTBridge:
         return None, None
 
     def _find_bt_node(self):
-        """根据已连接蓝牙的 MAC 地址构造 PipeWire 节点名"""
         print("🔍 查找蓝牙输出节点...")
         try:
             result = subprocess.run(
@@ -165,7 +175,6 @@ class DenoiseBTBridge:
                     mac = parts[1]
                     expected_node = f"bluez_output.{mac.replace(':', '_')}.a2dp-sink"
                     print(f"   预期节点: {expected_node}")
-                    # 尝试验证
                     try:
                         data = subprocess.check_output(
                             ["pw-dump"], text=True, timeout=5
@@ -175,7 +184,7 @@ class DenoiseBTBridge:
                             if expected_node in obj.get("props", {}).get(
                                 "node.name", ""
                             ):
-                                print(f"   ✅ 节点已确认存在")
+                                print("   ✅ 节点已确认存在")
                                 return expected_node
                     except Exception:
                         pass
@@ -187,7 +196,7 @@ class DenoiseBTBridge:
             print(f"   bluetoothctl 查询失败: {e}")
             return None
 
-    # ===================== 麦克风增益（扩大搜索） =====================
+    # ===================== 麦克风增益 =====================
     def _set_mic_gain(self):
         try:
             result = subprocess.run(
@@ -200,7 +209,6 @@ class DenoiseBTBridge:
             print(result.stdout)
             lines = result.stdout.splitlines()
             control_name = None
-            # 扩大关键字匹配范围
             keywords = [
                 "Mic",
                 "Capture",
@@ -217,7 +225,6 @@ class DenoiseBTBridge:
                         match = re.search(r"'([^']+)'", line)
                         if match:
                             control_name = match.group(1)
-                            # 排除明显是播放（Playback）的控件
                             if "Playback" not in line:
                                 break
                 if control_name:
@@ -230,9 +237,7 @@ class DenoiseBTBridge:
                 )
                 print(f"✅ 麦克风增益: {control_name} = {TARGET_MIC_GAIN}%")
             else:
-                print(
-                    "⚠️ 未找到麦克风增益控件，请手动设置（例如 amixer sset 'PCM' 50%）"
-                )
+                print("⚠️ 未找到麦克风增益控件，请手动设置")
         except Exception as e:
             print(f"⚠️ 设置增益失败: {e}")
 
@@ -267,7 +272,6 @@ class DenoiseBTBridge:
                 audio_float = audio_int16.astype(np.float32) / 32768.0
                 cur_rms = np.sqrt(np.mean(audio_float**2))
 
-                # 更新背景噪声估计
                 if cur_rms < self.noise_floor_rms * 1.2:
                     self.noise_floor_rms = (
                         self.noise_floor_alpha * self.noise_floor_rms
@@ -276,7 +280,6 @@ class DenoiseBTBridge:
                 else:
                     self.noise_floor_rms *= 0.999
 
-                # VAD
                 vad_speech = True
                 if self.vad is not None:
                     try:
@@ -286,16 +289,13 @@ class DenoiseBTBridge:
                     except Exception:
                         vad_speech = True
 
-                # 能量门限（自适应）
                 adaptive_threshold = max(
                     NOISE_GATE_THRESHOLD, self.noise_floor_rms * 2.0
                 )
                 energy_speech = cur_rms > adaptive_threshold
 
-                # 瞬态检测
                 prev_rms = np.mean(rms_history) if rms_history else 0.0
                 is_transient = self._is_transient(audio_float, prev_rms)
-
                 is_speech = vad_speech and energy_speech and (not is_transient)
                 rms_history.append(cur_rms)
 
@@ -314,18 +314,14 @@ class DenoiseBTBridge:
                     self.pwcat_proc.stdin.flush()
                     continue
 
-                # ---- AI 降噪（关键修复：转换为 Tensor） ----
-                # DeepFilterNet 要求输入为 (1, T) 形状的 float32 Tensor
-                audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)  # (1, T)
+                # AI 降噪（Tensor 输入）
+                audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)
                 enhanced_tensor = enhance(self.df_model, self.df_state, audio_tensor)
-                # 增强后的输出通常也是 (1, T) Tensor，取第一个通道并转为 numpy
                 if isinstance(enhanced_tensor, torch.Tensor):
                     enhanced_float = enhanced_tensor.squeeze(0).numpy()
                 else:
-                    # 如果返回的已经是 numpy，直接使用
                     enhanced_float = np.asarray(enhanced_tensor).flatten()
 
-                # 确保长度与原帧一致（增强可能改变长度）
                 if len(enhanced_float) > self.frame_size:
                     enhanced_float = enhanced_float[: self.frame_size]
                 elif len(enhanced_float) < self.frame_size:
@@ -439,7 +435,7 @@ class DenoiseBTBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v4.1")
+    print("树莓派降噪蓝牙麦克风 v4.3")
     print("=" * 50)
 
     bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
