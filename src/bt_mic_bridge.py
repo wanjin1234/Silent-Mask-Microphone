@@ -101,9 +101,35 @@ class DenoiseBTBridge:
     def init_bluetooth(self):
         print("🔵 初始化蓝牙...")
         subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
-        time.sleep(2)
+        time.sleep(3)  # 增加等待时间
+        # 确保蓝牙不被 rfkill 阻塞
+        subprocess.run(["sudo", "rfkill", "unblock", "bluetooth"], check=False)
+        # 设置别名
         subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=True)
-        subprocess.run(["bluetoothctl", "power", "on"], check=True)
+        # 带重试的 power on
+        for attempt in range(5):
+            try:
+                subprocess.run(
+                    ["bluetoothctl", "power", "on"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                print("✅ 蓝牙已上电")
+                break
+            except subprocess.CalledProcessError as e:
+                error_msg = e.stderr if e.stderr else e.stdout
+                if "Busy" in error_msg:
+                    print(f"⏳ 蓝牙适配器繁忙，重试 {attempt + 1}/5 ...")
+                    time.sleep(2)
+                else:
+                    print(f"⚠️ power on 失败: {error_msg.strip()}")
+                    raise  # 其他错误直接抛出
+        else:
+            print("❌ 蓝牙上电失败，请检查蓝牙适配器状态（rfkill list）")
+            # 不终止程序，允许后续 continue 重试
+        # 可发现、可配对
         subprocess.run(["bluetoothctl", "discoverable", "on"], check=True)
         subprocess.run(["bluetoothctl", "pairable", "on"], check=True)
         print(f"✅ 蓝牙可发现: {BT_DEVICE_NAME}")
