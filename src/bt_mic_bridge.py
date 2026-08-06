@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.4
+树莓派 ReSpeaker 降噪 → 蓝牙输出到电脑 v4.6
 修复:
-  - pw-cat 崩溃导致 BrokenPipeError，增加进程存活检查与自动重连
-  - 捕获 pw-cat stderr 以便诊断
-  - 抑制 webrtcvad 警告
-  - 蓝牙上电容错
+  - 从 pw-dump 获取真实的节点名（支持 .N 后缀）
+  - pw-cat 添加缺失的 '-' 参数（从 stdin 读取）
+  - 增加更详细的 pw-cat 启动日志
 """
 
 import atexit
@@ -60,8 +59,7 @@ class DenoiseBTBridge:
         self.pwcat_proc = None
         self.running = True
         self.audio_thread = None
-        self.bt_node = None  # 保存蓝牙节点名，用于重连
-        self.pwcat_cmd = None  # 保存 pw-cat 命令
+        self.bt_node = None
 
         self.noise_floor_rms = 0.0
         self.noise_floor_alpha = 0.95
@@ -103,7 +101,6 @@ class DenoiseBTBridge:
         subprocess.run(["sudo", "systemctl", "restart", "bluetooth"], check=False)
         time.sleep(3)
         subprocess.run(["sudo", "rfkill", "unblock", "bluetooth"], check=False)
-
         subprocess.run(["bluetoothctl", "system-alias", BT_DEVICE_NAME], check=False)
 
         print("⏳ 等待蓝牙上电...")
@@ -120,7 +117,6 @@ class DenoiseBTBridge:
                     break
             except Exception:
                 pass
-
             try:
                 subprocess.run(
                     ["bluetoothctl", "power", "on"],
@@ -131,11 +127,11 @@ class DenoiseBTBridge:
                 )
             except Exception:
                 pass
-
-            print(f"   ⏳ 仍未上电，重试 {attempt + 1}/15 ...")
+            if attempt % 3 == 0:
+                print(f"   ⏳ 重试 {attempt + 1}/15 ...")
             time.sleep(2)
         else:
-            print("⚠️ 蓝牙最终未能上电，但继续尝试其他设置")
+            print("⚠️ 蓝牙最终未能上电")
 
         subprocess.run(
             ["bluetoothctl", "discoverable", "on"], check=False, capture_output=True
@@ -161,40 +157,24 @@ class DenoiseBTBridge:
         return None, None
 
     def _find_bt_node(self):
+        """从 pw-dump 获取真实的蓝牙节点名（支持 .N 后缀）"""
         print("🔍 查找蓝牙输出节点...")
-        try:
-            result = subprocess.run(
-                ["bluetoothctl", "devices", "Connected"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == "Device":
-                    mac = parts[1]
-                    expected_node = f"bluez_output.{mac.replace(':', '_')}.a2dp-sink"
-                    print(f"   预期节点: {expected_node}")
-                    try:
-                        data = subprocess.check_output(
-                            ["pw-dump"], text=True, timeout=5
-                        )
-                        nodes = json.loads(data)
-                        for obj in nodes:
-                            if expected_node in obj.get("props", {}).get(
-                                "node.name", ""
-                            ):
-                                print("   ✅ 节点已确认存在")
-                                return expected_node
-                    except Exception:
-                        pass
-                    print("   ⚠️ 将直接使用构造的节点名")
-                    return expected_node
-            print("   ❌ 未发现已连接的蓝牙设备")
-            return None
-        except Exception as e:
-            print(f"   bluetoothctl 查询失败: {e}")
-            return None
+        for attempt in range(15):
+            try:
+                data = subprocess.check_output(["pw-dump"], text=True, timeout=5)
+                nodes = json.loads(data)
+                for obj in nodes:
+                    if "props" in obj and "node.name" in obj["props"]:
+                        name = obj["props"]["node.name"]
+                        if "bluez_output" in name or "bluez_sink" in name:
+                            print(f"   ✅ 找到蓝牙节点: {name}")
+                            return name
+                print(f"   ⏳ pw-dump 中未发现 bluez 节点，等待...")
+            except Exception as e:
+                print(f"   pw-dump 查询失败: {e}")
+            time.sleep(1)
+        print("❌ 15 次重试后仍未找到蓝牙节点")
+        return None
 
     # ===================== 麦克风增益 =====================
     def _set_mic_gain(self):
@@ -205,8 +185,6 @@ class DenoiseBTBridge:
                 text=True,
                 timeout=5,
             )
-            print("🔍 当前系统所有 ALSA 控件:")
-            print(result.stdout)
             lines = result.stdout.splitlines()
             control_name = None
             keywords = [
@@ -237,7 +215,7 @@ class DenoiseBTBridge:
                 )
                 print(f"✅ 麦克风增益: {control_name} = {TARGET_MIC_GAIN}%")
             else:
-                print("⚠️ 未找到麦克风增益控件，请手动设置")
+                print("⚠️ 未找到麦克风增益控件")
         except Exception as e:
             print(f"⚠️ 设置增益失败: {e}")
 
@@ -258,19 +236,18 @@ class DenoiseBTBridge:
                 return True
         return False
 
-    # ===================== pw-cat 管理（自动重连） =====================
+    # ===================== pw-cat 管理 =====================
     def _ensure_pwcat_running(self):
-        """检查 pw-cat 是否仍在运行，如果已退出则重新启动"""
+        """确保 pw-cat 正常运行，退出时自动重连"""
         if self.pwcat_proc is not None and self.pwcat_proc.poll() is not None:
-            # 进程已退出，捕获错误信息
-            out, err = self.pwcat_proc.communicate()  # 获取 stdout/stderr（可能为空）
+            out, err = self.pwcat_proc.communicate()
             print(f"⚠️ pw-cat 意外退出 (退出码: {self.pwcat_proc.returncode})")
             if err:
                 print(f"   stderr: {err.decode()}")
             self.pwcat_proc = None
 
         if self.pwcat_proc is None and self.bt_node:
-            print("🔄 正在重新启动 pw-cat ...")
+            print("🔄 正在启动 pw-cat ...")
             cmd = [
                 "pw-cat",
                 "--playback",
@@ -282,24 +259,25 @@ class DenoiseBTBridge:
                 "s16",
                 "--target",
                 self.bt_node,
+                "-",  # ← 关键：从 stdin 读取
             ]
+            print(f"   命令: {' '.join(cmd)}")
             try:
-                # 保留 stderr 以便查看错误
                 self.pwcat_proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,  # 捕获错误输出
+                    stderr=subprocess.PIPE,
                     bufsize=0,
                 )
-                time.sleep(0.5)  # 给予短暂启动时间
+                time.sleep(1)  # 给 pw-cat 启动时间
                 if self.pwcat_proc.poll() is not None:
-                    # 立即退出，读取错误
                     _, err = self.pwcat_proc.communicate()
-                    print(f"❌ pw-cat 启动失败: {err.decode() if err else '未知'}")
+                    err_msg = err.decode() if err else "未知错误"
+                    print(f"❌ pw-cat 启动失败: {err_msg}")
                     self.pwcat_proc = None
                     return False
-                print("✅ pw-cat 已重新启动")
+                print(f"✅ pw-cat 已启动 → {self.bt_node}")
                 return True
             except Exception as e:
                 print(f"❌ pw-cat 启动异常: {e}")
@@ -317,10 +295,9 @@ class DenoiseBTBridge:
 
         try:
             while self.running:
-                # 确保 pw-cat 进程正常
                 if not self._ensure_pwcat_running():
-                    print("⏳ pw-cat 不可用，等待重试...")
-                    time.sleep(1)
+                    print("⏳ pw-cat 不可用，等待 2 秒后重试...")
+                    time.sleep(2)
                     continue
 
                 data = self.stream_in.read(self.frame_size, exception_on_overflow=False)
@@ -371,11 +348,10 @@ class DenoiseBTBridge:
                         self.pwcat_proc.stdin.flush()
                         consecutive_pipe_errors = 0
                     except (BrokenPipeError, OSError):
-                        print("⚠️ 写入静音时管道破裂，标记 pw-cat 已失效")
-                        self.pwcat_proc = None  # 触发重连
+                        print("⚠️ 写入静音时管道破裂，pw-cat 已失效")
+                        self.pwcat_proc = None
                         consecutive_pipe_errors += 1
-                        if consecutive_pipe_errors > 3:
-                            print("❌ 连续管道错误，退出处理循环")
+                        if consecutive_pipe_errors > 5:
                             break
                         continue
                     continue
@@ -403,10 +379,10 @@ class DenoiseBTBridge:
                     self.pwcat_proc.stdin.flush()
                     consecutive_pipe_errors = 0
                 except (BrokenPipeError, OSError):
-                    print("⚠️ 写入音频时管道破裂，标记 pw-cat 已失效")
+                    print("⚠️ 写入音频时管道破裂，pw-cat 已失效")
                     self.pwcat_proc = None
                     consecutive_pipe_errors += 1
-                    if consecutive_pipe_errors > 3:
+                    if consecutive_pipe_errors > 5:
                         break
         except Exception as e:
             print(f"音频处理错误: {e}")
@@ -449,7 +425,6 @@ class DenoiseBTBridge:
             p.terminate()
             return False
 
-        # 第一次启动 pw-cat
         if not self._ensure_pwcat_running():
             print("❌ 未能启动 pw-cat，请检查 PipeWire 服务")
             self.stream_in.close()
@@ -490,7 +465,7 @@ class DenoiseBTBridge:
 
 def main():
     print("=" * 50)
-    print("树莓派降噪蓝牙麦克风 v4.4")
+    print("树莓派降噪蓝牙麦克风 v4.6")
     print("=" * 50)
 
     bridge = DenoiseBTBridge(sample_rate=SAMPLE_RATE)
