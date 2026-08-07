@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-SCO 音频发送后端 (用系统 Python 运行)
-从 stdin 读取 PCM 数据，通过蓝牙 SCO 发送到电脑
-"""
-
 import sys
 
 import bluetooth
@@ -17,7 +12,7 @@ def main():
     print("🔗 正在建立 SCO 连接...", flush=True)
     sock = BluetoothSocket(SCO)
     try:
-        sock.connect((BT_ADDR, 0))
+        sock.connect(BT_ADDR)  # 只传 MAC 地址，不传端口
     except Exception as e:
         print(f"❌ SCO 连接失败: {e}", flush=True)
         sys.exit(1)
@@ -31,7 +26,6 @@ def main():
             sock.send(chunk)
         except Exception:
             break
-
     sock.close()
     print("🛑 SCO 发送停止", flush=True)
 
