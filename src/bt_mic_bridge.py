@@ -32,18 +32,20 @@ import torch
 # ====== 可调参数 ======
 SAMPLE_RATE = 16000
 CHANNELS = 1
-FRAME_SIZE = 320          # 20ms @ 16kHz
+FRAME_SIZE = 320  # 20ms @ 16kHz
 BT_DEVICE_NAME = "RaspberryPi-Mic"
 NOISE_GATE_THRESHOLD = 0.005
 VAD_AGGRESSIVENESS = 2
 ENABLE_VAD = True
 
 
-def run_cmd(cmd, timeout=5):
+def run_cmd(cmd, timeout=5, check=False):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=check
+        )
         return r.stdout
-    except:
+    except Exception:
         return ""
 
 
@@ -58,6 +60,7 @@ class PipeWireDenoiseBridge:
         if ENABLE_VAD:
             try:
                 import webrtcvad
+
                 self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
             except:
                 pass
@@ -65,8 +68,8 @@ class PipeWireDenoiseBridge:
         self.rec_proc = None
         self.play_proc = None
         self.agent_proc = None
-        self.running = False       # 由 start/stop 控制
-        self.bt_source = None      # 蓝牙 source (电脑麦克风输入)
+        self.running = False  # 由 start/stop 控制
+        self.bt_source = None  # 蓝牙 source (电脑麦克风输入)
         self.respeaker_source = None
 
     # ==================== 蓝牙基础初始化（仅首次） ====================
@@ -84,11 +87,12 @@ class PipeWireDenoiseBridge:
         run_cmd(["bluetoothctl", "discoverable", "on"])
         run_cmd(["bluetoothctl", "pairable", "on"])
         # 启动 bt-agent
-        run_cmd(["killall", "bt-agent"], check=False)
+        subprocess.run(["killall", "bt-agent"], capture_output=True, check=False)
         if run_cmd(["which", "bt-agent"]).strip():
             self.agent_proc = subprocess.Popen(
                 ["bt-agent", "-c", "DisplayOnly"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             print("✅ bt-agent 已启动")
         else:
@@ -149,15 +153,22 @@ class PipeWireDenoiseBridge:
     # ==================== 音频管道 ====================
     def _start_capture(self, source):
         cmd = [
-            "pw-cat", "--record",
-            "--rate", str(SAMPLE_RATE),
-            "--channels", str(CHANNELS),
-            "--format", "s16",
-            "--target", source,
-            "-"
+            "pw-cat",
+            "--record",
+            "--rate",
+            str(SAMPLE_RATE),
+            "--channels",
+            str(CHANNELS),
+            "--format",
+            "s16",
+            "--target",
+            source,
+            "-",
         ]
         print(f"🔄 录制: {' '.join(cmd)}")
-        self.rec_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.rec_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         time.sleep(1)
         if self.rec_proc.poll() is not None:
             err = self.rec_proc.stderr.read().decode()
@@ -167,15 +178,22 @@ class PipeWireDenoiseBridge:
 
     def _start_playback(self, bt_source):
         cmd = [
-            "pw-cat", "--playback",
-            "--rate", str(SAMPLE_RATE),
-            "--channels", str(CHANNELS),
-            "--format", "s16",
-            "--target", bt_source,
-            "-"
+            "pw-cat",
+            "--playback",
+            "--rate",
+            str(SAMPLE_RATE),
+            "--channels",
+            str(CHANNELS),
+            "--format",
+            "s16",
+            "--target",
+            bt_source,
+            "-",
         ]
         print(f"🔄 发送到电脑: {' '.join(cmd)}")
-        self.play_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.play_proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         time.sleep(1)
         if self.play_proc.poll() is not None:
             err = self.play_proc.stderr.read().decode()
@@ -224,7 +242,11 @@ class PipeWireDenoiseBridge:
             # 降噪
             t = torch.from_numpy(audio_int).unsqueeze(0)
             enhanced = enhance(self.df_model, self.df_state, t)
-            enhanced = enhanced.squeeze(0).numpy() if hasattr(enhanced, 'numpy') else np.asarray(enhanced).flatten()
+            enhanced = (
+                enhanced.squeeze(0).numpy()
+                if hasattr(enhanced, "numpy")
+                else np.asarray(enhanced).flatten()
+            )
             if len(enhanced) > FRAME_SIZE:
                 enhanced = enhanced[:FRAME_SIZE]
             elif len(enhanced) < FRAME_SIZE:
@@ -264,7 +286,7 @@ class PipeWireDenoiseBridge:
         if not self._start_playback(self.bt_source):
             return False
 
-        self.running = True          # 关键：重置状态
+        self.running = True  # 关键：重置状态
         self.proc_thread = threading.Thread(target=self._process_loop, daemon=True)
         self.proc_thread.start()
         print("✅ 桥接成功！降噪音频正在发送到电脑。")
@@ -331,7 +353,7 @@ def main():
                         break
                 print("设备断开，重新监听...")
                 bridge.stop_bridge()
-                last_addr = None        # 重置，允许重新连接
+                last_addr = None  # 重置，允许重新连接
             else:
                 fail_count += 1
                 backoff = min(fail_count * 5, 30)
