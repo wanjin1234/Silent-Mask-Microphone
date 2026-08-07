@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-import sys
+"""
+SCO 音频发送后端 (socket 版)
+由系统 Python 运行，无需 pybluez
+"""
 
-import bluetooth
-from bluetooth import SCO, BluetoothSocket
+import socket
+import sys
 
 BT_ADDR = "C4:FF:99:AC:A6:6A"
 SCO_PACKET_SIZE = 64
@@ -10,9 +13,13 @@ SCO_PACKET_SIZE = 64
 
 def main():
     print("🔗 正在建立 SCO 连接...", flush=True)
-    sock = BluetoothSocket(SCO)
+    # AF_BLUETOOTH = 31, BTPROTO_SCO = 2
     try:
-        sock.connect(BT_ADDR)  # 只传 MAC 地址，不传端口
+        sock = socket.socket(
+            socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, 2
+        )  # 2 = BTPROTO_SCO
+        sock.bind((BT_ADDR, 0))  # 绑定本地地址
+        sock.connect((BT_ADDR, 0))  # 连接到远程设备，端口固定为 0
     except Exception as e:
         print(f"❌ SCO 连接失败: {e}", flush=True)
         sys.exit(1)
@@ -26,6 +33,7 @@ def main():
             sock.send(chunk)
         except Exception:
             break
+
     sock.close()
     print("🛑 SCO 发送停止", flush=True)
 
