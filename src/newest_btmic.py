@@ -1,538 +1,483 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Raspberry Pi as Bluetooth Microphone with DeepFilterNet (BlueALSA方案)
-- 使用 BlueALSA 绕过 PulseAudio，稳定支持 HFP。
-- 自动确保 bluealsa 以 hfp-ag/hsp-ag 模式运行。
-- 无控制台交互，全自动运行。
+蓝牙麦克风（BlueALSA + DeepFilterNet）自动修复版
+- 主动请求 HFP profile
+- 超时后自动重启 BlueALSA 重试
+- 退出时自动恢复系统设置
 """
 
-import atexit
+import glob
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-# 配置
-USE_DEEP_FILTER = True
-DENOISE_PYTHON = os.path.expanduser("~/denoise_mic/venv/bin/python")
+# ==================== 配置 ====================
+MIC_DEVICE = os.environ.get("MIC_DEVICE", "hw:0,0")
+SAMPLE_RATE = 16000
+CHANNELS = 1
+FORMAT = "S16_LE"
 
-BACKUP_DIR = "/tmp/bt_mic_backup"
-BLUETOOTH_CONF = "/etc/bluetooth/main.conf"
 BT_OVERRIDE = "/etc/systemd/system/bluetooth.service.d/override.conf"
 BLUEALSA_OVERRIDE = "/etc/systemd/system/bluealsa.service.d/override.conf"
+BT_OVERRIDE_BAK = "/tmp/bluetooth.service.override.bak"
+BLUEALSA_OVERRIDE_BAK = "/tmp/bluealsa.service.override.bak"
+
+CONNECTION_TIMEOUT = 180
+HFP_PROFILE_TIMEOUT = 120
+BLUEALSA_WAIT_ATTEMPTS = 3  # 每 30 秒重启 bluealsa，共尝试 3 次
+
+# ==================== 工具函数 ====================
 
 
-# ---------- 工具 ----------
-def run(cmd, timeout=20, check=False):
-    print("[执行]", cmd)
+def run(cmd, check=False, timeout=60, capture=True):
     try:
         result = subprocess.run(
-            cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
+            cmd, shell=True, capture_output=capture, text=True, timeout=timeout
         )
+        if check and result.returncode != 0:
+            print(f"命令失败: {cmd}")
+            if capture:
+                print(result.stdout)
+                print(result.stderr)
+            sys.exit(1)
+        return result
     except subprocess.TimeoutExpired:
-        print(f"[超时] {cmd}")
+        if check:
+            print(f"命令超时: {cmd}")
+            sys.exit(1)
         return None
-    if result.stdout:
-        print(result.stdout)
-    if check and result.returncode != 0:
-        raise RuntimeError(f"命令失败: {cmd}\n输出: {result.stdout}")
-    return result
 
 
-def backup_config():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    for path in [BLUETOOTH_CONF, BT_OVERRIDE, BLUEALSA_OVERRIDE]:
-        if os.path.exists(path):
-            shutil.copy2(
-                path, os.path.join(BACKUP_DIR, os.path.basename(path) + ".bak")
-            )
+def print_status(msg):
+    print(f"\n=== {msg} ===")
 
 
-def restore_config():
-    print("正在恢复系统配置...")
-    for fname, dest in [("main.conf.bak", BLUETOOTH_CONF)]:
-        src = os.path.join(BACKUP_DIR, fname)
+def check_root():
+    if os.geteuid() != 0:
+        sys.exit("请使用 sudo 运行此脚本")
+
+
+# ==================== 备份与恢复 ====================
+
+
+def backup_settings():
+    print_status("备份系统配置")
+    for src, dst in [
+        (BT_OVERRIDE, BT_OVERRIDE_BAK),
+        (BLUEALSA_OVERRIDE, BLUEALSA_OVERRIDE_BAK),
+    ]:
         if os.path.exists(src):
-            shutil.copy2(src, dest)
+            shutil.copy2(src, dst)
         else:
-            run(f"rm -f {dest}", check=False)
-    run(
-        "rm -rf /etc/systemd/system/bluetooth.service.d /etc/systemd/system/bluealsa.service.d",
-        check=False,
-    )
-    run("systemctl stop bluealsa 2>/dev/null || true", check=False)
-    run("systemctl disable bluealsa 2>/dev/null || true", check=False)
-    run("pkill -f deepfilter_denoise || pkill -f 'arecord.*aplay' || true", check=False)
-    run("systemctl daemon-reload", check=False)
+            Path(dst).write_text("# NO_FILE\n")
+
+    for svc in ["pulseaudio", "pipewire", "pipewire-pulse", "bluealsa"]:
+        state = subprocess.run(
+            f"systemctl is-enabled {svc} 2>/dev/null",
+            shell=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        Path(f"/tmp/{svc}.state").write_text(state if state else "disabled")
+
+
+def restore_settings():
+    print_status("恢复系统设置")
+
+    # 恢复 override 文件
+    for bak, target in [
+        (BT_OVERRIDE_BAK, BT_OVERRIDE),
+        (BLUEALSA_OVERRIDE_BAK, BLUEALSA_OVERRIDE),
+    ]:
+        if not os.path.exists(bak):
+            continue
+        content = Path(bak).read_text()
+        if content == "# NO_FILE\n":
+            if os.path.exists(target):
+                os.remove(target)
+        else:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(bak, target)
+
+    run("systemctl daemon-reload")
+
+    # 恢复服务启用状态
+    for svc in ["pulseaudio", "pipewire", "pipewire-pulse", "bluealsa"]:
+        state_file = f"/tmp/{svc}.state"
+        if os.path.exists(state_file):
+            state = Path(state_file).read_text().strip()
+            if state == "enabled":
+                run(f"systemctl enable {svc} 2>/dev/null || true", check=False)
+            else:
+                run(f"systemctl disable {svc} 2>/dev/null || true", check=False)
+
     run("systemctl restart bluetooth", check=False)
-    print("系统配置已恢复。")
+    run("systemctl stop bluealsa 2>/dev/null || true", check=False)
+    time.sleep(2)
+
+    for f in [
+        BT_OVERRIDE_BAK,
+        BLUEALSA_OVERRIDE_BAK,
+        "/tmp/pulseaudio.state",
+        "/tmp/pipewire.state",
+        "/tmp/pipewire-pulse.state",
+        "/tmp/bluealsa.state",
+    ]:
+        if os.path.exists(f):
+            os.remove(f)
+    print("  -> 已恢复原始配置")
 
 
-# ---------- 系统配置 ----------
-def install_dependencies():
-    run("apt-get update -y --allow-releaseinfo-change", timeout=60, check=True)
+# ==================== 系统配置 ====================
+
+
+def setup_packages():
+    print_status("检查依赖")
+    run("apt-get update -y --allow-releaseinfo-change", check=False)
     run("apt-get install -y bluez bluez-tools bluez-alsa-utils", check=True)
 
 
-def configure_bluetooth_class():
-    content = ""
-    if os.path.exists(BLUETOOTH_CONF):
-        with open(BLUETOOTH_CONF, "r") as f:
-            content = f.read()
-    lines = content.splitlines()
-    new_lines = []
-    in_general = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_general = stripped == "[General]"
-            new_lines.append(line)
-            continue
-        if in_general and stripped.startswith("Class="):
-            continue
-        new_lines.append(line)
-    idx = None
-    for i, l in enumerate(new_lines):
-        if l.strip() == "[General]":
-            idx = i
-            break
-    if idx is None:
-        new_lines.append("[General]")
-        idx = len(new_lines) - 1
-    new_lines.insert(idx + 1, "Class = 0x240404")
-    with open(BLUETOOTH_CONF, "w") as f:
-        f.write("\n".join(new_lines) + "\n")
-    print("蓝牙类别已设为耳机（Class=0x240404）")
+def disable_audio_servers():
+    print_status("禁用 PulseAudio / PipeWire")
+    for service in ["pulseaudio", "pipewire", "pipewire-pulse"]:
+        run(f"systemctl stop {service} 2>/dev/null || true")
+        run(f"systemctl disable {service} 2>/dev/null || true")
 
 
-def get_original_bluetooth_execstart():
-    result = run(
-        "systemctl show bluetooth.service -p FragmentPath --value", check=False
-    )
-    unit_file = result.stdout.strip() if result else ""
-    if not unit_file or not os.path.isfile(unit_file):
-        for path in [
-            "/lib/systemd/system/bluetooth.service",
-            "/usr/lib/systemd/system/bluetooth.service",
-        ]:
-            if os.path.isfile(path):
-                unit_file = path
-                break
-    if not unit_file:
-        raise RuntimeError("找不到 bluetooth.service 单元文件")
-    with open(unit_file, "r") as f:
-        for line in f:
-            if line.strip().startswith("ExecStart="):
-                return line.strip().split("=", 1)[1].strip()
-    raise RuntimeError("未找到 ExecStart 行")
+def find_bluetoothd():
+    for p in ["/usr/libexec/bluetooth/bluetoothd", "/usr/lib/bluetooth/bluetoothd"]:
+        if os.path.exists(p):
+            return p
+    return shutil.which("bluetoothd") or sys.exit("找不到 bluetoothd")
 
 
-def configure_bluetoothd():
+def configure_bluetooth():
+    print_status("配置 BlueZ")
+    bt_bin = find_bluetoothd()
+    new_exec = f"{bt_bin} --noplugin=audio,headset --experimental"
+
     os.makedirs(os.path.dirname(BT_OVERRIDE), exist_ok=True)
-    orig = get_original_bluetooth_execstart()
-    if "--experimental" not in orig and "-E" not in orig:
-        new_exec = orig + " --experimental"
-    else:
-        new_exec = orig
     with open(BT_OVERRIDE, "w") as f:
         f.write("[Service]\nExecStart=\nExecStart=" + new_exec + "\n")
-    run("systemctl daemon-reload", check=True)
+
+    run("systemctl daemon-reload")
     run("systemctl restart bluetooth", check=True)
-    print("BlueZ 已启用实验模式并重启")
+    time.sleep(2)
+
+    result = run("ps aux | grep bluetoothd | grep -v grep")
+    if result and "--noplugin=audio,headset" in result.stdout:
+        print("  -> BlueZ 已禁用内置 audio/headset")
+    else:
+        print("  !! 警告：BlueZ 参数未生效")
 
 
 def configure_bluealsa():
-    """确保 bluealsa 以 hfp-ag/hsp-ag 模式运行"""
+    print_status("配置 BlueALSA")
+    ba_path = shutil.which("bluealsa")
+    if not ba_path:
+        sys.exit("找不到 bluealsa")
+
+    candidates = glob.glob("/sys/class/bluetooth/hci*")
+    interface = os.path.basename(candidates[0]) if candidates else "hci0"
+
+    new_exec = f"{ba_path} -i {interface} -p hfp-ag -p hsp-ag"
+    print(f"  -> 启动参数: {new_exec}")
+
     os.makedirs(os.path.dirname(BLUEALSA_OVERRIDE), exist_ok=True)
-
-    result = run("systemctl show bluealsa.service -p FragmentPath --value", check=False)
-    unit_file = result.stdout.strip() if result else None
-    if not unit_file or not os.path.isfile(unit_file):
-        for path in [
-            "/lib/systemd/system/bluealsa.service",
-            "/usr/lib/systemd/system/bluealsa.service",
-            "/etc/systemd/system/bluealsa.service",
-        ]:
-            if os.path.isfile(path):
-                unit_file = path
-                break
-    if not unit_file:
-        raise RuntimeError("找不到 bluealsa.service 单元文件")
-
-    exec_start = None
-    with open(unit_file, "r") as f:
-        for line in f:
-            if line.strip().startswith("ExecStart="):
-                exec_start = line.strip().split("=", 1)[1].strip()
-                break
-    if exec_start is None:
-        exec_start = "/usr/bin/bluealsa"
-
-    new_exec = exec_start
-    if "-p hfp-ag" not in new_exec:
-        new_exec += " -p hfp-ag"
-    if "-p hsp-ag" not in new_exec:
-        new_exec += " -p hsp-ag"
-
     with open(BLUEALSA_OVERRIDE, "w") as f:
         f.write("[Service]\nExecStart=\nExecStart=" + new_exec + "\n")
 
-    run("systemctl daemon-reload", check=True)
-    run("systemctl stop bluealsa 2>/dev/null || true", check=False)
-    run("systemctl enable bluealsa 2>/dev/null || true", check=False)
-    run("systemctl restart bluealsa", check=True)
+    run("systemctl reset-failed bluealsa 2>/dev/null || true")
+    run("systemctl daemon-reload")
+    run("systemctl stop bluealsa 2>/dev/null || true")
+    run("systemctl enable bluealsa")
+
+    result = run("systemctl restart bluealsa")
+    if result and result.returncode != 0:
+        print("  !! BlueALSA 启动失败，日志：")
+        run("journalctl -u bluealsa -n 20 --no-pager")
+        sys.exit(1)
     time.sleep(2)
-
-    result = run("systemctl is-active bluealsa", check=False)
-    if result and result.stdout.strip() == "active":
-        print("BlueALSA 已启动，支持 HFP/HSP AG")
-        return True
-    else:
-        run("bluealsa -i hci0 -p hsp-ag -p hfp-ag &", check=False)
-        time.sleep(2)
-        return True
+    print("  -> BlueALSA 已启动")
 
 
-def make_discoverable():
-    cmds = (
-        "power on\nagent on\ndefault-agent\n"
-        "discoverable on\ndiscoverable-timeout 0\npairable on\n"
-        "pairable-timeout 0\nquit\n"
-    )
-    p = subprocess.Popen(
-        ["bluetoothctl"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    p.communicate(cmds, timeout=10)
-    run("bluetoothctl show", check=False)
-    print("蓝牙已设为可发现，请在 Windows 端连接树莓派")
+# ==================== 蓝牙设备管理 ====================
 
 
-# ---------- 设备查找 ----------
-def find_bluealsa_device():
-    """查找 BlueALSA 创建的 HFP/HSP 设备"""
-    result = run("aplay -L", check=False)
-    if result is None or result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("bluealsa:") and ("hfp_ag" in line or "hsp_ag" in line):
-            print(f"检测到 BlueALSA 设备: {line}")
-            return line
-    return None
+def get_connected_devices():
+    result = run("bluetoothctl devices Connected", check=False)
+    devices = []
+    if result:
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Device "):
+                parts = line.split()
+                if len(parts) >= 2:
+                    devices.append(parts[1])
+    return devices
 
 
-def wait_for_bluealsa_device(macs, timeout=30):
-    """在已经连接的设备上等待 HFP/HSP 设备出现"""
-    if not macs:
-        return None
-    mac = macs[0].lower()
+def wait_for_connection(timeout=CONNECTION_TIMEOUT):
+    print_status(f"等待 Windows 连接（最长 {timeout} 秒）")
+    print("  请在 Windows 蓝牙设置中连接 'RaspberryPi-Mic'")
     start = time.time()
     while time.time() - start < timeout:
-        result = run("aplay -L", check=False)
-        if result and result.returncode == 0:
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if (
-                    line.startswith("bluealsa:DEV=")
-                    and mac in line.lower()
-                    and ("hfp_ag" in line or "hsp_ag" in line)
-                ):
-                    print(f"找到 BlueALSA HFP 设备: {line}")
-                    return line
-        time.sleep(2)
+        devices = get_connected_devices()
+        if devices:
+            print(f"  -> 已连接设备: {devices[0]}")
+            return devices[0]
+        time.sleep(3)
+    print("  !! 错误：未检测到设备")
     return None
 
 
-def find_mic_alsa_name():
-    result = run("arecord -L", check=False)
-    if result is None or result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if (
-            "seeed2micvoicec" in line
-            or "soc_sound" in line
-            or "ac108" in line
-            or "tlv320aic3x" in line
-        ):
-            if (
-                line.startswith("hw:")
-                or line.startswith("plughw:")
-                or line.startswith("sysdefault:")
-            ):
-                print(f"本地麦克风 ALSA 设备: {line}")
-                return line
-    return None
+def ensure_hfp(device):
+    print_status("确保 HFP 模式并激活语音通道")
 
+    info = run(f"bluetoothctl info {device}")
+    if info and "Handsfree" in info.stdout:
+        print("  -> 设备支持 HFP，主动请求 HFP profile")
 
-def find_connected_bt_macs():
-    result = run("bluetoothctl devices Connected", check=False)
-    if result is None or result.returncode != 0:
-        return []
-    macs = []
-    for line in result.stdout.splitlines():
-        if line.startswith("Device "):
-            parts = line.split()
-            if len(parts) >= 2:
-                macs.append(parts[1])
-    return macs
+        # 通过 D-Bus 强制连接 HFP（UUID 0x111f 是 Handsfree Audio Gateway）
+        dev_path = "/org/bluez/hci0/dev_" + device.replace(":", "_")
+        uuid_hf = "0000111e-0000-1000-8000-00805f9b34fb"  # Handsfree
+        uuid_ag = "0000111f-0000-1000-8000-00805f9b34fb"  # Handsfree Audio Gateway
 
-
-def trigger_bt_connect(macs):
-    for mac in macs:
-        print(f"确保蓝牙连接: {mac}")
-        run(f"bluetoothctl connect {mac}", timeout=5, check=False)
-        time.sleep(2)
-
-
-# ---------- 音频转发 ----------
-def get_denoise_python():
-    if DENOISE_PYTHON and os.path.isfile(DENOISE_PYTHON):
-        return DENOISE_PYTHON
-    for p in [
-        "/home/wanjin1234/venv/bin/python",
-        os.path.expanduser("~/venv/bin/python"),
-    ]:
-        if os.path.isfile(p):
-            return p
-    return sys.executable
-
-
-def check_sounddevice(python_interp):
-    try:
-        result = subprocess.run(
-            [python_interp, "-c", "import sounddevice; print('ok')"],
-            capture_output=True,
-            text=True,
+        # 先请求 AG role（树莓派作为网关）
+        result = run(
+            f"dbus-send --system --print-reply --dest=org.bluez "
+            f"{dev_path} org.bluez.Device1.ConnectProfile string:{uuid_ag}",
+            check=False,
             timeout=10,
         )
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"虚拟环境缺少 sounddevice: {result.stderr.strip()}")
-            return False
-    except Exception as e:
-        print(f"检查 sounddevice 时出错: {e}")
-        return False
+        if not result or result.returncode != 0:
+            # 如果 AG 失败，尝试 HF role（允许 Windows 作为网关？）
+            run(
+                f"dbus-send --system --print-reply --dest=org.bluez "
+                f"{dev_path} org.bluez.Device1.ConnectProfile string:{uuid_hf}",
+                check=False,
+                timeout=10,
+            )
+
+        time.sleep(5)
+        info = run(f"bluetoothctl info {device}")
+        return True
+
+    print("  ! 设备不支持 HFP，请检查 Windows 连接方式")
+    return False
 
 
-def start_denoise_process(mic_alsa, bt_alsa):
-    python_interp = get_denoise_python()
-    worker_code = f"""
-import os, sys, time
-import numpy as np
-import sounddevice as sd
-import df
-
-def main():
-    print("初始化 DeepFilterNet...", flush=True)
-    model, state = df.init(mode="streaming")
-    print("模型初始化完成", flush=True)
-
-    CH = 1
-    RATE = 16000
-    BLOCK = 512
-
-    try:
-        stream = sd.Stream(
-            device=({mic_alsa!r}, {bt_alsa!r}),
-            samplerate=RATE,
-            blocksize=BLOCK,
-            channels=CH,
-            dtype='int16',
-            latency='low'
-        )
-    except Exception as e:
-        print(f"无法打开音频流: {{e}}", file=sys.stderr)
-        sys.exit(1)
-
-    stream.start()
-    print("开始实时降噪...", flush=True)
-    try:
-        while True:
-            data, overflowed = stream.read(BLOCK)
-            if overflowed:
-                continue
-            pcm = data.astype(np.float32) / 32768.0
-            enhanced = df.process_pcm(model, state, pcm)
-            out = (np.clip(enhanced, -1, 1) * 32767).astype(np.int16)
-            stream.write(out)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stream.stop()
-        stream.close()
-
-if __name__ == "__main__":
-    main()
-"""
-    env = os.environ.copy()
-    env["HOME"] = "/root"
-    env["ALSA_CONFIG_PATH"] = "/usr/share/alsa/alsa.conf"
-    try:
-        proc = subprocess.Popen(
-            [python_interp, "-c", worker_code],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
-        time.sleep(3)
-        if proc.poll() is not None:
-            out = proc.stdout.read() if proc.stdout else ""
-            print(f"降噪进程启动失败: {out}", file=sys.stderr)
-            return None
-        return proc
-    except Exception as e:
-        print(f"启动降噪异常: {e}", file=sys.stderr)
-        return None
+def find_bluealsa_device(device):
+    """在 aplay/arecord 输出中查找 BlueALSA 设备"""
+    mac_pattern = f"bluealsa:DEV={device},"
+    for cmd in ["arecord -L", "aplay -L"]:
+        result = run(cmd, check=False)
+        if result:
+            for line in result.stdout.splitlines():
+                if mac_pattern in line:
+                    return line.strip()
+    return None
 
 
-def start_plain_forward(mic_alsa, bt_alsa):
-    """回退：使用 arecord | aplay 简单转发"""
-    print("使用普通音频转发（无降噪）")
-    cmd = f"arecord -D {mic_alsa} -f S16_LE -r 16000 -c 1 | aplay -D {bt_alsa} -f S16_LE -r 16000 -c 1"
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        return proc
-    except Exception as e:
-        print(f"普通转发启动失败: {e}")
-        return None
+def wait_for_bluealsa_device(
+    device, timeout=HFP_PROFILE_TIMEOUT, attempts=BLUEALSA_WAIT_ATTEMPTS
+):
+    print_status(f"等待 SCO 语音通道（最长 {timeout * attempts} 秒）")
 
+    for attempt in range(1, attempts + 1):
+        print(f"  -- 尝试 {attempt}/{attempts} --")
+        start = time.time()
+        found = False
 
-def stop_forward_proc(proc):
-    if not proc:
-        return
-    print("停止音频转发...")
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
-    except:
-        try:
-            proc.kill()
-        except:
-            pass
+        while time.time() - start < timeout:
+            dev = find_bluealsa_device(device)
+            if dev:
+                print(f"  -> BlueALSA 设备已就绪: {dev}")
+                return dev
 
+            # 提示用户操作
+            if int(time.time() - start) % 30 == 0:
+                print("  -> 请在 Windows 声音控制面板中确认蓝牙麦克风正在使用")
+                print("     如果已经启用，请尝试对麦克风说话或调整音量")
 
-# ---------- 主流程 ----------
-def main():
-    if os.geteuid() != 0:
-        print("需要 root，尝试 sudo 重启...")
-        os.execvp("sudo", ["sudo", "python3", sys.argv[0]])
-
-    backup_config()
-    atexit.register(restore_config)
-
-    print("===== 蓝牙麦克风（BlueALSA + DeepFilterNet）=====")
-    install_dependencies()
-    configure_bluetooth_class()
-    configure_bluetoothd()
-    configure_bluealsa()
-    make_discoverable()
-
-    python_interp = get_denoise_python()
-    if USE_DEEP_FILTER and not check_sounddevice(python_interp):
-        print("警告：虚拟环境缺少 sounddevice，将使用普通转发（无降噪）。")
-        deep_filter_enabled = False
-    else:
-        deep_filter_enabled = USE_DEEP_FILTER
-
-    print("\n请在 Windows 蓝牙设置中连接树莓派（应显示为“耳机”）。\n")
-
-    forward_proc = None
-    route_active = False
-    last_mac = set()
-    waiting_bt = False
-
-    try:
-        while True:
-            connected_macs = find_connected_bt_macs()
-            if connected_macs:
-                if set(connected_macs) != last_mac:
-                    print(f"检测到已连接设备: {connected_macs}")
-                    last_mac = set(connected_macs)
-                    trigger_bt_connect(connected_macs)
-                    waiting_bt = True
-
-                if waiting_bt:
-                    bt_alsa = wait_for_bluealsa_device(connected_macs, timeout=15)
-                    if bt_alsa is None:
-                        print("尚未出现 HFP 设备，继续等待并重新触发连接...")
-                        trigger_bt_connect(connected_macs)
-                else:
-                    bt_alsa = find_bluealsa_device()
-
-                if bt_alsa and not route_active:
-                    mic_alsa = find_mic_alsa_name()
-                    if not mic_alsa:
-                        print("[警告] 未找到本地麦克风，重试...")
-                        time.sleep(3)
-                        continue
-
-                    print(f"本地麦克风: {mic_alsa}")
-                    print(f"蓝牙设备: {bt_alsa}")
-
-                    if deep_filter_enabled:
-                        forward_proc = start_denoise_process(mic_alsa, bt_alsa)
-                        if forward_proc:
-                            print("深度降噪已启动，音频发送中...")
-                            route_active = True
-                        else:
-                            print("降噪启动失败，回退到普通转发...")
-                            forward_proc = start_plain_forward(mic_alsa, bt_alsa)
-                            if forward_proc:
-                                route_active = True
-                    else:
-                        forward_proc = start_plain_forward(mic_alsa, bt_alsa)
-                        if forward_proc:
-                            route_active = True
-
-                    if route_active:
-                        waiting_bt = False
-                elif bt_alsa:
-                    pass
-            else:
-                if route_active:
-                    print("蓝牙断开，停止转发...")
-                    stop_forward_proc(forward_proc)
-                    forward_proc = None
-                    route_active = False
-                last_mac.clear()
-                waiting_bt = False
+            # 设备断开了？
+            if device not in get_connected_devices():
+                print("  !! 设备已断开")
+                return None
 
             time.sleep(2)
 
+        # 当前尝试超时，重启 BlueALSA 再试
+        if attempt < attempts:
+            print("  超时，重启 BlueALSA 后重试...")
+            run("systemctl restart bluealsa", check=False)
+            time.sleep(5)
+        else:
+            print("  !! 多次尝试仍无 BlueALSA 设备")
+            print("  !! 请手动运行以下命令获取诊断信息：")
+            print("       journalctl -u bluealsa -f")
+            print("       bluetoothctl info " + device)
+            return None
+
+
+# ==================== 音频转发 ====================
+
+
+def start_audio_forwarding(bluealsa_device):
+    print_status("启动音频转发")
+
+    venv_python = "/home/wanjin1234/denoise_mic/venv/bin/python"
+    if not os.path.exists(venv_python):
+        venv_python = sys.executable
+
+    result = run(f"{venv_python} -c 'import df; print(\"ok\")'")
+    use_df = result and result.returncode == 0
+
+    if not use_df:
+        print("  -> 未启用 DeepFilterNet，直接转发")
+        pipeline = [
+            [
+                "arecord",
+                "-D",
+                MIC_DEVICE,
+                "-f",
+                FORMAT,
+                "-r",
+                str(SAMPLE_RATE),
+                "-c",
+                str(CHANNELS),
+            ],
+            [
+                "aplay",
+                "-D",
+                bluealsa_device,
+                "-f",
+                FORMAT,
+                "-r",
+                str(SAMPLE_RATE),
+                "-c",
+                str(CHANNELS),
+            ],
+        ]
+    else:
+        print("  -> 启用 DeepFilterNet 降噪")
+        denoise_script = Path("/tmp/df_denoise.py")
+        denoise_script.write_text("""
+import sys
+import numpy as np
+import df
+
+model, state, _ = df.init_model(16000, channels=1)
+while True:
+    data = sys.stdin.buffer.read(1024)
+    if not data:
+        break
+    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    processed, state = df.process(model, state, audio)
+    out = (processed * 32768.0).astype(np.int16)
+    sys.stdout.buffer.write(out.tobytes())
+    sys.stdout.flush()
+""")
+        pipeline = [
+            [
+                "arecord",
+                "-D",
+                MIC_DEVICE,
+                "-f",
+                FORMAT,
+                "-r",
+                str(SAMPLE_RATE),
+                "-c",
+                str(CHANNELS),
+            ],
+            [venv_python, str(denoise_script)],
+            [
+                "aplay",
+                "-D",
+                bluealsa_device,
+                "-f",
+                FORMAT,
+                "-r",
+                str(SAMPLE_RATE),
+                "-c",
+                str(CHANNELS),
+            ],
+        ]
+
+    processes = []
+    prev = None
+    try:
+        for cmd in pipeline:
+            if prev is None:
+                p = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+            else:
+                p = subprocess.Popen(
+                    cmd,
+                    stdin=prev.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                prev.stdout.close()
+            processes.append(p)
+            prev = p
+
+        print("  -> 音频转发已启动，按 Ctrl+C 停止")
+        for p in processes:
+            p.wait()
     except KeyboardInterrupt:
-        print("\n退出中...")
+        print("\n  -> 正在停止...")
+        for p in processes:
+            p.terminate()
+        raise
+
+
+# ==================== 主流程 ====================
+
+
+def main():
+    check_root()
+    backup_settings()
+
+    try:
+        print("=== 蓝牙麦克风（BlueALSA + DeepFilterNet）自动修复版 ===")
+
+        setup_packages()
+        disable_audio_servers()
+
+        configure_bluetooth()
+        configure_bluealsa()
+
+        print_status("设置蓝牙类别")
+        run("hciconfig hci0 class 0x240404 2>/dev/null || true", check=False)
+        run("bluetoothctl power on", check=False)
+        run("bluetoothctl discoverable on", check=False)
+        run("bluetoothctl pairable on", check=False)
+
+        device_mac = wait_for_connection()
+        if not device_mac:
+            sys.exit("未检测到设备")
+
+        ensure_hfp(device_mac)
+
+        bluealsa_dev = wait_for_bluealsa_device(device_mac)
+        if not bluealsa_dev:
+            sys.exit("SCO 语音通道未建立")
+
+        start_audio_forwarding(bluealsa_dev)
+
+    except KeyboardInterrupt:
+        print("\n  用户中断程序")
+    except SystemExit as e:
+        print(f"  程序退出: {e}")
     finally:
-        if forward_proc:
-            stop_forward_proc(forward_proc)
-
-
-def handle_sigterm(signum, frame):
-    sys.exit(0)
+        restore_settings()
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, handle_sigterm)
     main()
