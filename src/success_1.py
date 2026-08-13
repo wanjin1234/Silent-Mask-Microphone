@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）
 
@@ -10,21 +11,18 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）
 - 在找不到 exact SCO PCM 时，继续探测常见 BlueALSA profile 名称
 """
 
+import atexit
 import glob
-import logging
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
-
-MIC_DEVICE = os.environ.get("MIC_DEVICE", "").strip()
+MIC_DEVICE = os.environ.get("MIC_DEVICE", "hw:0,0")
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FORMAT = "S16_LE"
@@ -46,7 +44,6 @@ def run(cmd, check=False, timeout=60, verbose=True):
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
         )
         if check and result.returncode != 0:
             print(result.stdout)
@@ -513,11 +510,9 @@ def list_bluealsa_pcm_candidates(device):
             if prof == "default":
                 candidates.append(f"bluealsa:DEV={mac}")
                 candidates.append(f"bluealsa:SRV=org.bluealsa,DEV={mac}")
-                candidates.append(f"bluealsa:DEV={mac},SRV=org.bluealsa")
             else:
                 candidates.append(f"bluealsa:DEV={mac},PROFILE={prof}")
                 candidates.append(f"bluealsa:SRV=org.bluealsa,DEV={mac},PROFILE={prof}")
-                candidates.append(f"bluealsa:DEV={mac},PROFILE={prof},SRV=org.bluealsa")
 
     seen = set()
     ordered = []
@@ -577,109 +572,9 @@ def get_denoise_python():
     return sys.executable
 
 
-def test_capture_device(device):
-    cmd = (
-        f"timeout 2 arecord -D '{device}' -t raw -f {FORMAT} -r {SAMPLE_RATE} "
-        f"-c {CHANNELS} -d 1 >/dev/null 2>&1"
-    )
-    result = run(cmd, check=False, timeout=5, verbose=False)
-    if result is None:
-        return False
-    return result.returncode == 0
-
-
-def list_capture_device_candidates():
-    candidates = []
-    env_device = os.environ.get("MIC_DEVICE", "").strip()
-    if env_device:
-        candidates.append(env_device)
-
-    for fallback in ["plughw:0,0", "hw:0,0", "default", "sysdefault"]:
-        if fallback not in candidates:
-            candidates.append(fallback)
-
-    arecord_l = run("arecord -l", check=False, timeout=8, verbose=False)
-    if arecord_l and arecord_l.returncode == 0:
-        current_card = None
-        for raw_line in arecord_l.stdout.splitlines():
-            line = raw_line.strip()
-            card_match = re.search(r"card (\d+):", line)
-            if card_match:
-                current_card = card_match.group(1)
-            device_match = re.search(r"device (\d+):", line)
-            if current_card is not None and device_match:
-                device_no = device_match.group(1)
-                for candidate in [
-                    f"hw:{current_card},{device_no}",
-                    f"plughw:{current_card},{device_no}",
-                ]:
-                    if candidate not in candidates:
-                        candidates.append(candidate)
-
-    arecord_L = run("arecord -L", check=False, timeout=8, verbose=False)
-    if arecord_L and arecord_L.returncode == 0:
-        for raw_line in arecord_L.stdout.splitlines():
-            name = raw_line.strip()
-            if not name:
-                continue
-            if (
-                name.startswith(("default", "sysdefault", "plughw", "hw"))
-                and name not in candidates
-            ):
-                candidates.append(name)
-
-    seen = set()
-    ordered = []
-    for candidate in candidates:
-        if candidate not in seen:
-            seen.add(candidate)
-            ordered.append(candidate)
-    return ordered
-
-
-def select_capture_device():
-    print_status("查找可用录音输入设备")
-    for device in list_capture_device_candidates():
-        print(f"  测试输入设备: {device}")
-        if test_capture_device(device):
-            print(f"  -> 找到可用输入设备: {device}")
-            return device
-
-    print("  !! 未找到可用录音设备，输出 arecord 诊断信息")
-    diag1 = run("arecord -l 2>&1", check=False, timeout=8, verbose=False)
-    if diag1 and (diag1.stdout or "").strip():
-        print("  -- arecord -l --")
-        print((diag1.stdout or "").strip())
-    diag2 = run("arecord -L 2>&1", check=False, timeout=8, verbose=False)
-    if diag2 and (diag2.stdout or "").strip():
-        print("  -- arecord -L --")
-        print((diag2.stdout or "").strip())
-    return None
-
-
-def drain_stream(stream, label, sink):
-    try:
-        for raw_line in iter(stream.readline, b""):
-            if not raw_line:
-                break
-            line = raw_line.decode(errors="replace").rstrip()
-            sink.append(line)
-            print(f"    [{label}] {line}")
-    finally:
-        try:
-            stream.close()
-        except (OSError, ValueError) as exc:
-            logger.debug("关闭 %s stderr 流失败: %s", label, exc)
-
-
 def start_audio_forwarding(bluealsa_pcm):
     print_status("启动音频转发")
     venv_python = get_denoise_python()
-    capture_device = select_capture_device()
-    if not capture_device:
-        raise RuntimeError(
-            "未找到可用录音输入设备。请检查树莓派本地麦克风/声卡是否存在。"
-        )
     result = run(
         f"{venv_python} -c 'import df; print(\"ok\")'", check=False, verbose=False
     )
@@ -691,9 +586,7 @@ def start_audio_forwarding(bluealsa_pcm):
             [
                 "arecord",
                 "-D",
-                capture_device,
-                "-t",
-                "raw",
+                MIC_DEVICE,
                 "-f",
                 FORMAT,
                 "-r",
@@ -705,8 +598,6 @@ def start_audio_forwarding(bluealsa_pcm):
                 "aplay",
                 "-D",
                 bluealsa_pcm,
-                "-t",
-                "raw",
                 "-f",
                 FORMAT,
                 "-r",
@@ -740,9 +631,7 @@ while True:
             [
                 "arecord",
                 "-D",
-                capture_device,
-                "-t",
-                "raw",
+                MIC_DEVICE,
                 "-f",
                 FORMAT,
                 "-r",
@@ -755,8 +644,6 @@ while True:
                 "aplay",
                 "-D",
                 bluealsa_pcm,
-                "-t",
-                "raw",
                 "-f",
                 FORMAT,
                 "-r",
@@ -766,21 +653,13 @@ while True:
             ],
         ]
 
-    def launch_pipeline():
-        processes = []
-        stderr_logs = {"arecord": [], "denoise": [], "aplay": []}
-        prev = None
-        for index, cmd in enumerate(pipeline):
-            label = (
-                "arecord"
-                if index == 0
-                else ("aplay" if index == len(pipeline) - 1 else "denoise")
-            )
+    processes = []
+    prev = None
+    try:
+        for cmd in pipeline:
             if prev is None:
                 p = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
             else:
                 p = subprocess.Popen(
@@ -789,47 +668,22 @@ while True:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                if prev.stdout:
-                    prev.stdout.close()
-            processes.append((label, p))
-            thread = threading.Thread(
-                target=drain_stream,
-                args=(p.stderr, label, stderr_logs[label]),
-                daemon=True,
-            )
-            thread.start()
+                prev.stdout.close()
+            processes.append(p)
             prev = p
-        return processes, stderr_logs
 
-    restart_count = 0
-    try:
-        while True:
-            processes, stderr_logs = launch_pipeline()
-            print("  -> 音频转发已启动，按 Ctrl+C 停止")
-            while True:
-                time.sleep(1)
-                dead = [(label, p) for label, p in processes if p.poll() is not None]
-                if dead:
-                    print("  !! 检测到转发子进程退出，准备重启整个音频管道")
-                    for label, p in processes:
-                        code = p.poll()
-                        print(f"    -> {label} 退出码: {code}")
-                    for label, p in processes:
-                        if p.poll() is None:
-                            p.terminate()
-                    time.sleep(1)
-                    for label, logs in stderr_logs.items():
-                        if logs:
-                            print(f"  -- {label} stderr tail --")
-                            for line in logs[-10:]:
-                                print(f"    {line}")
-                    restart_count += 1
-                    print(f"  -> 将在 2 秒后重启转发管道（第 {restart_count} 次）")
-                    time.sleep(2)
-                    break
+        print("  -> 音频转发已启动，按 Ctrl+C 停止")
+        for p in processes:
+            p.wait()
     except KeyboardInterrupt:
         print("\n  -> 正在停止转发...")
+        for p in processes:
+            p.terminate()
         raise
+    finally:
+        for p in processes:
+            if p.poll() is None:
+                p.terminate()
 
 
 def main():
@@ -894,7 +748,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n  用户中断程序")
-    except (RuntimeError, FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+    except Exception as e:
         print(f"\n[错误] {e}")
         sys.exit(1)
     finally:
