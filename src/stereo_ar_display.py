@@ -133,7 +133,7 @@ class StereoARDisplay:
 
         # 5. 人体信号图标（刻度线下方，对齐三个方向）
         icon_size = 30
-        icon_y = tick_y_top + tick_height + 15
+        icon_y = tick_y_top + tick_height + 25
 
         def draw_human_icon(surface, x, y, size, distance):
             half = size // 2
@@ -155,6 +155,7 @@ class StereoARDisplay:
             surface.blit(dist_text, dist_rect)
 
         for center_x in [self.center_x_left, self.center_x_right]:
+            local_start = center_x - total_width // 2   
             segment_width = total_width / 3
             x_positions = [
                 local_start + segment_width * 0.5,
@@ -193,8 +194,7 @@ class StereoARDisplay:
                 self.screen.blit(shadow_surf, (text_rect.x + 2, text_rect.y + 2))
                 self.screen.blit(text_surf, text_rect)
 
-        # 7. 模式提示
-        self._draw_mode_hint()
+        
 
     # ---------- 俯视图模式（保持不变） ----------
     def draw_top_view(self, obstacles):
