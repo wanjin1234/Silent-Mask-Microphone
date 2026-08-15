@@ -309,10 +309,17 @@ class StereoARDisplay:
         self.screen.blit(text, (20, 15))
 
     # ---------- 主绘制入口 ----------
-    def draw_obstacles(self, obstacles):
-        """根据当前模式绘制"""
+    def draw_obstacles(self, obstacles, humans):
+        """根据当前模式绘制，合并障碍物与人体数据"""
+        # 将人体标记为 type='human'，与障碍物合并
+        merged = list(obstacles)
+        for h in humans:
+            h_copy = dict(h)
+            h_copy['type'] = 'human'
+            merged.append(h_copy)
+
         if self.view_mode == "stereo":
-            self.draw_stereo(obstacles)
+            self.draw_stereo(merged)
         else:
-            self.draw_top_view(obstacles)
+            self.draw_top_view(merged)
         pygame.display.flip()
