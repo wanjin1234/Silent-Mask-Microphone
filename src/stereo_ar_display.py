@@ -194,15 +194,26 @@ class StereoARDisplay:
                 self.screen.blit(shadow_surf, (text_rect.x + 2, text_rect.y + 2))
                 self.screen.blit(text_surf, text_rect)
 
-        
+
 
     # ---------- 俯视图模式（保持不变） ----------
     def draw_top_view(self, obstacles):
+        """俯视图模式：左右分屏显示，无立体视差"""
         self.screen.fill((10, 10, 18))
-        cx = self.width // 2
-        cy = self.height - 100
+
+        # 左半屏俯视图
+        self._draw_top_view_at(obstacles, self.center_x_left, self.height - 100)
+        # 右半屏俯视图（内容完全相同）
+        self._draw_top_view_at(obstacles, self.center_x_right, self.height - 100)
+
+        
+        pygame.display.flip()
+
+    def _draw_top_view_at(self, obstacles, cx, cy):
+        """在指定中心绘制俯视雷达图"""
         scale = 80
 
+        # 扇形探测区域
         sector_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         pts = [(cx, cy)]
         for angle in range(-60, 61, 5):
@@ -212,6 +223,7 @@ class StereoARDisplay:
         pygame.draw.polygon(sector_surf, self.colors['sector'], pts)
         self.screen.blit(sector_surf, (0, 0))
 
+        # 距离环
         for r in range(1, 6):
             radius = r * scale
             pygame.draw.circle(self.screen, (50, 55, 70), (cx, cy), radius, 1)
@@ -219,6 +231,7 @@ class StereoARDisplay:
             text = font.render(f"{r}m", True, (160, 170, 180))
             self.screen.blit(text, (cx + 6, cy - radius - 18))
 
+        # 高亮三方向线
         dirs = [(-45, (255, 100, 100), "L45"), (0, (100, 255, 100), "C"), (45, (100, 200, 255), "R45")]
         for angle, color, label in dirs:
             rad = math.radians(angle)
@@ -228,6 +241,7 @@ class StereoARDisplay:
             font = pygame.font.Font(None, 24)
             self.screen.blit(font.render(label, True, color), (end_x - 15, end_y - 20))
 
+        # 绘制障碍物（含人体）
         for obs in obstacles:
             if 'angle' in obs and 'distance' in obs:
                 ang = obs['angle']
@@ -264,23 +278,13 @@ class StereoARDisplay:
             font = pygame.font.Font(None, 20)
             self.screen.blit(font.render(f"{dist:.1f}m", True, (220, 230, 255)), (screen_x + 14, screen_y - 10))
 
+        # 头部位置标识
         pygame.draw.circle(self.screen, (0, 200, 255), (cx, cy), 8)
         pygame.draw.line(self.screen, (0, 200, 255), (cx, cy), (cx, cy - 30), 3)
         pygame.draw.polygon(self.screen, (0, 200, 255), [(cx - 5, cy - 25), (cx + 5, cy - 25), (cx, cy - 35)])
 
-        self._draw_mode_hint()
-
-    # ---------- 模式提示 ----------
-    def _draw_mode_hint(self):
-        font = pygame.font.Font(None, 30)
-        mode_text = "俯视图模式" if self.view_mode == "top" else "立体分屏模式"
-        hint = f"{mode_text}  按V切换  ESC退出"
-        text = font.render(hint, True, (200, 210, 220))
-        bg = pygame.Surface((text.get_width() + 20, text.get_height() + 10), pygame.SRCALPHA)
-        bg.fill((0, 0, 0, 150))
-        self.screen.blit(bg, (10, 10))
-        self.screen.blit(text, (20, 15))
-
+    
+   
     # ---------- 主绘制入口 ----------
     def draw_obstacles(self, obstacles, humans):
         """根据当前模式绘制，合并障碍物与人体数据"""
