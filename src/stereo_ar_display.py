@@ -19,17 +19,14 @@ class StereoARDisplay:
 
         self.view_mode = "stereo"
 
-        # 颜色定义
         self.colors = {
             'bg': (20, 20, 30),
             'grid': (60, 60, 70),
             'sector': (0, 200, 255, 30),
             'text': (255, 255, 255),
-            # 新增 HUD 浅蓝色
             'hud_blue': (0, 200, 255),
         }
 
-    # ---------- 投影函数（保留） ----------
     def project_point(self, x, y, z, eye):
         if eye == 'left':
             cam_x = -self.ipd / 2
@@ -47,20 +44,9 @@ class StereoARDisplay:
             return (int(screen_x), int(screen_y))
         return None
 
-    # ---------- 立体分屏模式（新UI） ----------
     def draw_stereo(self, obstacles):
-        """
-        立体分屏模式：
-        - 背景纯黑（透明）
-        - 中心浅蓝色小十字（左右各一）
-        - 上方等距刻度线（浅蓝色竖线，无数字）
-        - 刻度线下方：人体信号图标（感叹号+黄色三角形+浅蓝色距离）
-        - 下方三个矩形条（普通障碍物距离），红/黄/隐藏，条内距离数字白色
-        """
-        # 1. 纯黑背景（AR透明）
         self.screen.fill((0, 0, 0))
 
-        # 2. 解析障碍物和人体数据
         left_dist = center_dist = right_dist = None
         human_left = human_center = human_right = None
 
@@ -103,7 +89,7 @@ class StereoARDisplay:
                 elif direction == 'right':
                     right_dist = dist
 
-        # 3. 中心浅蓝色小十字
+        # 中心浅蓝色小十字
         cross_size = 12
         cross_gap = 4
         hud_blue = self.colors['hud_blue']
@@ -115,10 +101,10 @@ class StereoARDisplay:
             pygame.draw.line(self.screen, hud_blue, (cx, cy - cross_size), (cx, cy - cross_gap), 2)
             pygame.draw.line(self.screen, hud_blue, (cx, cy + cross_gap), (cx, cy + cross_size), 2)
 
-        # 4. 上方等距刻度线（浅蓝色）
+        # 上方等距刻度线
         total_width = int(self.width * 0.5)
-        bar_width = total_width // 3
         gap = 6
+        bar_width = (total_width - 2 * gap) // 3
         num_ticks = 7
         tick_height = 20
         tick_y_top = 40
@@ -131,31 +117,30 @@ class StereoARDisplay:
                                  (x_pos, tick_y_top),
                                  (x_pos, tick_y_top + tick_height), 2)
 
-        # 5. 人体信号图标（刻度线下方，对齐三个方向）
+        # 人体信号图标（刻度线下方，对齐三个方向）
         icon_size = 30
-        icon_y = tick_y_top + tick_height + 25
+        icon_y = tick_y_top + tick_height + 30
 
         def draw_human_icon(surface, x, y, size, distance):
             half = size // 2
-            # 黄色三角形
             points = [(x, y - half), (x - half, y + half//2), (x + half, y + half//2)]
             pygame.draw.polygon(surface, (255, 255, 0), points)
             pygame.draw.polygon(surface, (200, 200, 0), points, 2)
 
-            # 感叹号 "!" 改为浅蓝色
+            # 感叹号白色
             font = pygame.font.Font(None, size)
-            exclaim = font.render("!", True, hud_blue)
+            exclaim = font.render("!", True, (255, 255, 255))
             text_rect = exclaim.get_rect(center=(x, y))
             surface.blit(exclaim, text_rect)
 
-            # 距离数值改为浅蓝色
+            # 距离数值浅蓝色
             font_dist = pygame.font.Font(None, 20)
             dist_text = font_dist.render(f"{distance:.1f}m", True, hud_blue)
             dist_rect = dist_text.get_rect(center=(x, y + half + 15))
             surface.blit(dist_text, dist_rect)
 
         for center_x in [self.center_x_left, self.center_x_right]:
-            local_start = center_x - total_width // 2   
+            local_start = center_x - total_width // 2
             segment_width = total_width / 3
             x_positions = [
                 local_start + segment_width * 0.5,
@@ -167,7 +152,7 @@ class StereoARDisplay:
                 if dist is not None and dist <= 5.0:
                     draw_human_icon(self.screen, x_positions[idx], icon_y, icon_size, dist)
 
-        # 6. 下方三个矩形条（普通障碍物距离）
+        # 下方三个矩形条（普通障碍物距离）
         bar_height = 30
         bar_y = self.height - 70
         color_near = (255, 50, 50)
@@ -185,7 +170,6 @@ class StereoARDisplay:
                 pygame.draw.rect(self.screen, fill_color, rect_rect)
                 pygame.draw.rect(self.screen, (220, 220, 220), rect_rect, 1)
 
-                # 条内距离文字蓝色（红黄底上清晰）
                 font = pygame.font.Font(None, 28)
                 text_str = f"{dist:.1f}m"
                 text_surf = font.render(text_str, True, self.colors['hud_blue'])
@@ -194,26 +178,19 @@ class StereoARDisplay:
                 self.screen.blit(shadow_surf, (text_rect.x + 2, text_rect.y + 2))
                 self.screen.blit(text_surf, text_rect)
 
-
-
-    # ---------- 俯视图模式（保持不变） ----------
     def draw_top_view(self, obstacles):
-        """俯视图模式：左右分屏显示，无立体视差"""
+        """俯视图模式：左右分屏显示，无立体视差，无提示文字"""
         self.screen.fill((10, 10, 18))
 
-        # 左半屏俯视图
         self._draw_top_view_at(obstacles, self.center_x_left, self.height - 100)
-        # 右半屏俯视图（内容完全相同）
         self._draw_top_view_at(obstacles, self.center_x_right, self.height - 100)
 
-        
         pygame.display.flip()
 
     def _draw_top_view_at(self, obstacles, cx, cy):
         """在指定中心绘制俯视雷达图"""
         scale = 80
 
-        # 扇形探测区域
         sector_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         pts = [(cx, cy)]
         for angle in range(-60, 61, 5):
@@ -223,7 +200,6 @@ class StereoARDisplay:
         pygame.draw.polygon(sector_surf, self.colors['sector'], pts)
         self.screen.blit(sector_surf, (0, 0))
 
-        # 距离环
         for r in range(1, 6):
             radius = r * scale
             pygame.draw.circle(self.screen, (50, 55, 70), (cx, cy), radius, 1)
@@ -231,7 +207,6 @@ class StereoARDisplay:
             text = font.render(f"{r}m", True, (160, 170, 180))
             self.screen.blit(text, (cx + 6, cy - radius - 18))
 
-        # 高亮三方向线
         dirs = [(-45, (255, 100, 100), "L45"), (0, (100, 255, 100), "C"), (45, (100, 200, 255), "R45")]
         for angle, color, label in dirs:
             rad = math.radians(angle)
@@ -241,7 +216,6 @@ class StereoARDisplay:
             font = pygame.font.Font(None, 24)
             self.screen.blit(font.render(label, True, color), (end_x - 15, end_y - 20))
 
-        # 绘制障碍物（含人体）
         for obs in obstacles:
             if 'angle' in obs and 'distance' in obs:
                 ang = obs['angle']
@@ -259,7 +233,7 @@ class StereoARDisplay:
 
             obj_type = obs.get('type', 'obstacle')
             if obj_type == 'human':
-                self._draw_human_icon_top(screen_x, screen_y, size=16)
+                self._draw_human_icon_top(screen_x, screen_y, dist, size=25)
             else:
                 if dist < 1.2:
                     color = (255, 60, 60)
@@ -270,21 +244,33 @@ class StereoARDisplay:
                 else:
                     color = (50, 255, 50)
                     radius = 5
-            pygame.draw.circle(self.screen, color, (screen_x, screen_y), radius)
-            pygame.draw.circle(self.screen, (255, 255, 255), (screen_x, screen_y), radius, 1)
-            font = pygame.font.Font(None, 20)
-            self.screen.blit(font.render(f"{dist:.1f}m", True, (220, 230, 255)), (screen_x + 14, screen_y - 10))
+                pygame.draw.circle(self.screen, color, (screen_x, screen_y), radius)
+                pygame.draw.circle(self.screen, (255, 255, 255), (screen_x, screen_y), radius, 1)
+                font = pygame.font.Font(None, 20)
+                self.screen.blit(font.render(f"{dist:.1f}m", True, (220, 230, 255)), (screen_x + 14, screen_y - 10))
 
-        # 头部位置标识
         pygame.draw.circle(self.screen, (0, 200, 255), (cx, cy), 8)
         pygame.draw.line(self.screen, (0, 200, 255), (cx, cy), (cx, cy - 30), 3)
         pygame.draw.polygon(self.screen, (0, 200, 255), [(cx - 5, cy - 25), (cx + 5, cy - 25), (cx, cy - 35)])
 
+    def _draw_human_icon_top(self, x, y, distance, size=12):
+        """在俯视图中绘制黄色三角形+白色感叹号"""
+        half = size // 2
+        points = [(x, y - half), (x - half, y + half//2), (x + half, y + half//2)]
+        pygame.draw.polygon(self.screen, (255, 255, 0), points)
+        pygame.draw.polygon(self.screen, (200, 200, 0), points, 1)
+        font = pygame.font.Font(None, size)
+        exclaim = font.render("!", True, (255, 255, 255))
+        rect = exclaim.get_rect(center=(x, y))
+        self.screen.blit(exclaim, rect)
+
+        font_dist = pygame.font.Font(None, 16)
+        dist_text = font_dist.render(f"{distance:.1f}m", True, (255,255,255))
+        dist_rect = dist_text.get_rect(center=(x, y + half + 10))
+        self.screen.blit(dist_text, dist_rect)
     
-   
-    # ---------- 主绘制入口 ----------
     def draw_obstacles(self, obstacles, humans):
-        """根据当前模式绘制，合并障碍物与人体数据"""
+        """合并障碍物与人体数据，然后绘制"""
         merged = list(obstacles)
         for h in humans:
             h_copy = dict(h)
@@ -296,17 +282,3 @@ class StereoARDisplay:
         else:
             self.draw_top_view(merged)
         pygame.display.flip()
-
-        def _draw_human_icon_top(self, x, y, size=12):
-            """在俯视图中绘制与立体模式一致的黄色三角形+感叹号图标"""
-            hud_blue = self.colors['hud_blue']
-            half = size // 2
-            # 黄色三角形
-            points = [(x, y - half), (x - half, y + half//2), (x + half, y + half//2)]
-            pygame.draw.polygon(self.screen, (255, 255, 0), points)
-            pygame.draw.polygon(self.screen, (200, 200, 0), points, 1)  # 边框
-            # 感叹号（浅蓝色）
-            font = pygame.font.Font(None, size)
-            exclaim = font.render("!", True, hud_blue)
-            rect = exclaim.get_rect(center=(x, y))
-            self.screen.blit(exclaim, rect)
