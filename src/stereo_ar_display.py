@@ -259,10 +259,7 @@ class StereoARDisplay:
 
             obj_type = obs.get('type', 'obstacle')
             if obj_type == 'human':
-                color = (255, 255, 0)
-                radius = 8
-                font = pygame.font.Font(None, 16)
-                self.screen.blit(font.render("!", True, (255,255,255)), (screen_x-4, screen_y-10))
+                self._draw_human_icon_top(screen_x, screen_y, size=16)
             else:
                 if dist < 1.2:
                     color = (255, 60, 60)
@@ -299,3 +296,17 @@ class StereoARDisplay:
         else:
             self.draw_top_view(merged)
         pygame.display.flip()
+
+        def _draw_human_icon_top(self, x, y, size=12):
+            """在俯视图中绘制与立体模式一致的黄色三角形+感叹号图标"""
+            hud_blue = self.colors['hud_blue']
+            half = size // 2
+            # 黄色三角形
+            points = [(x, y - half), (x - half, y + half//2), (x + half, y + half//2)]
+            pygame.draw.polygon(self.screen, (255, 255, 0), points)
+            pygame.draw.polygon(self.screen, (200, 200, 0), points, 1)  # 边框
+            # 感叹号（浅蓝色）
+            font = pygame.font.Font(None, size)
+            exclaim = font.render("!", True, hud_blue)
+            rect = exclaim.get_rect(center=(x, y))
+            self.screen.blit(exclaim, rect)
