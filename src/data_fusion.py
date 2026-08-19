@@ -22,7 +22,8 @@ class DataFusion:
             for d in radar_data:
                 if d and d.get('angle') == angle and d.get('valid'):
                     radar_dist = d.get('distance')
-                    presence = d.get('presence', 0)
+                    # Prefer stable presence if parser provides it; fall back to legacy 'presence' or raw presence
+                    presence = d.get('presence_stable', d.get('presence', d.get('presence_raw', 0)))
                     break
 
             # 提取超声波数据

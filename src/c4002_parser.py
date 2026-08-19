@@ -38,7 +38,7 @@ if _select_env is not None:
     DEFAULT_ENERGY_THRESHOLD_SELECT = int(_select_env)
 else:
     DEFAULT_ENERGY_THRESHOLD_SELECT = int(os.getenv('C4002_ENERGY_THRESHOLD_SELECT', '0'))
-DEFAULT_HISTORY_LEN = int(os.getenv('C4002_HISTORY_LEN', '7'))
+DEFAULT_HISTORY_LEN = int(os.getenv('C4002_HISTORY_LEN', '9'))
 DEFAULT_PRESENCE_ON = int(os.getenv('C4002_PRESENCE_ON', '3'))
 DEFAULT_PRESENCE_OFF = int(os.getenv('C4002_PRESENCE_OFF', '3'))
 DEFAULT_ENERGY_SMOOTH_LEN = int(os.getenv('C4002_ENERGY_SMOOTH_LEN', '5'))
@@ -50,6 +50,10 @@ DEFAULT_BREATH_OFF = int(os.getenv('C4002_BREATH_OFF', '4'))
 # Motion detection defaults (on-count uses DEFAULT_PRESENCE_ON by default)
 DEFAULT_MOTION_ENERGY_THRESHOLD = int(os.getenv('C4002_MOTION_ENERGY_THRESHOLD', '10'))
 DEFAULT_DISTANCE_VARIANCE = float(os.getenv('C4002_DISTANCE_VARIANCE', '0.15'))
+# Cap used to reduce influence of saturated (maxed) energy readings when averaging
+DEFAULT_ENERGY_CAP = int(os.getenv('C4002_ENERGY_CAP', '80'))
+DEFAULT_SATURATION_DISTANCE = float(os.getenv('C4002_SATURATION_DISTANCE', '2.0'))  # meters
+
 
 class C4002Serial:
     def __init__(self, port='/dev/ttyAMA0', baud=115200, angle=0, sensor_id=0, timeout=0.5):
@@ -121,6 +125,13 @@ class C4002Serial:
         if not body or len(body) < remaining:
             return {'valid': False}
         pdata = hb + list(body)
+        # debug: print raw packet hex when debug enabled to verify field offsets
+        if getattr(self, 'debug', False):
+            try:
+                raw_hex = ''.join(f'{b:02x}' for b in pdata)
+            except Exception:
+                raw_hex = ''.join(['{:02x}'.format(int(x)&0xFF) for x in pdata])
+            print(f"[C4002 RAW] sensor:{self.sensor_id} pack_len:{pack_len} raw:{raw_hex}")
 
         # checksum verification
         calc = 0
@@ -144,18 +155,52 @@ class C4002Serial:
 
         # the detect result struct starts at pdata[12]
         base = 12
-        if data_len < 11:
+        # Expect at least the full detect result (16 bytes)
+        if data_len < 16:
             return {'valid': False}
 
-        target_status = pdata[base + 0]
-        light = (pdata[base + 2] << 8) | pdata[base + 1]
-        exist_gate_index = (pdata[base + 6] << 24) | (pdata[base + 5] << 16) | (pdata[base + 4] << 8) | pdata[base + 3]
-        exist_count_down = (pdata[base + 8] << 8) | pdata[base + 7]
-        exist_target_distance = (pdata[base + 10] << 8) | pdata[base + 9]
+        # Detailed per-byte debug to verify field offsets when debugging is enabled
+        if getattr(self, 'debug', False):
+            try:
+                # print a window of bytes around the data base so we can inspect exact positions
+                window_start = max(0, base - 4)
+                window_end = min(len(pdata), base + 20)
+                mapping = []
+                for i in range(window_start, window_end):
+                    ann = ''
+                    if i == base + 11:
+                        ann = ' <exist_en>'
+                    if i == base + 14:
+                        ann += ' <move_en>'
+                    mapping.append(f'{i}:{pdata[i]:02x}{ann}')
+                print(f"[C4002 BYTES] sensor:{self.sensor_id} base:{base} data_len:{data_len} bytes: {' '.join(mapping)}")
+            except Exception:
+                pass
+
+        # Parse fields (use explicit bounds checks). Fields follow the original DFRobot layout:
+        # 0: target_status
+        # 1-2: light (uint16, little-endian)
+        # 3-6: exist gate index (uint32, little-endian)
+        # 7-8: exist count down (uint16)
+        # 9-10: exist target distance (uint16, cm)
+        # 11: exist target energy (uint8)
+        # 12: move target distance (uint8, cm)
+        # 13: move target speed (uint8)
+        # 14: move target energy (uint8)
+        # 15: move target direction (uint8)
+        target_status = pdata[base + 0] if (base + 0) < len(pdata) else 0
+        light = ((pdata[base + 2] << 8) | pdata[base + 1]) if (base + 2) < len(pdata) else 0
+        exist_gate_index = (
+            (pdata[base + 6] << 24) | (pdata[base + 5] << 16) | (pdata[base + 4] << 8) | pdata[base + 3]
+        ) if (base + 6) < len(pdata) else 0
+        exist_count_down = ((pdata[base + 8] << 8) | pdata[base + 7]) if (base + 8) < len(pdata) else 0
+        exist_target_distance = ((pdata[base + 10] << 8) | pdata[base + 9]) if (base + 10) < len(pdata) else 0
         exist_target_energy = pdata[base + 11] if (base + 11) < len(pdata) else 0
-        # move target fields
-        move_target_distance = (pdata[base + 13] << 8) | pdata[base + 12] if (base + 13) < len(pdata) else 0
-        move_target_energy = pdata[base + 16] if (base + 16) < len(pdata) else 0
+        # move target fields (single-byte per original protocol)
+        move_target_distance = pdata[base + 12] if (base + 12) < len(pdata) else 0
+        move_target_speed = pdata[base + 13] if (base + 13) < len(pdata) else 0
+        move_target_energy = pdata[base + 14] if (base + 14) < len(pdata) else 0
+        move_target_direct = pdata[base + 15] if (base + 15) < len(pdata) else 0
 
         # choose the most likely valid target by energy
         # energies are uint8, apply a minimum threshold to reduce noise
@@ -193,25 +238,83 @@ class C4002Serial:
 
         # smoothing: use median of history to avoid spikes
         self.dist_history.append(distance_m)
-        # energy smoothing
-        self.energy_history.append(int(chosen_energy))
+        # energy smoothing (cap saturated values to reduce their influence on averages)
+        e_val = int(chosen_energy)
+        if e_val >= 95:
+            e_val = DEFAULT_ENERGY_CAP
+        self.energy_history.append(e_val)
         avg_energy = sum(self.energy_history) / len(self.energy_history) if len(self.energy_history) > 0 else 0
 
+        # breath energy smoothing (use move_target_energy as micro-motion indicator), cap saturated values
+        m_val = int(move_target_energy)
+        if m_val >= 95:
+            m_val = DEFAULT_ENERGY_CAP
+        self.breath_energy_history.append(m_val)
+        avg_move_energy = sum(self.breath_energy_history) / len(self.breath_energy_history) if len(self.breath_energy_history) > 0 else 0
+
         # hysteresis counters for presence to avoid transient spikes
-        # consider presence only when raw_presence is true and averaged energy is above presence threshold
-        if raw_presence and avg_energy >= PRESENCE_THRESHOLD:
+        # consider presence based on averaged energy normally, but detect saturation (many 99 readings)
+        # and, if saturated, require breath/motion evidence rather than raw energy alone.
+        sat_count = sum(1 for e in self.energy_history if e >= 95)
+        saturated = (len(self.energy_history) > 0) and (sat_count / len(self.energy_history) > 0.6)
+        if saturated:
+            # when saturated, prefer averaged move-energy (breath) as evidence to avoid false positives from saturated exist_en
+            # Additionally, prefer the closer target as distance source (to avoid selecting distant ceiling reflections)
+            try:
+                # choose the closer valid distance (non-zero)
+                exist_d_m = exist_target_distance * 0.01 if exist_target_distance > 0 else None
+                move_d_m = move_target_distance * 0.01 if move_target_distance > 0 else None
+                chosen_override = None
+                if exist_d_m is not None and move_d_m is not None:
+                    chosen_override = 'move' if move_d_m < exist_d_m else 'exist'
+                elif move_d_m is not None:
+                    chosen_override = 'move'
+                elif exist_d_m is not None:
+                    chosen_override = 'exist'
+
+                if chosen_override == 'move':
+                    chosen_distance_cm = move_target_distance
+                    chosen_energy = move_target_energy
+                    chosen_type = 'move_sat'
+                elif chosen_override == 'exist':
+                    chosen_distance_cm = exist_target_distance
+                    chosen_energy = exist_target_energy
+                    chosen_type = 'exist_sat'
+                # update last energy history entry to reflect chosen energy (with cap)
+                if len(self.energy_history) > 0:
+                    capped_e = int(chosen_energy)
+                    if capped_e >= 95:
+                        capped_e = DEFAULT_ENERGY_CAP
+                    # replace last appended value
+                    try:
+                        self.energy_history[-1] = capped_e
+                    except Exception:
+                        pass
+                # recompute avg_energy with possible replaced value
+                avg_energy = sum(self.energy_history) / len(self.energy_history) if len(self.energy_history) > 0 else 0
+            except Exception:
+                pass
+
+            # presence evidence now requires both breath/move energy AND that chosen distance is within a reasonable human range
+            distance_m = float(chosen_distance_cm) * 0.01 if chosen_distance_cm > 0 else 0.0
+            presence_evidence = raw_presence and (avg_move_energy >= DEFAULT_BREATH_ENERGY_THRESHOLD) and (0.02 < distance_m <= DEFAULT_SATURATION_DISTANCE)
+        else:
+            presence_evidence = raw_presence and avg_energy >= PRESENCE_THRESHOLD
+
+        if presence_evidence:
             self.presence_on_count += 1
             self.presence_off_count = 0
         else:
             self.presence_off_count += 1
             self.presence_on_count = 0
 
-        # breath energy smoothing (use move_target_energy as micro-motion indicator)
-        self.breath_energy_history.append(int(move_target_energy))
-        avg_move_energy = sum(self.breath_energy_history) / len(self.breath_energy_history) if len(self.breath_energy_history) > 0 else 0
-
         # breath hysteresis counters
-        if raw_presence and avg_move_energy >= DEFAULT_BREATH_ENERGY_THRESHOLD:
+        # Require micro-motion energy AND that the chosen distance is within a plausible human range
+        # to avoid counting environmental noise or distant/super-close reflections as breathing.
+        min_breath_distance = 0.2  # meters (ignore very close readings)
+        max_breath_distance = DEFAULT_SATURATION_DISTANCE  # meters (configurable)
+        if (raw_presence and avg_move_energy >= DEFAULT_BREATH_ENERGY_THRESHOLD
+                and (distance_m >= min_breath_distance and distance_m <= max_breath_distance)):
             self.breath_on_count += 1
             self.breath_off_count = 0
         else:
@@ -228,6 +331,12 @@ class C4002Serial:
                 med = 0.0
         except Exception:
             med = distance_m
+
+        # If saturated selection override happened above, ensure distance_m reflects current chosen_distance
+        try:
+            distance_m = float(chosen_distance_cm) * 0.01 if chosen_distance_cm > 0 else 0.0
+        except Exception:
+            distance_m = med
 
         # compute short-term distance variation to detect motion of a target
         distance_variation = 0.0
@@ -247,11 +356,11 @@ class C4002Serial:
             self.motion_off_count += 1
             self.motion_on_count = 0
 
-        # decide stable presence using breath OR motion counters (both use hysteresis)
+        # decide stable presence using stricter rule requested by user:
+        # stable_presence = True ONLY if sustained breath detected. Energy alone is not sufficient in
+        # persistent-high-energy indoor environments to avoid constant false positives.
         stable_presence = 0
         if self.breath_on_count >= DEFAULT_BREATH_ON:
-            stable_presence = 1
-        elif self.motion_on_count >= DEFAULT_PRESENCE_ON:
             stable_presence = 1
 
         # force clear if general presence_off_count is high
@@ -268,12 +377,14 @@ class C4002Serial:
 
         # debug logging if enabled
         if getattr(self, 'debug', False):
-            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_en_th:{MOTION_ENERGY_THRESHOLD} dist_var:{distance_variation:.3f} dist_var_th:{DISTANCE_VARIANCE_THRESHOLD} motion:{motion_condition} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
+            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_en_th:{MOTION_ENERGY_THRESHOLD} dist_var:{distance_variation:.3f} dist_var_th:{DISTANCE_VARIANCE_THRESHOLD} motion:{motion_condition} saturated:{saturated} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
 
         return {
             'distance': float(med),
             'signal': int(chosen_energy),
             'presence': int(stable_presence),
+            'presence_raw': int(raw_presence),
+            'presence_stable': int(stable_presence),
             'angle': self.angle,
             'sensor_id': self.sensor_id,
             'valid': True if med > 0 else False,
