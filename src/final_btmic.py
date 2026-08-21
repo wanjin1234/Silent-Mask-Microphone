@@ -93,6 +93,11 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   800ms——必须大于单块突发 320ms，否则每个突发都会被误删一段
   （曾设 240ms，导致 aplay 每轮 underrun 约 300ms：周期性爆音 +
   SCO 频繁掉线）；只有 SCO 真卡死才丢最旧数据、保留最近 100ms
+- 音量提升（上行链没有任何放大，+VGM=15 时 gain=1.0 直通）：gain 阶段
+  默认叠加 GAIN_BOOST_DB=6dB 数字增益（约 2 倍幅度），BOOST>1 时
+  接近满幅按软限幅平滑压缩、绝不硬削波；编解码器模拟 PGA（amixer
+  'PGA'，ADC 之前）启动时探测并报告当前值，设 MIC_PGA_GAIN 环境
+  变量（如 "20dB"）即可提升模拟增益，比数字放大信噪比更好
 - --uninstall 除卸载 systemd 服务外，还恢复 install 阶段写入的蓝牙
   override/main.conf 备份、重启 bluetooth/bluealsa，然后断开并关闭
   适配器电源（bluetoothctl power off / hci0 down）：disconnect 只能
@@ -171,6 +176,15 @@ DENOISE_MODE = os.environ.get("DENOISE_MODE", "df").lower()
 DF_BENCH_LIMIT = float(os.environ.get("DF_BENCH_LIMIT", "0.9"))  # 基准 RTF 阈值
 DF_RTF_EXIT_SECS = int(os.environ.get("DF_RTF_EXIT_SECS", "30"))  # 运行中持续超限多久自动降级
 SPEC_FLOOR = float(os.environ.get("SPEC_FLOOR", "0.15"))  # 轻量降噪增益下限
+
+# 音量提升：上行链路没有任何放大（+VGM=15 时 gain=1.0 纯直通），麦克风整体偏轻。
+#   GAIN_BOOST_DB = gain 阶段的数字增益（dB）。+6dB ≈ 2 倍幅度；接近满幅时
+#     软限幅平滑压缩，防止增强后削波爆音。0 = 纯直通
+#   MIC_PGA_GAIN   = 编解码器模拟 PGA 增益（amixer cset 值，如 "20dB"、"50%"）。
+#     tlv320aic3x 的 'PGA' 位于 ADC 之前，比数字放大更干净（提升输入信噪比）；
+#     空 = 不改动，只报告当前值
+GAIN_BOOST_DB = float(os.environ.get("GAIN_BOOST_DB", "6"))
+MIC_PGA_GAIN = os.environ.get("MIC_PGA_GAIN", "")
 
 BACKUP_DIR = "/tmp/bt_mic_backup"
 BT_OVERRIDE = "/etc/systemd/system/bluetooth.service.d/override.conf"
@@ -2533,12 +2547,17 @@ def stop_denoise_warmup(warmup):
 #
 # 但 BlueALSA 官方文档明确：原生音量模式下它只更新 volume 属性、
 # 不缩放样本（期望耳机硬件自己施加增益）；softvol 模式下虽然缩放
-# 样本，+VGM 却会被忽略。树莓派上没有"硬件增益"，因此这里自己做桥接：
+# 样本，+VGM 却会被忽略。因此这里自己做桥接：
 #   1. 保持原生模式（SoftVolume=false），让 +VGM 如实反映到 volume 属性
 #   2. 音量监控线程轮询 bluealsa-cli volume，把 0~15 增益写入电平文件
 #   3. 音频管道中的 gain 阶段读取电平文件，对样本施加 sqrt(level/15)
 #      的幅度缩放（与 BlueALSA 自身的 loudness 曲线一致），并以每样本
 #      小步渐变逼近目标因子，消除音量台阶突变引起的"咔哒"声
+#   4. 上行链路整体没有任何放大（+VGM=15 时 gain=1.0 直通），麦克风
+#      偏轻：gain 阶段默认再叠加 GAIN_BOOST_DB=6dB 数字增益，BOOST>1
+#      时软限幅防削波；编解码器模拟 PGA（tlv320aic3x 的 amixer 'PGA'
+#      控制，位于 ADC 之前、信噪比更好）由 MIC_PGA_GAIN 环境变量驱动，
+#      启动时探测并报告当前值（空 = 不动它）
 
 
 GAIN_SCRIPT_CONTENT = r"""
@@ -2571,6 +2590,14 @@ def read_level():
 # 音量变化不再瞬时跳变：因子按样本小步逼近目标（15->8 约 20ms 渐变、
 # 满幅度变化约 80ms），消除 Windows 调音量时 +VGM 台阶突变引起的"咔哒"。
 STEP = 0.0008
+
+# 数字增益（dB）：上行链路没有硬件放大（+VGM=15 时 gain=1.0），麦克风
+# 整体偏轻，因此默认额外 +6dB（约 2 倍幅度）；0 = 纯直通。
+# BOOST>1 时启用软限幅：超过拐点后平滑压缩到封顶值，增强后的强信号
+# 不会被硬削波成方波（爆音），只是轻微压缩。
+BOOST = 10 ** (__GAIN_BOOST_DB__ / 20.0)
+KNEE = 20000   # 软限幅拐点（样本值）
+CEIL = 32000   # 软限幅封顶（样本值）
 
 
 def main():
@@ -2606,7 +2633,7 @@ def main():
         HAS_SELECT = False
 
     lvl0 = read_level()
-    gain = math.sqrt(lvl0 / 15.0) if lvl0 > 0 else 0.0
+    gain = math.sqrt(lvl0 / 15.0) * BOOST if lvl0 > 0 else 0.0
     eof = False
     while True:
         # 1) 排空输入
@@ -2663,7 +2690,7 @@ def main():
             pending = []
             pending_bytes = 0
             level = read_level()
-            target = math.sqrt(level / 15.0) if level > 0 else 0.0
+            target = math.sqrt(level / 15.0) * BOOST if level > 0 else 0.0
             n = len(data) // 2
             samples = array.array("h")
             samples.frombytes(data[: n * 2])
@@ -2673,7 +2700,16 @@ def main():
                     gain = min(target, gain + STEP)
                 elif gain > target:
                     gain = max(target, gain - STEP)
-                out.append(int(s * gain))
+                v = s * gain
+                if BOOST > 1.0:
+                    if v > KNEE:
+                        v = KNEE + (CEIL - KNEE) * (
+                            1.0 - math.exp(-(v - KNEE) / (CEIL - KNEE)))
+                    elif v < -KNEE:
+                        # 负向对称：v+KNEE 恒为负，exp 指数负值 → 压缩到 -CEIL
+                        v = -(KNEE + (CEIL - KNEE) * (
+                            1.0 - math.exp((v + KNEE) / (CEIL - KNEE))))
+                out.append(int(min(32767, max(-32768, v))))
             sys.stdout.buffer.write(out.tobytes())
             sys.stdout.buffer.flush()
             continue
@@ -2692,6 +2728,7 @@ def write_gain_script(path):
     path.write_text(
         GAIN_SCRIPT_CONTENT.replace("__LEVEL_FILE__", GAIN_LEVEL_FILE)
         .replace("__SAMPLE_RATE__", str(SAMPLE_RATE))
+        .replace("__GAIN_BOOST_DB__", repr(float(GAIN_BOOST_DB)))
     )
 
 
@@ -2701,6 +2738,46 @@ def set_gain_level_file(level):
     with open(tmp, "w") as f:
         f.write(str(int(level)))
     os.replace(tmp, GAIN_LEVEL_FILE)
+
+
+def apply_capture_pga(mic_device, gain_spec):
+    """探测并（可选）提升麦克风所在声卡的模拟 PGA 增益。
+
+    tlv320aic3x 等编解码器在 ADC 之前有模拟可编程增益（amixer 控制
+    'PGA'，0~59.5dB），比数字放大干净得多：在量化之前提升输入信号，
+    信噪比更好。gain_spec 为空时只报告当前值；否则用 amixer cset
+    设置（支持百分比或 dB 值，如 "50%"、"20dB"）。设置前会确保
+    PGA 前的 Mic2 输入开关打开。找不到 PGA 控制时返回 None。
+    """
+    if shutil.which("amixer") is None:
+        return None
+    card = "0"
+    m = re.search(r"hw:(\d+)", mic_device or "")
+    if m:
+        card = m.group(1)
+    cget = run(f"amixer -c {card} cget name='PGA'",
+               check=False, timeout=8, verbose=False)
+    if not cget or cget.returncode != 0:
+        return None
+    cur = None
+    for line in (cget.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith(": values="):
+            cur = line.split("=", 1)[1].strip()
+    print(f"  -> 模拟 PGA 增益（声卡 {card}）：{cur if cur else '未知'}"
+          f"{'（可通过 MIC_PGA_GAIN 提升，如 20dB）' if not gain_spec else ''}")
+    if not gain_spec:
+        return cur
+    # PGA 前的输入开关：麦克风一般接在 Mic2L/Mic2R，确保通路打开
+    for sw in ("Left PGA Mixer Mic2L", "Right PGA Mixer Mic2R"):
+        run(f"amixer -c {card} cset name='{sw}' on",
+            check=False, timeout=8, verbose=False)
+    res = run(f"amixer -c {card} cset name='PGA' {gain_spec}",
+              check=False, timeout=8, verbose=False)
+    if res and res.returncode == 0:
+        last = (res.stdout or "").strip().splitlines()
+        print(f"  -> 已设置 PGA = {gain_spec}：{last[-1] if last else ''}")
+    return cur
 
 
 def get_sco_sink_pcm_path(device):
@@ -3318,6 +3395,8 @@ def main():
             ensure_discoverable()
             time.sleep(5)
         print(f"  -> 最终使用麦克风: {mic_device}（{mic_channels} 通道）")
+        if mic_device:
+            apply_capture_pga(mic_device, MIC_PGA_GAIN)
 
         # 后台预选降噪模式：利用等待连接的时间加载模型并实测 RTF，
         # 连接建立后转发管道可直接启动，无需再等模型加载
