@@ -54,11 +54,13 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   记录缺失会让 Windows 永远不发起 HFP（症状=已连接但无法选为麦克风）；
   同时全局 mask 用户会话的 pipewire/pulseaudio 单元防止 socket 重拉抢
   注 HFP UUID，卸载/恢复时 unmask
-- PCM 等待期间预启动降噪子进程并按真实节拍喂约 1.5 秒静音：模型加载
+- PCM 等待期间预启动降噪子进程并一次性灌入约 0.8 秒静音：模型加载
   （Pi4 上 5~7 秒）与 PCM 等待并行进行，转发真正启动时降噪进程已就绪，
   消除 arecord 爆缓冲（实测 overrun 5.1s）/aplay underrun（实测 402ms）/
-  积压丢弃（740ms）这一整套启动爆音；预热窗口上下文也被静音填满，
-  首块真实音频无缝接续（SCO 上最多约 0.3 秒静音后直接出人声）
+  积压丢弃（740ms）这一整套启动爆音；预热输出由 stdout 排水线程丢弃、
+  不进 SCO，接入真实音频时 stdin 里没有残留静音垫底（旧实现按实时
+  节拍喂 1.5 秒且不排 stdout：进程被输出管道反压停住，接入后首句
+  人声前最多有 ~1.2 秒静音——本次 3 秒延迟的主要成分之一）
 
 低延迟（修复 2~3 秒延迟，根因是旧降噪脚本按 10ms 小块调用模型推理、
 每次调用固定开销大于块时长，加上 BufferedReader.read 要读满 64KB 才返回）：
@@ -77,18 +79,26 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   DF2 需 2 帧真实前瞻且库在块尾追加零样本，损坏上下文合计 40~60ms：
   改为"预热窗口"推理——窗口 = 块头 DF_PREFIX_MS（默认 50ms）真实历史
   音频预热 + 本块 + 块尾 DF_EDGE_MS（默认 40ms）丢弃边缘，本块输出
-  两侧上下文完整；相邻窗口接缝再做 DF_XFADE_MS（默认 10ms）线性交叉
+  两侧上下文完整；相邻窗口接缝再做 DF_XFADE_MS（默认 15ms）线性交叉
   淡化，即使两侧 GRU 预热有微小掩码差也听感完全连续；DF_POST_FILTER
   （默认开）启用模型后置滤波 PF；DF_SPEC_POST（默认 0.4）在模型后
   追加轻量谱减法门（帧 32ms/跳 8ms，+24ms 延迟），与 DF 级联进一步
   压低噪声地板、加大静音衰减（0=关闭）；块长默认 320ms（窗口 420ms，
-  Pi4 实测 RTF 约 0.87），整链附加延迟 ≈ 320+50+40+10+24 ≈ 440ms
+  Pi4 实测 RTF 约 0.87），整链附加延迟 ≈ 320+50+40+15+24 ≈ 450ms
 - Windows 调音量（+VGM 变化）经 gain 阶段按样本小步渐变（15→8 约
-  20ms），消除音量台阶突变引起的"咔哒"爆音
+  20ms），消除音量台阶突变引起的"咔哒"爆音；gain 阶段非阻塞排空
+  （select+os.read，读多少发多少），去掉旧实现 read(4096) 的 128ms
+  块延迟；320ms 突发原样透传，由 aplay 的 128ms FIFO + 60ms 硬件
+  缓冲（合计 188ms）平滑，块间约 42ms 空档不会造成欠载。积压上限
+  800ms——必须大于单块突发 320ms，否则每个突发都会被误删一段
+  （曾设 240ms，导致 aplay 每轮 underrun 约 300ms：周期性爆音 +
+  SCO 频繁掉线）；只有 SCO 真卡死才丢最旧数据、保留最近 100ms
 - --uninstall 除卸载 systemd 服务外，还恢复 install 阶段写入的蓝牙
-  override/main.conf 备份、重启 bluetooth/bluealsa，并移除全部已配对
-  设备：disconnect 只能断开当前链路，Windows 对已配对设备会自动重连，
-  删除配对后自动重连才会真正失败（下次使用需重新配对）
+  override/main.conf 备份、重启 bluetooth/bluealsa，然后断开并关闭
+  适配器电源（bluetoothctl power off / hci0 down）：disconnect 只能
+  断开当前链路，Windows 对已配对设备会自动重连，关闭电源后重连才会
+  真正失败；配对信息两侧都保留，下次运行本程序时适配器自动 power on
+  并恢复可发现，Windows 无需删除设备即可自动重连
 - DF_MODEL（默认 deepfilternet2）显式选用轻量版模型：比 deepfilternet3
   快 2~3 倍，是 Pi4 上 RTF 达标的关键；空串=库默认模型
 - 模型按需下载无超时，缓存缺失时降噪脚本快速失败并打印下载指引，
@@ -151,7 +161,7 @@ DF_MAX_CHUNK_MS = int(os.environ.get("DF_MAX_CHUNK_MS", "640"))   # auto 模式�
 #     线性混合后接缝听感完全连续（GRU 预热残差的兜底）。
 DF_PREFIX_MS = int(os.environ.get("DF_PREFIX_MS", "50"))   # 块头预热前缀时长（毫秒）
 DF_EDGE_MS = int(os.environ.get("DF_EDGE_MS", "40"))       # 块尾丢弃边缘时长（毫秒）
-DF_XFADE_MS = int(os.environ.get("DF_XFADE_MS", "10"))     # 相邻窗口接缝交叉淡化宽度（毫秒，0=关闭）
+DF_XFADE_MS = int(os.environ.get("DF_XFADE_MS", "15"))     # 相邻窗口接缝交叉淡化宽度（毫秒，0=关闭）
 DF_POST_FILTER = int(os.environ.get("DF_POST_FILTER", "1"))  # 后置滤波器 PF：额外降噪、加大静音衰减
 DF_SPEC_POST = float(os.environ.get("DF_SPEC_POST", "0.4"))  # 模型后追加的轻量谱减法门增益下限（>0 启用；0=关闭）
 # 降噪模式: df=DeepFilterNet（默认）；其他模式需显式指定：
@@ -2310,12 +2320,20 @@ def launch_pipeline(pipeline, prestarted=None):
     阶段从它的 stdout 接续。预启动进程已退出时回退为正常启动。"""
     procs = []
     logs = {label: [] for label in set(l for l, _ in pipeline)}
-    pre_label = pre_proc = pre_lines = pre_stop = None
+    pre_label = pre_proc = pre_lines = pre_stop = pre_drain_stop = None
     used_pre = False
     if prestarted:
-        pre_label, pre_proc, pre_lines, pre_stop = prestarted
+        pre_label, pre_proc, pre_lines, pre_stop = prestarted[:4]
         if pre_label in logs:
             logs[pre_label] = pre_lines
+        # 第 5 项：预热进程 stdout 排水线程的停止事件。在启动任何管道
+        # 阶段之前就置位：排水线程若继续读到 arecord 接入后的真实音频
+        # 会把它丢掉（丢首段人声），所以必须抢在 arecord spawn 前停住。
+        # 预热静音在接入时早已被消费/排空（灌入即消费，RTF≈0.87），
+        # 停排后残留在输出管道里的静音最多约 250ms，交给 aplay 播放
+        pre_drain_stop = prestarted[4] if len(prestarted) > 4 else None
+        if pre_drain_stop is not None:
+            pre_drain_stop.set()
 
     prev_stdout = None
     for i, (label, cmd) in enumerate(pipeline):
@@ -2325,6 +2343,8 @@ def launch_pipeline(pipeline, prestarted=None):
             used_pre = True
             if pre_stop is not None:
                 pre_stop.set()
+            if pre_drain_stop is not None:
+                pre_drain_stop.set()
             procs.append((label, pre_proc))
             prev_stdout = pre_proc.stdout
             continue
@@ -2395,15 +2415,48 @@ def check_pipeline_startup(procs, logs):
     return True, []
 
 
+def drain_discard(stream, stop):
+    """持续读空预热进程的 stdout 并丢弃（预热输出是静音，不能进 SCO）。"""
+    fd = stream.fileno()
+    try:
+        import select as _sel
+
+        while not stop.is_set():
+            r, _, _ = _sel.select([fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                data = os.read(fd, 1 << 16)
+            except OSError:
+                return
+            if not data:
+                return
+    except (ImportError, OSError, ValueError):
+        # select 不可用（Windows 测试环境）：阻塞读，stop 置位后线程退出
+        while not stop.is_set():
+            try:
+                data = os.read(fd, 1 << 16)
+            except OSError:
+                return
+            if not data:
+                return
+
+
 def start_denoise_warmup(venv_python, mic_channels):
-    """PCM 等待期间预启动降噪子进程并按真实节拍喂约 1.5 秒静音。
+    """PCM 等待期间预启动降噪子进程并灌入约 0.8 秒静音。
 
     DeepFilterNet 在树莓派上加载需 5~7 秒：若等转发管道启动时才加载，
     arecord 的 60ms 缓冲会爆掉（实测 overrun 5.1s），下游 aplay 也因
     无数据而 underrun（实测 402ms），SCO 开头出现爆音/断流。预启动让
-    加载与 PCM 等待并行进行；静音喂入使预热窗口/谱门状态先跑起来，
-    真实音频接入时窗口上下文无缝衔接（SCO 上最多约 0.3 秒静音后
-    直接出人声，无爆音）。返回 (label, proc, stderr行列表, 停止事件)；
+    加载与 PCM 等待并行进行。
+
+    静音一次性灌入（不是按实时节拍）：进程以快于实时的速度消费
+    （RTF≈0.87），消化完即阻塞等真实输入，预热窗口上下文与谱门噪声
+    学习先行就绪；预热输出的静音由 stdout 排水线程丢弃。旧实现按
+    20ms/块实时喂 1.5 秒且不排 stdout：进程被输出管道（8KB）反压后
+    停住，stdin 里最多积压 ~1.2 秒未消费的静音，接入后这些静音作为
+    输出垫在真实音频前头，首句人声被推迟 1 秒以上（听感=启动延迟大）。
+    返回 (label, proc, stderr行列表, 停止事件, stdout排水停止事件)；
     非降噪模式（off/无依赖）返回 None。
     """
     mode = _select_denoise_mode(venv_python, mic_channels)
@@ -2425,30 +2478,39 @@ def start_denoise_warmup(venv_python, mic_channels):
         target=drain_stream, args=(proc.stderr, label, lines), daemon=True
     ).start()
     stop = threading.Event()
+    drain_stop = threading.Event()
+    threading.Thread(
+        target=drain_discard, args=(proc.stdout, drain_stop), daemon=True
+    ).start()
 
     def feed_zeros():
-        # 20ms 一小块：即使被启动瞬间截断，混入真实流的静音也不超过 20ms
+        # 一次性灌入约 0.8 秒静音：模型尚未加载完时会暂存在 stdin 管道
+        # 里（64KB 容量足够），加载完立刻被消费；预热窗口需要 prefix+
+        # chunk+edge 约 450ms 历史，再多喂一块让交叉淡化窗口成对
+        total = 2 * max(1, SAMPLE_RATE * 800 // 1000)
         chunk_bytes = 2 * max(1, SAMPLE_RATE * 20 // 1000)
-        for _ in range(75):  # 共约 1.5 秒
-            if stop.is_set():
-                return
-            try:
+        try:
+            for _ in range(0, total, chunk_bytes):
+                if stop.is_set():
+                    return
                 proc.stdin.write(b"\x00" * chunk_bytes)
                 proc.stdin.flush()
-            except (OSError, ValueError):
-                return
-            time.sleep(0.02)
+        except (OSError, ValueError):
+            return
 
     threading.Thread(target=feed_zeros, daemon=True).start()
-    return (label, proc, lines, stop)
+    return (label, proc, lines, stop, drain_stop)
 
 
 def stop_denoise_warmup(warmup):
     """会话未走到转发就结束时，停掉预启动的降噪进程。"""
     if not warmup:
         return
-    _, proc, _lines, stop = warmup
+    _, proc, _lines, stop = warmup[:4]
+    drain_stop = warmup[4] if len(warmup) > 4 else None
     stop.set()
+    if drain_stop is not None:
+        drain_stop.set()
     if proc.poll() is None:
         try:
             proc.terminate()
@@ -2484,8 +2546,10 @@ import array
 import math
 import os
 import sys
+import time
 
 LEVEL_FILE = "__LEVEL_FILE__"
+SAMPLE_RATE = __SAMPLE_RATE__
 
 # 缩小输出管道（约 256ms）：SCO 卡顿时旧音频最多积压这些，
 # 而不是默认 64KB 的约 2 秒
@@ -2510,26 +2574,113 @@ STEP = 0.0008
 
 
 def main():
+    in_fd = sys.stdin.buffer.fileno()
+    # 积压上限必须大于降噪阶段单块突发（默认 320ms）：上一版取 240ms，
+    # 比突发还小，结果每个 320ms 突发一到就被"截断"删掉 200ms，剩下
+    # 120ms 播完后又空等 200ms 才有下一块——aplay 每轮 underrun 约
+    # 300ms，周期性爆音 + SCO 频繁掉线。800ms 上限下正常峰值（一个
+    # 突发 320ms + 启动残留静音 ≤250ms）不会触发截断，只有 SCO 真
+    # 卡死（aplay 不再消费、积压持续增长）才会触发。
+    CAP = 2 * max(1, SAMPLE_RATE * 800 // 1000)
+    # 真卡顿恢复时丢最旧数据、只保留最近 100ms，不播陈旧缓冲
+    KEEP = 2 * max(1, SAMPLE_RATE * 100 // 1000)
+    pending = []
+    pending_bytes = 0
+
+    # 排空方式：有 select 时非阻塞读多少算多少（Linux 生产环境）；
+    # 否则阻塞 os.read（Windows 测试环境）——注意绝不能用
+    # BufferedReader.read(n)：它会阻塞到读满 n 字节才返回，旧实现
+    # read(4096) 等于每块 128ms 延迟。读到的数据立即整体透传给
+    # aplay：320ms 突发由 aplay 的 128ms FIFO + 60ms 硬件缓冲
+    # （合计 188ms）平滑，块间约 42ms 空档不会造成欠载（此前按
+    # 10ms 节拍发射的版本在积压上限配置错误时反而每块误删数据，
+    # 已废弃；透传下 gain 阶段自身不再引入节拍延迟）。
+    try:
+        import select as _sel
+        # 探测一次：Linux 上对管道 select 正常；Windows 上会抛 OSError，
+        # 此时退回阻塞 os.read（测试环境，不影响树莓派生产路径）
+        _sel.select([sys.stdin.buffer.fileno()], [], [], 0)
+        HAS_SELECT = True
+    except Exception:
+        _sel = None
+        HAS_SELECT = False
+
     lvl0 = read_level()
     gain = math.sqrt(lvl0 / 15.0) if lvl0 > 0 else 0.0
+    eof = False
     while True:
-        data = sys.stdin.buffer.read(4096)
-        if not data:
+        # 1) 排空输入
+        if not eof:
+            if HAS_SELECT:
+                while True:
+                    r, _, _ = _sel.select([in_fd], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        raw = os.read(in_fd, 1 << 16)
+                    except (BlockingIOError, OSError):
+                        eof = True
+                        break
+                    if not raw:
+                        eof = True
+                        break
+                    pending.append(raw)
+                    pending_bytes += len(raw)
+            else:
+                # 无 select（Windows 测试环境）：每次循环最多读一次，
+                # 读到多少算多少；读不到就阻塞等数据，不影响后面发射
+                try:
+                    raw = os.read(in_fd, 1 << 16)
+                except (BlockingIOError, OSError):
+                    raw = b""
+                    eof = True
+                if not raw:
+                    eof = True
+                else:
+                    pending.append(raw)
+                    pending_bytes += len(raw)
+
+        # 2) 积压截断：仅当积压超过 CAP（SCO 真卡死）时，丢最旧数据、
+        #    保留最近 KEEP（100ms），恢复后接上的是新音频而不是陈旧缓冲
+        if pending_bytes > CAP:
+            dropped = pending_bytes - KEEP
+            trim = dropped
+            while pending and trim >= len(pending[0]):
+                trim -= len(pending[0])
+                pending.pop(0)
+            if trim and pending:
+                pending[0] = pending[0][trim:]
+            pending_bytes = KEEP
+            print("[gain] 积压超限，丢弃 %.0f ms（SCO 卡顿恢复）"
+                  % (dropped * 1000.0 / (2 * SAMPLE_RATE)),
+                  file=sys.stderr, flush=True)
+
+        # 3) 透传全部积压：应用音量渐变后整体写出。突发形态交给 aplay
+        #    的 FIFO/硬件缓冲（合计 188ms）平滑，覆盖块间约 42ms 空档，
+        #    gain 阶段自身不引入节拍延迟
+        if pending_bytes > 0:
+            data = b"".join(pending)
+            pending = []
+            pending_bytes = 0
+            level = read_level()
+            target = math.sqrt(level / 15.0) if level > 0 else 0.0
+            n = len(data) // 2
+            samples = array.array("h")
+            samples.frombytes(data[: n * 2])
+            out = array.array("h")
+            for s in samples:
+                if gain < target:
+                    gain = min(target, gain + STEP)
+                elif gain > target:
+                    gain = max(target, gain - STEP)
+                out.append(int(s * gain))
+            sys.stdout.buffer.write(out.tobytes())
+            sys.stdout.buffer.flush()
+            continue
+
+        if eof:
             break
-        level = read_level()
-        target = math.sqrt(level / 15.0) if level > 0 else 0.0
-        n = len(data) // 2
-        samples = array.array("h")
-        samples.frombytes(data[: n * 2])
-        out = array.array("h")
-        for s in samples:
-            if gain < target:
-                gain = min(target, gain + STEP)
-            elif gain > target:
-                gain = max(target, gain - STEP)
-            out.append(int(s * gain))
-        sys.stdout.buffer.write(out.tobytes())
-        sys.stdout.buffer.flush()
+        time.sleep(0.004)
 
 
 if __name__ == "__main__":
@@ -2538,7 +2689,10 @@ if __name__ == "__main__":
 
 
 def write_gain_script(path):
-    path.write_text(GAIN_SCRIPT_CONTENT.replace("__LEVEL_FILE__", GAIN_LEVEL_FILE))
+    path.write_text(
+        GAIN_SCRIPT_CONTENT.replace("__LEVEL_FILE__", GAIN_LEVEL_FILE)
+        .replace("__SAMPLE_RATE__", str(SAMPLE_RATE))
+    )
 
 
 def set_gain_level_file(level):
@@ -3078,12 +3232,16 @@ def uninstall_systemd_unit():
     run("systemctl daemon-reload", check=False, verbose=False)
     run("systemctl restart bluetooth 2>/dev/null || true", check=False, verbose=False)
     time.sleep(3)
-    # Windows 对已配对设备会自动重连，disconnect 之后几秒链路又回来了，
-    # 看起来像"没断开"。重启 bluetoothd 把链路清掉后立即删除配对，
-    # 从源头阻止自动重连（下次使用需在 Windows 重新配对）。
-    remove_paired_devices()
+    # 保留配对、关闭适配器：Windows 对已配对设备会自动重连，disconnect
+    # 之后几秒链路又会回来，看起来像"没断开"；但删除配对会迫使下次在
+    # Windows 删设备重新配对。改为断开后直接关闭蓝牙电源（power off /
+    # hci0 down）：链路立即断开且 Windows 无法重连；下次运行本程序时
+    # wait_for_bt_adapter 会自动重新 power on 并恢复可发现，Windows 无需
+    # 删除设备即可自动重连（配对信息两侧都保留着）。
     run("systemctl restart bluealsa 2>/dev/null || true", check=False, verbose=False)
-    print("  -> 蓝牙配置已恢复默认（已断开并移除配对，Windows 不会自动重连）")
+    run("bluetoothctl power off 2>/dev/null || true", check=False, verbose=False)
+    run("hciconfig hci0 down 2>/dev/null || true", check=False, verbose=False)
+    print("  -> 蓝牙已断开并关闭电源（配对保留，下次运行本程序时 Windows 可直接重连）")
 
 
 # ---------------- 主流程 ----------------
