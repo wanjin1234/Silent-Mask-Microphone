@@ -85,6 +85,10 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   追加轻量谱减法门（帧 32ms/跳 8ms，+24ms 延迟），与 DF 级联进一步
   压低噪声地板、加大静音衰减（0=关闭）；块长默认 320ms（窗口 420ms，
   Pi4 实测 RTF 约 0.87），整链附加延迟 ≈ 320+50+40+15+24 ≈ 450ms
+- 修复交叉淡化接缝拼接取错窗口的 bug：本块主体曾误取上一窗口
+  （wins[-2] 的 [xf:unit] 段），实际输出里每个 320ms 块的头部 15ms
+  与上一块主体顺序错乱、块边界硬切（听感即周期性爆破音）；改为取
+  当前窗口 wins[-1]，仿真验证输出与输入仅差 PREFIX 延迟、接缝零跳变
 - Windows 调音量（+VGM 变化）经 gain 阶段按样本小步渐变（15→8 约
   20ms），消除音量台阶突变引起的"咔哒"爆音；gain 阶段非阻塞排空
   （select+os.read，读多少发多少），去掉旧实现 read(4096) 的 128ms
@@ -92,7 +96,13 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   缓冲（合计 188ms）平滑，块间约 42ms 空档不会造成欠载。积压上限
   800ms——必须大于单块突发 320ms，否则每个突发都会被误删一段
   （曾设 240ms，导致 aplay 每轮 underrun 约 300ms：周期性爆音 +
-  SCO 频繁掉线）；只有 SCO 真卡死才丢最旧数据、保留最近 100ms
+  SCO 频繁掉线）；只有 SCO 真卡死才丢最旧数据、保留最近 100ms。
+  SCO 长停顿（Windows/bluealsa 停止消费，实测 1~17s）恢复时：靠积压
+  上限 800ms 一次性丢掉停顿期间积压的最旧数据、只留最近 100ms，不做
+  "停顿检测+恢复窗口裁剪+静音补空"——实测恢复窗口把实时到达的每个
+  320ms 突发裁到 40ms，噪声↔静音边界是硬切，在环境噪声里爆破声反而
+  成倍增多。所有裁剪接缝（gain 与降噪阶段）一律 20ms 交叉淡化——
+  有环境噪声时硬切拼接点就是爆破声，淡化后听感连续
 - 音量提升（上行链没有任何放大，+VGM=15 时 gain=1.0 直通）：gain 阶段
   默认叠加 GAIN_BOOST_DB=6dB 数字增益（约 2 倍幅度），BOOST>1 时
   接近满幅按软限幅平滑压缩、绝不硬削波；编解码器模拟 PGA（amixer
@@ -116,6 +126,10 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   谱减法降噪脚本同样做非阻塞排空 + 积压截断
 - 降噪/gain 脚本把输出管道缩到 8KB（约 256ms）：下游 SCO 卡顿恢复后
   不需要先播完几秒积压旧音频，恢复延迟有硬上界
+- SCO 停顿恢复（降噪脚本）：写输出被下游阻塞 ≥0.5s 说明 aplay/SCO
+  停止消费，恢复后一次性把停顿期间攒下的陈旧积压裁到只留最近一块
+  （交叉淡化接缝，只裁一次），避免把停顿前/中说的话延迟 1~2s 重放
+  造成卡顿失真；实时到达的新音频完整透传
 - DeepFilterNet 基准失败时把降噪子进程的日志与 df 包信息（文件路径/
   版本/API）打印到 journal，便于定位"基准总是失败"的根因
 - 每 5 秒输出 rtf/backlog 日志（journalctl -u bt-mic -f 可见）
@@ -1595,6 +1609,9 @@ def main():
     # 不可信输出丢弃）。本块输出两侧都有完整真实上下文。相邻窗口即使
     # 预热深度不同仍可能有微小掩码差，接缝处再做 XFADE 宽度线性交叉
     # 淡化（前一块输出延伸 XFADE 与新块头部混合），接缝听感完全连续。
+    # 接缝拼接时本块主体必须取当前窗口（wins[-1][xf:unit]）：曾误取上一
+    # 窗口 a[xf:unit]，导致每个块头 15ms 与上一块主体顺序错乱、块边界
+    # 硬切——听感即 320ms 周期的爆破音。
     # 代价：每个窗口重复计算 PREFIX+EDGE+XFADE（约 100ms 开销），输出
     # 比输入滞后 PREFIX（默认 50ms）。第一块预热不足时无输出，由主循环
     # 补零。可选 SPEC_POST_FLOOR>0 时在模型后追加轻量谱减法门。
@@ -1701,8 +1718,7 @@ def main():
                 a = wins[-2]
                 out = np.concatenate([
                     (1.0 - w) * a[win_unit[0]:win_unit[0] + xf] + w * wins[-1][:xf],
-                    a[xf:win_unit[0] - xf],
-                    a[win_unit[0] - xf:win_unit[0]],
+                    wins[-1][xf:win_unit[0]],
                 ])
             if len(wins) > 2:
                 wins.pop(0)
@@ -1765,6 +1781,8 @@ def main():
     # 跳距都不改变块长）
     max_backlog = max(chunk, SR * MAX_BACKLOG_MS // 1000)
     step = CHANNELS * 2  # 一个采样帧的字节数
+    # 写输出阻塞超过该秒数 = 下游（aplay/SCO）停止消费，即一次停顿
+    STALL_BLOCK = 0.5
     log("model loaded, chunk=%d samples (%d ms), threads=%d"
         % (chunk, chunk * 1000 // SR, DF_THREADS))
 
@@ -1816,6 +1834,35 @@ def main():
 
     pending = []  # 字节块列表，避免大 bytes 反复拼接
     pending_bytes = 0
+    # 停顿恢复只裁一次：写输出阻塞 ≥STALL_BLOCK 后置位，见主循环裁剪处
+    recover_once = False
+
+    def trim_to(keep_bytes):
+        # 把 pending 裁到只保留最后 keep_bytes（按采样帧对齐），接缝
+        # 20ms 交叉淡化；返回丢弃的字节数（0 = 未裁剪）
+        nonlocal pending, pending_bytes
+        if pending_bytes <= keep_bytes:
+            return 0
+        drop = pending_bytes - keep_bytes
+        drop -= drop % step
+        xfade = min(drop, SR * 20 // 1000 * step)
+        all_b = b"".join(pending)
+        old_s = np.frombuffer(all_b[drop - xfade: drop],
+                              dtype=np.int16).astype(np.float32)
+        new_s = np.frombuffer(all_b[drop: drop + xfade],
+                              dtype=np.int16).astype(np.float32)
+        n = min(len(old_s), len(new_s))
+        if n > 0:
+            t = (np.arange(n) + 0.5) / n
+            blend = (old_s[:n] * (1.0 - t) + new_s[:n] * t)
+            blend = blend.astype(np.int16).tobytes()
+            rest = all_b[drop + n * 2:]
+            pending = [blend, rest] if rest else [blend]
+        else:
+            pending = [all_b[drop:]]
+        pending_bytes = sum(len(b) for b in pending)
+        return drop
+
     t_start = time.time()
     proc_sec = 0.0
     audio_sec = 0.0
@@ -1839,18 +1886,26 @@ def main():
                 eof = True
 
         # 积压截断：处理跟不上采集时（RTF>1）丢弃最旧音频，
-        # 使延迟封顶在 MAX_BACKLOG_MS，而不是无限增长
-        if pending_bytes > max_backlog * step:
-            drop = pending_bytes - max_backlog * step
-            drop -= drop % step
+        # 使延迟封顶在 MAX_BACKLOG_MS，而不是无限增长。
+        # 接缝交叉淡化 20ms：直接硬切在环境噪声上会"咔哒"
+        if recover_once and pending_bytes > chunk * step:
+            # SCO 停顿恢复（实测教训见 gain 阶段注释，勿再加"恢复窗口
+            # 反复裁剪+静音补空"）：写输出被下游阻塞 ≥STALL_BLOCK 秒说明
+            # aplay/SCO 停止消费，停顿期间输入端攒下的是整段陈旧音频；
+            # 恢复后若照常重放，用户会把停顿前/中说的话延迟 1~2s 再
+            # 听到一遍（卡顿失真）。一次性裁到只留最近一块，之后实时
+            # 到达的新音频完整透传，绝不重复裁剪；全程仅一处淡化接缝。
+            # 只在真正裁掉积压时才清标志：停顿积压不足一块时不动它
+            # （陈旧量小，正常处理即可），标志留到积压真的超出时再用
+            recover_once = False
+            dropped = trim_to(chunk * step)
+            if dropped:
+                log("SCO 停顿恢复，裁剪 %.0f ms 陈旧音频"
+                    % (dropped / step * 1000.0 / SR))
+        elif pending_bytes > max_backlog * step:
+            dropped = trim_to(max_backlog * step)
             log("backlog 超限，丢弃 %.0f ms（跳音保低延迟）"
-                % (drop / step * 1000.0 / SR))
-            while pending and drop >= len(pending[0]):
-                drop -= len(pending[0])
-                pending.pop(0)
-            if drop and pending:
-                pending[0] = pending[0][drop:]
-            pending_bytes = sum(len(b) for b in pending)
+                % (dropped / step * 1000.0 / SR))
 
         n = pending_bytes // step
         if n < chunk:
@@ -1918,8 +1973,13 @@ def main():
                 quiet_n += take
         out = (out * 32768.0).astype(np.int16)
         try:
+            w0 = time.time()
             sys.stdout.buffer.write(out.tobytes())
             sys.stdout.buffer.flush()
+            # 写输出阻塞 = 下游（aplay/SCO）停止消费，即一次 SCO 停顿；
+            # 恢复后置位 recover_once，主循环下一轮一次性裁剪陈旧积压
+            if time.time() - w0 >= STALL_BLOCK:
+                recover_once = True
         except BrokenPipeError:
             break
 
@@ -2090,21 +2150,29 @@ def main():
             except EOFError:
                 eof = True
 
-        # 积压截断：丢弃最旧音频（按采样帧对齐），使延迟封顶
+        # 积压截断：丢弃最旧音频（按采样帧对齐），使延迟封顶。
+        # 接缝交叉淡化 20ms：直接硬切在环境噪声上会"咔哒"
         if pending_bytes > max_backlog * step:
             dropped = pending_bytes - max_backlog * step
             dropped -= dropped % step
-            drop = dropped
-            while drop and pending:
-                if len(pending[0]) <= drop:
-                    drop -= len(pending[0])
-                    pending.pop(0)
-                else:
-                    pending[0] = pending[0][drop:]
-                    drop = 0
-            pending_bytes = max_backlog * step
             log("backlog 超限，丢弃 %.0f ms（跳音保低延迟）"
                 % (dropped * 1000.0 / (SR * step)))
+            xfade = min(dropped, SR * 20 // 1000 * step)
+            all_b = b"".join(pending)
+            old_s = np.frombuffer(all_b[dropped - xfade: dropped],
+                                  dtype=np.int16).astype(np.float32)
+            new_s = np.frombuffer(all_b[dropped: dropped + xfade],
+                                  dtype=np.int16).astype(np.float32)
+            n = min(len(old_s), len(new_s))
+            if n > 0:
+                t = (np.arange(n) + 0.5) / n
+                blend = (old_s[:n] * (1.0 - t) + new_s[:n] * t)
+                blend = blend.astype(np.int16).tobytes()
+                rest = all_b[dropped + n * 2:]
+                pending = [blend, rest] if rest else [blend]
+            else:
+                pending = [all_b[dropped:]]
+            pending_bytes = sum(len(b) for b in pending)
 
         take = pending_bytes // step
         if take == 0:
@@ -2558,6 +2626,15 @@ def stop_denoise_warmup(warmup):
 #      时软限幅防削波；编解码器模拟 PGA（tlv320aic3x 的 amixer 'PGA'
 #      控制，位于 ADC 之前、信噪比更好）由 MIC_PGA_GAIN 环境变量驱动，
 #      启动时探测并报告当前值（空 = 不动它）
+#   5. SCO 链路会周期性停顿数秒（Windows/bluealsa 停止消费，日志表现为
+#      aplay underrun 数千毫秒 + Pausing/Prepared 重协商循环）。不做
+#      "停顿检测+恢复窗口裁剪+静音补空"：实测恢复窗口把实时到达的每个
+#      320ms 突发裁到 40ms、空隙补静音，噪声↔静音边界是硬切，在环境
+#      噪声里爆破声反而成倍增多。停顿期间积压的陈旧数据（denoise 输出
+#      管道最多 64KB≈2s）在恢复时被非阻塞排空一次性读入，超过 800ms
+#      积压上限即一次性丢最旧、留最近，只产生一处交叉淡化接缝；gain 与
+#      降噪阶段的所有裁剪接缝一律 20ms 交叉淡化——有环境噪声时硬切点
+#      就是爆破声
 
 
 GAIN_SCRIPT_CONTENT = r"""
@@ -2611,8 +2688,50 @@ def main():
     CAP = 2 * max(1, SAMPLE_RATE * 800 // 1000)
     # 真卡顿恢复时丢最旧数据、只保留最近 100ms，不播陈旧缓冲
     KEEP = 2 * max(1, SAMPLE_RATE * 100 // 1000)
+    # SCO 停顿恢复策略（实测教训，勿再加"停顿检测+恢复窗口裁剪+
+    # 静音补空"）：恢复窗口会把实时到达的每个 320ms 突发裁到 40ms、
+    # 空隙补静音——噪声↔静音边界是硬切，在环境噪声里爆破声反而
+    # 成倍增多（22:09:31-35 实测：13 次"停顿恢复裁剪"+连续 underrun）。
+    # 正确做法：停顿期间下游积压的陈旧数据在恢复时被非阻塞排空
+    # 一次性读入（denoise 输出管道 64KB≈2s），超过 CAP 即由积压截断
+    # 一次性丢最旧、留最近，只产生一处 20ms 交叉淡化的接缝；aplay
+    # 自己管道里 ≤256ms（F_SETPIPE_SZ 已缩小）的陈旧重放是连续音频、
+    # 没有拼接点，不会产生爆破声。短停顿整段晚点重放即可，比切一刀
+    # 更顺滑；数据空隙不会让 aplay underrun——underrun 是 SCO 传输侧
+    # （Windows 停止消费）造成的，补静音阻止不了它，只会加硬切点
+    # 裁剪接缝交叉淡化：截断处新旧两侧各取 XFADE 个样本线性混合。
+    # 直接硬切在静音里听不见、在环境噪声里就是"咔哒"——有噪音时的
+    # 爆破声很大一部分来自这类拼接点
+    XFADE = SAMPLE_RATE * 20 // 1000
     pending = []
     pending_bytes = 0
+
+    # 裁剪 pending 只保留最后 keep_bytes，接缝处交叉淡化 XFADE 样本。
+    # 返回被丢弃的字节数（0 = 未裁剪）。
+    def do_trim(keep_bytes):
+        nonlocal pending, pending_bytes
+        if pending_bytes <= keep_bytes:
+            return 0
+        dropped = pending_bytes - keep_bytes
+        all_b = b"".join(pending)
+        cut = len(all_b) - keep_bytes
+        old_s = array.array("h")
+        old_s.frombytes(all_b[max(0, cut - XFADE * 2): cut])
+        new_s = array.array("h")
+        new_s.frombytes(all_b[cut: cut + XFADE * 2])
+        n = min(len(old_s), len(new_s))
+        blend = array.array("h")
+        for k in range(n):
+            t = (k + 0.5) / n
+            blend.append(int(old_s[k] * (1.0 - t) + new_s[k] * t))
+        rest = all_b[cut + n * 2:]
+        pending = []
+        if blend:
+            pending.append(blend.tobytes())
+        if rest:
+            pending.append(rest)
+        pending_bytes = sum(len(b) for b in pending)
+        return dropped
 
     # 排空方式：有 select 时非阻塞读多少算多少（Linux 生产环境）；
     # 否则阻塞 os.read（Windows 测试环境）——注意绝不能用
@@ -2667,17 +2786,12 @@ def main():
                     pending.append(raw)
                     pending_bytes += len(raw)
 
-        # 2) 积压截断：仅当积压超过 CAP（SCO 真卡死）时，丢最旧数据、
-        #    保留最近 KEEP（100ms），恢复后接上的是新音频而不是陈旧缓冲
+        # 2) 积压截断：积压超过 CAP（SCO 真卡死/长停顿恢复时非阻塞
+        #    排空一次性读入的陈旧数据）丢最旧、保留最近 KEEP，接缝
+        #    交叉淡化。不做恢复窗口裁剪/静音补空：恢复窗口把实时
+        #    音频裁成碎片、静音边界硬切，环境噪声下爆破声反而更多
         if pending_bytes > CAP:
-            dropped = pending_bytes - KEEP
-            trim = dropped
-            while pending and trim >= len(pending[0]):
-                trim -= len(pending[0])
-                pending.pop(0)
-            if trim and pending:
-                pending[0] = pending[0][trim:]
-            pending_bytes = KEEP
+            dropped = do_trim(KEEP)
             print("[gain] 积压超限，丢弃 %.0f ms（SCO 卡顿恢复）"
                   % (dropped * 1000.0 / (2 * SAMPLE_RATE)),
                   file=sys.stderr, flush=True)
