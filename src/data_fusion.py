@@ -1,11 +1,10 @@
 import math
 import time
-import numpy as np
 from collections import deque
 
 class DataFusion:
     def __init__(self):
-        self.history = deque(maxlen=20)
+        self.history = deque(maxlen=5)
         self.extra_sensor_data = {}   # 可扩展：存储其他传感器数据
 
     def fuse_measurements(self, radar_data, ultrasonic_data, sensor_height=0.8, pitch_deg=-5):
@@ -85,35 +84,32 @@ class DataFusion:
         return filtered_obstacles, filtered_humans
 
     def _filter_obstacles(self):
-        if len(self.history) < 5:
-            return list(self.history[-1]) if self.history else []
-        recent = list(self.history)[-10:]
+        if not self.history:
+            return []
+        recent = list(self.history)
         averaged = []
         for angle in [-45, 0, 45]:
-            xs, ys, zs, dists, pres = [], [], [], [], []
+            # 收集该角度下最近几帧的所有观测
+            matches = []
             for frame in recent:
                 for obs in frame:
                     if obs['angle'] == angle:
-                        xs.append(obs['x'])
-                        ys.append(obs['y'])
-                        zs.append(obs['z'])
-                        dists.append(obs['distance'])
-                        pres.append(obs['presence'])
-            if xs:
-                avg_x = np.mean(xs)
-                avg_y = np.mean(ys)
-                avg_z = np.mean(zs)
-                avg_dist = np.mean(dists)
-                # 最近是否有人：如果历史中任意一帧有人，则保留
-                avg_pres = 1 if any(pres) else 0
-                averaged.append({
-                    'angle': angle,
-                    'x': avg_x,
-                    'y': avg_y,
-                    'z': avg_z,
-                    'distance': avg_dist,
-                    'presence': avg_pres
-                })
+                        matches.append(obs)
+            if not matches:
+                continue
+            # 用距离中位数抑制突变，并取最接近中位数的帧作为代表（保留坐标与 presence 一致性）
+            dvals = sorted(o['distance'] for o in matches)
+            med_dist = dvals[len(dvals) // 2]
+            rep = min(matches, key=lambda o: abs(o['distance'] - med_dist))
+            pres = 1 if any(o['presence'] for o in matches) else 0
+            averaged.append({
+                'angle': angle,
+                'x': rep['x'],
+                'y': rep['y'],
+                'z': rep['z'],
+                'distance': med_dist,
+                'presence': pres
+            })
         return averaged
 
     def _filter_humans(self, humans):

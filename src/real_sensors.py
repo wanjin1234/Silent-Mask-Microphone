@@ -24,8 +24,8 @@ class RealSensorHub:
         try:
             self.ultra_gpio = GpioController()
             self.ultra_gpio.open_from_url('ftdi://ftdi:232h/1')
-            direction = 0b00101010   # TRIG 输出(0)，ECHO 输入(1)
-            self.ultra_gpio.set_direction(direction, 0b00111111)
+            direction = 0b00010101   # 输出掩码: D0/D2/D4(TRIG)，ECHO=D1/D3/D5(输入)
+            self.ultra_gpio.set_direction(0b00111111, direction)
             self.ultra_gpio.write(0x00)
         except Exception as e:
             print(f"FT232H 初始化失败: {e}")

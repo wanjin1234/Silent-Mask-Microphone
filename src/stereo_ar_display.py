@@ -19,6 +19,11 @@ class StereoARDisplay:
 
         self.view_mode = "stereo"
 
+        # 扫描状态提示（人体静止扫描）
+        self.scan_status = None
+        self.scan_status_color = (0, 200, 255)
+        self.scan_results = []   # 固定扫描结果：[{'angle', 'detected', 'distance'}]
+
         # 颜色定义
         self.colors = {
             'bg': (20, 20, 30),
@@ -60,9 +65,8 @@ class StereoARDisplay:
         # 1. 纯黑背景（AR透明）
         self.screen.fill((0, 0, 0))
 
-        # 2. 解析障碍物和人体数据
+        # 2. 解析障碍物数据（人体不再来自实时数据，只来自 scan_results 固定结果）
         left_dist = center_dist = right_dist = None
-        human_left = human_center = human_right = None
 
         for obs in obstacles:
             if 'angle' in obs and 'distance' in obs:
@@ -76,8 +80,6 @@ class StereoARDisplay:
                 ang = math.degrees(math.atan2(x, z))
                 dist = obs.get('distance', math.sqrt(x*x + z*z))
 
-            obj_type = obs.get('type', 'obstacle')
-
             direction = None
             if -50 <= ang <= -40:
                 direction = 'left'
@@ -88,20 +90,26 @@ class StereoARDisplay:
             else:
                 continue
 
-            if obj_type == 'human':
-                if direction == 'left':
-                    human_left = dist
-                elif direction == 'center':
-                    human_center = dist
-                elif direction == 'right':
-                    human_right = dist
-            else:
-                if direction == 'left':
-                    left_dist = dist
-                elif direction == 'center':
-                    center_dist = dist
-                elif direction == 'right':
-                    right_dist = dist
+            if direction == 'left':
+                left_dist = dist
+            elif direction == 'center':
+                center_dist = dist
+            elif direction == 'right':
+                right_dist = dist
+
+        # 人体图标完全由固定扫描结果驱动（保持到下次扫描）
+        human_left = human_center = human_right = None
+        for r in self.scan_results:
+            if not r.get('detected'):
+                continue
+            ang = r.get('angle', 0)
+            dist = r.get('distance', 0.0)
+            if -50 <= ang <= -40:
+                human_left = dist
+            elif -10 <= ang <= 10:
+                human_center = dist
+            elif 40 <= ang <= 50:
+                human_right = dist
 
         # 3. 中心浅蓝色小十字
         cross_size = 12
@@ -178,7 +186,7 @@ class StereoARDisplay:
             local_start = center_x - total_width // 2
             for idx, (label, dist) in enumerate(dirs):
                 x = local_start + idx * (bar_width + gap)
-                if dist is None or dist > 2.5:
+                if dist is None or dist > 6.0:
                     continue
                 fill_color = color_near if dist <= 1.2 else color_mid
                 rect_rect = (x, bar_y, bar_width, bar_height)
@@ -286,16 +294,28 @@ class StereoARDisplay:
     
    
     # ---------- 主绘制入口 ----------
-    def draw_obstacles(self, obstacles, humans):
-        """根据当前模式绘制，合并障碍物与人体数据"""
-        merged = list(obstacles)
-        for h in humans:
-            h_copy = dict(h)
-            h_copy['type'] = 'human'
-            merged.append(h_copy)
-
+    def draw_obstacles(self, obstacles):
+        """根据当前模式绘制障碍物；人体图标由 scan_results 固定驱动。"""
         if self.view_mode == "stereo":
-            self.draw_stereo(merged)
+            self.draw_stereo(obstacles)
         else:
-            self.draw_top_view(merged)
+            self.draw_top_view(obstacles)
+
+        # 绘制扫描状态提示
+        if self.scan_status:
+            font = pygame.font.Font(None, 44)
+            surf = font.render(self.scan_status, True, self.scan_status_color)
+            shadow = font.render(self.scan_status, True, (0, 0, 0))
+            self.screen.blit(shadow, (22, 22))
+            self.screen.blit(surf, (20, 20))
+
         pygame.display.flip()
+
+    def set_scan_status(self, text, color=(0, 200, 255)):
+        """设置/清除人体扫描状态提示。text 为 None 时清除。"""
+        self.scan_status = text
+        self.scan_status_color = color
+
+    def set_scan_results(self, results):
+        """设置固定的逐雷达扫描结果，保持显示到下次更新。"""
+        self.scan_results = list(results) if results else []

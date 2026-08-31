@@ -14,9 +14,10 @@ def main():
         print(f"无法打开FT232H: {e}")
         return
 
-    # 设置方向：TRIG为输出(0)，ECHO为输入(1)
-    direction = 0b00101010  # 0=输出, 1=输入
-    gpio.set_direction(direction, 0b00111111)
+    # 设置方向（pyftdi 约定：方向位 1=输出, 0=输入）
+    # TRIG = D0/D2/D4(输出), ECHO = D1/D3/D5(输入)
+    direction = 0b00010101            # 输出引脚掩码: D0, D2, D4
+    gpio.set_direction(0b00111111, direction)  # 配置 D0~D5
     gpio.write(0x00)  # 所有引脚拉低
 
     def measure(trig, echo):
