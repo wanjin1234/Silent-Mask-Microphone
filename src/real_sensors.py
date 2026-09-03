@@ -1,5 +1,6 @@
 import serial
 import time
+import os
 import traceback
 from pyftdi.gpio import GpioController
 
@@ -35,6 +36,10 @@ class RealSensorHub:
             {'trig': 2, 'echo': 3, 'angle': 0},
             {'trig': 4, 'echo': 5, 'angle': 45}
         ]
+
+        # 每路超声波测量之间的间隔（秒），用于衰减上一路的声学余响，避免串扰。
+        # 默认 40ms，可用环境变量 ULTRA_GAP_MS 覆盖（单位毫秒）。
+        self.ultra_gap = float(os.getenv('ULTRA_GAP_MS', '40')) / 1000.0
 
         # 雷达数据缓冲区
         self.radar_buffers = [bytearray() for _ in self.radars]
@@ -161,7 +166,7 @@ class RealSensorHub:
                     'angle': sensor['angle'],
                     'valid': True
                 })
-            time.sleep(0.02)
+            time.sleep(self.ultra_gap)
         return results
 
     def close(self):
