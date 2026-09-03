@@ -34,6 +34,17 @@ class StereoARDisplay:
             'hud_blue': (0, 200, 255),
         }
 
+        # 2.5D 伪立体 HUD 参数（可调）
+        self.arc_half = 430        # HUD 带从中心向两侧展开的半宽(px)
+        self.arc_bow = 45          # 弧线弯曲幅度(px)，越大弧越弯
+        self.tick_base_y = 60      # 上方刻度基线 y（中心处）
+        self.icon_base_y = 95      # 人体图标基线 y（中心处）
+        self.bar_base_y = 1020     # 下方距离条基线 y（中心处）
+        self.bar_half_h = 15       # 距离条半高(px)
+        self.divider_len = 130     # 分割线向纵深延伸的长度(px)
+        self.divider_color = (0, 140, 200)  # 分割线颜色（略暗，作为纵深元素）
+        self.depth_fade = 0.5      # 深度衰减强度(0~1)：越大，边缘(远处)越暗越细
+
     # ---------- 投影函数（保留） ----------
     def project_point(self, x, y, z, eye):
         if eye == 'left':
@@ -115,6 +126,14 @@ class StereoARDisplay:
         cross_size = 12
         cross_gap = 4
         hud_blue = self.colors['hud_blue']
+
+        def fade(color, f):
+            # f: 0=全黑(远景) ~ 1=原始色(近景)
+            if f >= 1.0:
+                return color
+            if f <= 0.0:
+                return (0, 0, 0)
+            return (int(color[0] * f), int(color[1] * f), int(color[2] * f))
         for center_x in [self.center_x_left, self.center_x_right]:
             cx = center_x
             cy = self.center_y
@@ -123,25 +142,25 @@ class StereoARDisplay:
             pygame.draw.line(self.screen, hud_blue, (cx, cy - cross_size), (cx, cy - cross_gap), 2)
             pygame.draw.line(self.screen, hud_blue, (cx, cy + cross_gap), (cx, cy + cross_size), 2)
 
-        # 4. 上方等距刻度线（浅蓝色）
-        total_width = int(self.width * 0.5)
-        bar_width = total_width // 3
-        gap = 6
+        # 4. 上方等距刻度线（浅蓝色，沿纵深方向弧形排布）
         num_ticks = 7
-        tick_height = 20
-        tick_y_top = 40
+        tick_len = 20
+        arc_half = self.arc_half
+        arc_bow = self.arc_bow
 
         for center_x in [self.center_x_left, self.center_x_right]:
-            local_start = center_x - total_width // 2
             for i in range(num_ticks):
-                x_pos = local_start + (i / (num_ticks - 1)) * total_width
-                pygame.draw.line(self.screen, hud_blue,
-                                 (x_pos, tick_y_top),
-                                 (x_pos, tick_y_top + tick_height), 2)
+                t = -1.0 + 2.0 * i / (num_ticks - 1)
+                x_pos = center_x + t * arc_half
+                y_top = self.tick_base_y - arc_bow * t * t
+                f = 1.0 - self.depth_fade * t * t
+                tick_w = 2 if f > 0.7 else 1
+                pygame.draw.line(self.screen, fade(hud_blue, f),
+                                 (x_pos, y_top),
+                                 (x_pos, y_top + tick_len), tick_w)
 
-        # 5. 人体信号图标（刻度线下方，对齐三个方向）
+        # 5. 人体信号图标（沿弧线排布，对齐三个方向）
         icon_size = 30
-        icon_y = tick_y_top + tick_height + 25
 
         def draw_human_icon(surface, x, y, size, distance):
             half = size // 2
@@ -162,43 +181,77 @@ class StereoARDisplay:
             dist_rect = dist_text.get_rect(center=(x, y + half + 15))
             surface.blit(dist_text, dist_rect)
 
+        icon_t_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0]
+        human_dists = [human_left, human_center, human_right]
         for center_x in [self.center_x_left, self.center_x_right]:
-            local_start = center_x - total_width // 2   
-            segment_width = total_width / 3
-            x_positions = [
-                local_start + segment_width * 0.5,
-                local_start + segment_width * 1.5,
-                local_start + segment_width * 2.5
-            ]
-            human_dists = [human_left, human_center, human_right]
             for idx, dist in enumerate(human_dists):
                 if dist is not None and dist <= 5.0:
-                    draw_human_icon(self.screen, x_positions[idx], icon_y, icon_size, dist)
+                    t = icon_t_centers[idx]
+                    x = center_x + t * arc_half
+                    y = self.icon_base_y - arc_bow * t * t
+                    draw_human_icon(self.screen, x, y, icon_size, dist)
 
-        # 6. 下方三个矩形条（普通障碍物距离）
-        bar_height = 30
-        bar_y = self.height - 70
+        # 6. 分割线（向纵深远方延伸）+ 下方弧形距离条
         color_near = (255, 50, 50)
         color_mid = (255, 200, 50)
         dirs = [('L', left_dist), ('C', center_dist), ('R', right_dist)]
+        bar_t_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0]
+        bar_half_w = 0.28
 
         for center_x in [self.center_x_left, self.center_x_right]:
-            local_start = center_x - total_width // 2
+            # 6a. 三个方向条之间的分割线，向纵深（画面中心/消失点）延伸
+            for gap_t in (-1.0 / 3.0, 1.0 / 3.0):
+                sx0 = center_x + gap_t * arc_half
+                sy0 = self.bar_base_y + arc_bow * gap_t * gap_t
+                dx = center_x - sx0
+                dy = self.center_y - sy0
+                length = math.hypot(dx, dy)
+                if length == 0:
+                    continue
+                ux, uy = dx / length, dy / length
+                sx1 = sx0 + ux * self.divider_len
+                sy1 = sy0 + uy * self.divider_len
+                # 向远端渐暗：分段绘制，越远颜色越淡
+                seg_n = 8
+                for k in range(seg_n):
+                    p0 = k / seg_n
+                    p1 = (k + 1) / seg_n
+                    f0 = 1.0 - self.depth_fade * p0
+                    ax = sx0 + (sx1 - sx0) * p0
+                    ay = sy0 + (sy1 - sy0) * p0
+                    bx = sx0 + (sx1 - sx0) * p1
+                    by = sy0 + (sy1 - sy0) * p1
+                    pygame.draw.line(self.screen, fade(self.divider_color, f0),
+                                     (ax, ay), (bx, by), 2)
+
+            # 6b. 弧形距离条（红/黄），条内距离数字
             for idx, (label, dist) in enumerate(dirs):
-                x = local_start + idx * (bar_width + gap)
                 if dist is None or dist > 6.0:
                     continue
-                fill_color = color_near if dist <= 1.2 else color_mid
-                rect_rect = (x, bar_y, bar_width, bar_height)
-                pygame.draw.rect(self.screen, fill_color, rect_rect)
-                pygame.draw.rect(self.screen, (220, 220, 220), rect_rect, 1)
+                tc = bar_t_centers[idx]
+                base_color = color_near if dist <= 1.2 else color_mid
+                fill_color = fade(base_color, 1.0 - self.depth_fade * tc * tc)
+                pts_top = []
+                pts_bot = []
+                seg = 12
+                for j in range(seg + 1):
+                    t = tc + bar_half_w * (-1.0 + 2.0 * j / seg)
+                    sx = center_x + t * arc_half
+                    yc = self.bar_base_y + arc_bow * t * t
+                    pts_top.append((sx, yc - self.bar_half_h))
+                    pts_bot.append((sx, yc + self.bar_half_h))
+                poly = pts_top + pts_bot[::-1]
+                pygame.draw.polygon(self.screen, fill_color, poly)
+                pygame.draw.polygon(self.screen, (220, 220, 220), poly, 1)
 
-                # 条内距离文字蓝色（红黄底上清晰）
+                # 条内距离文字（蓝色，红黄底上清晰）
                 font = pygame.font.Font(None, 28)
                 text_str = f"{dist:.1f}m"
                 text_surf = font.render(text_str, True, self.colors['hud_blue'])
                 shadow_surf = font.render(text_str, True, (0, 0, 0))
-                text_rect = text_surf.get_rect(center=(x + bar_width//2, bar_y + bar_height//2))
+                text_rect = text_surf.get_rect(
+                    center=(center_x + tc * arc_half,
+                            self.bar_base_y + arc_bow * tc * tc))
                 self.screen.blit(shadow_surf, (text_rect.x + 2, text_rect.y + 2))
                 self.screen.blit(text_surf, text_rect)
 
