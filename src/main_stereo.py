@@ -23,6 +23,10 @@ except Exception:
     sensor_hub = SimulatedSensorHub()
 from data_fusion import DataFusion
 from stereo_ar_display import StereoARDisplay
+try:
+    from gpio_button import GpioButton
+except Exception:
+    GpioButton = None
 
 # 人体静止扫描参数（均可通过环境变量覆盖）
 SCAN_DURATION = float(os.getenv('C4002_SCAN_DURATION', '2.0'))       # 扫描时长 s
@@ -73,6 +77,27 @@ def main():
     scan_stats = {}
     scan_results = []   # 固定结果：[{'angle', 'detected', 'distance'}]
 
+    # 空闲 GPIO 按钮：按一次触发一次人体存在扫描
+    button = None
+    if GpioButton is not None:
+        try:
+            candidate = GpioButton(gpio=os.getenv('BUTTON_GPIO'))
+            if candidate.enabled:
+                button = candidate
+        except Exception:
+            button = None
+
+    def start_scan():
+        """开始一次"静止扫描"：清空各雷达检测计数器，保证扫描窗口干净。"""
+        nonlocal scan_active, scan_start, scan_stats, scan_results
+        for r in sensor_hub.radars:
+            if hasattr(r, 'reset_detection'):
+                r.reset_detection()
+        scan_active = True
+        scan_start = time.time()
+        scan_stats = {}
+        scan_results = []
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -83,14 +108,11 @@ def main():
                 elif event.key == pygame.K_v:
                     display.view_mode = "top" if display.view_mode == "stereo" else "stereo"
                 elif event.key == pygame.K_SPACE:
-                    # 开始一次"静止扫描"：清空各雷达检测计数器，保证扫描窗口干净
-                    for r in sensor_hub.radars:
-                        if hasattr(r, 'reset_detection'):
-                            r.reset_detection()
-                    scan_active = True
-                    scan_start = time.time()
-                    scan_stats = {}
-                    scan_results = []
+                    start_scan()
+
+        # GPIO 按钮触发扫描
+        if button is not None and button.poll():
+            start_scan()
 
         # 获取雷达与超声波数据：
         # C4002 现在只用于"人体静止扫描"，因此仅在扫描窗口内才读取串口；

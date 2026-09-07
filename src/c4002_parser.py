@@ -81,6 +81,9 @@ DEFAULT_DISTANCE_VARIANCE = float(os.getenv('C4002_DISTANCE_VARIANCE', '0.15'))
 # 能量信号（exist_en/move_en）在近距离强反射下会饱和到 99 失去区分度，
 # 而速度是真正的多普勒物理量：静止呼吸的人有低速周期性微变，静止墙面恒为 0。
 DEFAULT_BREATH_SPEED_MAX = int(os.getenv('C4002_BREATH_SPEED_MAX', '20'))   # 呼吸微动速度上限 cm/s
+DEFAULT_BREATH_SPEED_MIN = int(os.getenv('C4002_BREATH_SPEED_MIN', '5'))    # 呼吸微动速度下限 cm/s（过滤微小抖动）
+DEFAULT_BREATH_PERIOD_LEN = int(os.getenv('C4002_BREATH_PERIOD_LEN', '20')) # 周期性检测窗口帧数
+DEFAULT_BREATH_CROSS_MIN = int(os.getenv('C4002_BREATH_CROSS_MIN', '1'))    # 窗口内最少符号翻转(过零)次数
 DEFAULT_MOTION_SPEED_MIN = int(os.getenv('C4002_MOTION_SPEED_MIN', '20'))   # 运动速度下限 cm/s
 # Cap used to reduce influence of saturated (maxed) energy readings when averaging
 DEFAULT_ENERGY_CAP = int(os.getenv('C4002_ENERGY_CAP', '80'))
@@ -115,6 +118,7 @@ class C4002Serial:
         # breath-specific energy smoothing and counters
         breath_len = DEFAULT_BREATH_SMOOTH_LEN if DEFAULT_BREATH_SMOOTH_LEN > 0 else 15
         self.breath_energy_history = deque(maxlen=breath_len)
+        self.move_speed_history = deque(maxlen=DEFAULT_BREATH_PERIOD_LEN if DEFAULT_BREATH_PERIOD_LEN > 0 else 20)
         self.breath_on_count = 0
         self.breath_off_count = 0
         # motion counters
@@ -297,6 +301,7 @@ class C4002Serial:
         self.motion_off_count = 0
         self.energy_history.clear()
         self.breath_energy_history.clear()
+        self.move_speed_history.clear()
         self.presence_history.clear()
         self.dist_history.clear()
         self.last_distance_ema = None
@@ -319,6 +324,29 @@ class C4002Serial:
 
     def _bytes_to_uint32(self, b0, b1, b2, b3):
         return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+
+    def _breath_periodic(self):
+        """判断 move_target_speed 窗口内是否呈现周期性（多次过零）。
+
+        呼吸的胸腔起伏是准正弦速度信号：吸气/呼气使速度在接近(+)与远离(-)
+        之间周期性交替，即符号（正负）多次翻转。无规律的偶发抖动通常不会
+        这样规律过零，缓慢单向移动（速度恒正或恒负）也不会翻转，从而被排除。
+
+        只统计幅度达到速度下限(DEFAULT_BREATH_SPEED_MIN)的有效帧，进一步
+        滤掉 1~4 cm/s 的微小噪声。返回 True 表示窗口内至少出现过
+        DEFAULT_BREATH_CROSS_MIN 次符号翻转。
+        """
+        valid = [s for s in self.move_speed_history if abs(s) >= DEFAULT_BREATH_SPEED_MIN]
+        if len(valid) < 2:
+            return False
+        crosses = 0
+        prev = 1 if valid[0] > 0 else -1
+        for s in valid[1:]:
+            cur = 1 if s > 0 else -1
+            if cur != prev:
+                crosses += 1
+                prev = cur
+        return crosses >= DEFAULT_BREATH_CROSS_MIN
 
     def read_data(self):
         # Returns a dict with keys used by data_fusion: 'distance','signal','presence','angle','sensor_id','valid','timestamp'
@@ -552,8 +580,13 @@ class C4002Serial:
         # breath 证据（单帧，无滞后）——滞后统一交给扫描层聚合判定。
         # 呼吸微动用 move_target_speed 判定：静止呼吸的人会产生低速周期性速度微变，
         # 而静止天花板/墙的速度恒为 0。能量信号在强反射下饱和无区分度，故弃用。
+        # 两层过滤：
+        #   1) 速度幅度下限：|speed| 需 >= DEFAULT_BREATH_SPEED_MIN，过滤微小抖动；
+        #   2) 周期性：窗口内速度符号需多次翻转(过零)，过滤无规律偶发抖动与单向缓慢移动。
         abs_speed = abs(move_target_speed)
-        breath_evidence = raw_presence and (0 < abs_speed <= DEFAULT_BREATH_SPEED_MAX)
+        self.move_speed_history.append(move_target_speed)
+        speed_in_band = DEFAULT_BREATH_SPEED_MIN <= abs_speed <= DEFAULT_BREATH_SPEED_MAX
+        breath_evidence = raw_presence and speed_in_band and self._breath_periodic()
 
         # breath hysteresis counters（带滞后清零）——保留用于 stable_presence 兼容字段
         if breath_evidence:
@@ -681,10 +714,9 @@ class RealSensorHub:
         for i, p in enumerate(ports):
             ang = angles[i] if i < len(angles) else 0
             sensor = C4002Serial(port=p, baud=baud, angle=ang, sensor_id=i)
-            # enable debug via env var C4002_DEBUG=1
+            # 串口打印默认开启；设 C4002_DEBUG=0 可关闭
             import os
-            if os.getenv('C4002_DEBUG') == '1':
-                sensor.debug = True
+            sensor.debug = os.getenv('C4002_DEBUG', '1') != '0'
             # 下发初始化配置（低灵敏度 + 检测范围 + 消失延迟），可通过 C4002_ENABLE_CONFIG=0 关闭
             sensor.configure()
             self.radars.append(sensor)
