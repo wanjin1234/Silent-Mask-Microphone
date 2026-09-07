@@ -81,9 +81,6 @@ DEFAULT_DISTANCE_VARIANCE = float(os.getenv('C4002_DISTANCE_VARIANCE', '0.15'))
 # 能量信号（exist_en/move_en）在近距离强反射下会饱和到 99 失去区分度，
 # 而速度是真正的多普勒物理量：静止呼吸的人有低速周期性微变，静止墙面恒为 0。
 DEFAULT_BREATH_SPEED_MAX = int(os.getenv('C4002_BREATH_SPEED_MAX', '20'))   # 呼吸微动速度上限 cm/s
-DEFAULT_BREATH_SPEED_MIN = int(os.getenv('C4002_BREATH_SPEED_MIN', '5'))    # 呼吸微动速度下限 cm/s（过滤微小抖动）
-DEFAULT_BREATH_PERIOD_LEN = int(os.getenv('C4002_BREATH_PERIOD_LEN', '20')) # 周期性检测窗口帧数
-DEFAULT_BREATH_CROSS_MIN = int(os.getenv('C4002_BREATH_CROSS_MIN', '1'))    # 窗口内最少符号翻转(过零)次数
 DEFAULT_MOTION_SPEED_MIN = int(os.getenv('C4002_MOTION_SPEED_MIN', '20'))   # 运动速度下限 cm/s
 # Cap used to reduce influence of saturated (maxed) energy readings when averaging
 DEFAULT_ENERGY_CAP = int(os.getenv('C4002_ENERGY_CAP', '80'))
@@ -118,7 +115,6 @@ class C4002Serial:
         # breath-specific energy smoothing and counters
         breath_len = DEFAULT_BREATH_SMOOTH_LEN if DEFAULT_BREATH_SMOOTH_LEN > 0 else 15
         self.breath_energy_history = deque(maxlen=breath_len)
-        self.move_speed_history = deque(maxlen=DEFAULT_BREATH_PERIOD_LEN if DEFAULT_BREATH_PERIOD_LEN > 0 else 20)
         self.breath_on_count = 0
         self.breath_off_count = 0
         # motion counters
@@ -301,7 +297,6 @@ class C4002Serial:
         self.motion_off_count = 0
         self.energy_history.clear()
         self.breath_energy_history.clear()
-        self.move_speed_history.clear()
         self.presence_history.clear()
         self.dist_history.clear()
         self.last_distance_ema = None
@@ -324,29 +319,6 @@ class C4002Serial:
 
     def _bytes_to_uint32(self, b0, b1, b2, b3):
         return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
-
-    def _breath_periodic(self):
-        """判断 move_target_speed 窗口内是否呈现周期性（多次过零）。
-
-        呼吸的胸腔起伏是准正弦速度信号：吸气/呼气使速度在接近(+)与远离(-)
-        之间周期性交替，即符号（正负）多次翻转。无规律的偶发抖动通常不会
-        这样规律过零，缓慢单向移动（速度恒正或恒负）也不会翻转，从而被排除。
-
-        只统计幅度达到速度下限(DEFAULT_BREATH_SPEED_MIN)的有效帧，进一步
-        滤掉 1~4 cm/s 的微小噪声。返回 True 表示窗口内至少出现过
-        DEFAULT_BREATH_CROSS_MIN 次符号翻转。
-        """
-        valid = [s for s in self.move_speed_history if abs(s) >= DEFAULT_BREATH_SPEED_MIN]
-        if len(valid) < 2:
-            return False
-        crosses = 0
-        prev = 1 if valid[0] > 0 else -1
-        for s in valid[1:]:
-            cur = 1 if s > 0 else -1
-            if cur != prev:
-                crosses += 1
-                prev = cur
-        return crosses >= DEFAULT_BREATH_CROSS_MIN
 
     def read_data(self):
         # Returns a dict with keys used by data_fusion: 'distance','signal','presence','angle','sensor_id','valid','timestamp'
@@ -580,14 +552,8 @@ class C4002Serial:
         # breath 证据（单帧，无滞后）——滞后统一交给扫描层聚合判定。
         # 呼吸微动用 move_target_speed 判定：静止呼吸的人会产生低速周期性速度微变，
         # 而静止天花板/墙的速度恒为 0。能量信号在强反射下饱和无区分度，故弃用。
-        # 两层过滤：
-        #   1) 速度幅度下限：|speed| 需 >= DEFAULT_BREATH_SPEED_MIN，过滤微小抖动；
-        #   2) 周期性：窗口内速度符号需多次翻转(过零)，过滤无规律偶发抖动与单向缓慢移动。
         abs_speed = abs(move_target_speed)
-        self.move_speed_history.append(move_target_speed)
-        speed_in_band = DEFAULT_BREATH_SPEED_MIN <= abs_speed <= DEFAULT_BREATH_SPEED_MAX
-        periodic = self._breath_periodic()
-        breath_evidence = raw_presence and speed_in_band and periodic
+        breath_evidence = raw_presence and (0 < abs_speed <= DEFAULT_BREATH_SPEED_MAX)
 
         # breath hysteresis counters（带滞后清零）——保留用于 stable_presence 兼容字段
         if breath_evidence:
@@ -629,11 +595,7 @@ class C4002Serial:
 
         # motion detection：速度超过运动阈值，或距离显著变化（速度字段偶发为 0 时的兜底）
         DISTANCE_VARIANCE_THRESHOLD = DEFAULT_DISTANCE_VARIANCE
-        # 慢速单向移动：速度落在呼吸带内、但无周期翻转，说明是持续单方向的移动而非呼吸，
-        # 应归为运动，避免慢走者落入“既不算呼吸也不够运动速度”的死区。
-        # 用 DEFAULT_BREATH_ON 作为最小历史帧数门控，避免呼吸者头几帧（尚不足以判定周期）被误当运动。
-        slow_steady_motion = speed_in_band and (not periodic) and len(self.move_speed_history) >= DEFAULT_BREATH_ON
-        motion_condition = (abs_speed > DEFAULT_MOTION_SPEED_MIN) or slow_steady_motion or (distance_variation >= DISTANCE_VARIANCE_THRESHOLD)
+        motion_condition = (abs_speed > DEFAULT_MOTION_SPEED_MIN) or (distance_variation >= DISTANCE_VARIANCE_THRESHOLD)
 
         # motion hysteresis counters
         if raw_presence and motion_condition:
@@ -688,7 +650,7 @@ class C4002Serial:
 
         # debug logging if enabled
         if getattr(self, 'debug', False):
-            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} move_speed:{move_target_speed} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_speed_min:{DEFAULT_MOTION_SPEED_MIN} dist_var:{distance_variation:.3f} dist_var_th:{DISTANCE_VARIANCE_THRESHOLD} motion:{motion_condition} periodic:{periodic} slow_motion:{slow_steady_motion} saturated:{saturated} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
+            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} move_speed:{move_target_speed} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_speed_min:{DEFAULT_MOTION_SPEED_MIN} dist_var:{distance_variation:.3f} dist_var_th:{DISTANCE_VARIANCE_THRESHOLD} motion:{motion_condition} saturated:{saturated} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
 
         return {
             'distance': float(out_distance),
@@ -719,9 +681,10 @@ class RealSensorHub:
         for i, p in enumerate(ports):
             ang = angles[i] if i < len(angles) else 0
             sensor = C4002Serial(port=p, baud=baud, angle=ang, sensor_id=i)
-            # 串口打印默认开启；设 C4002_DEBUG=0 可关闭
+            # enable debug via env var C4002_DEBUG=1
             import os
-            sensor.debug = os.getenv('C4002_DEBUG', '1') != '0'
+            if os.getenv('C4002_DEBUG') == '1':
+                sensor.debug = True
             # 下发初始化配置（低灵敏度 + 检测范围 + 消失延迟），可通过 C4002_ENABLE_CONFIG=0 关闭
             sensor.configure()
             self.radars.append(sensor)

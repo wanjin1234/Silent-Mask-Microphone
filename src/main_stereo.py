@@ -1,6 +1,7 @@
 import time
 import pygame
 import os
+import threading
 from simulated_sensors import SimulatedSensorHub
 # try to use real C4002 driver if available; set RADAR_PORTS env var to comma-separated ports (e.g. /dev/ttyUSB0,/dev/ttyUSB1,/dev/ttyUSB2)
 try:
@@ -72,61 +73,42 @@ def _robust_distance(dists):
         kept = sd
     return kept[len(kept) // 2]
 
-def main():
-    # reuse sensor_hub created at module import time (RealSensorHub or SimulatedSensorHub)
+def sensor_worker(lock, state, scan_trigger, stop_event):
+    """后台采集线程：串口/超声波读取、扫描证据聚合、融合均在此执行。
+
+    超声波 measure() 每次最多阻塞 50~80ms、三路串行可达 150ms+，若放在渲染
+    主循环会导致帧率骤降、扫描弧动画"跳格"。移入独立线程后，渲染主循环只做
+    读取共享状态 + 绘制，稳定跑满 60fps。
+    """
     fusion = DataFusion()
-    display = StereoARDisplay(1920, 1080)
+    SENSOR_HZ = float(os.getenv('C4002_SENSOR_HZ', '20'))
+    SENSOR_INTERVAL = 1.0 / SENSOR_HZ
 
-    running = True
-    clock = pygame.time.Clock()
-
-    # 人体扫描状态（逐雷达）
     scan_active = False
     scan_start = 0.0
-    # key: angle -> {'breath': 呼吸证据帧数, 'motion': 运动证据帧数, 'dists': [有效距离列表]}
     scan_stats = {}
-    scan_results = []   # 固定结果：[{'angle', 'detected', 'distance'}]
+    scan_results = []
 
-    # 空闲 GPIO 按钮：按一次触发一次人体存在扫描
-    button = None
-    if GpioButton is not None:
-        try:
-            candidate = GpioButton(gpio=os.getenv('BUTTON_GPIO'))
-            if candidate.enabled:
-                button = candidate
-        except Exception:
-            button = None
+    last_t = 0.0
+    while not stop_event.is_set():
+        # 处理扫描触发请求（来自主线程 SPACE / GPIO 按钮）
+        if scan_trigger.is_set():
+            scan_trigger.clear()
+            for r in sensor_hub.radars:
+                if hasattr(r, 'reset_detection'):
+                    r.reset_detection()
+            scan_active = True
+            scan_start = time.time()
+            scan_stats = {}
+            scan_results = []
 
-    def start_scan():
-        """开始一次"静止扫描"：清空各雷达检测计数器，保证扫描窗口干净。"""
-        nonlocal scan_active, scan_start, scan_stats, scan_results
-        for r in sensor_hub.radars:
-            if hasattr(r, 'reset_detection'):
-                r.reset_detection()
-        scan_active = True
-        scan_start = time.time()
-        scan_stats = {}
-        scan_results = []
+        now = time.time()
+        if now - last_t < SENSOR_INTERVAL:
+            time.sleep(0.001)
+            continue
+        last_t = now
 
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_v:
-                    display.view_mode = "top" if display.view_mode == "stereo" else "stereo"
-                elif event.key == pygame.K_SPACE:
-                    start_scan()
-
-        # GPIO 按钮触发扫描
-        if button is not None and button.poll():
-            start_scan()
-
-        # 获取雷达与超声波数据：
-        # C4002 现在只用于"人体静止扫描"，因此仅在扫描窗口内才读取串口；
-        # 障碍物距离完全交给超声波（radar_data 传空，融合层只走超声波路径）。
+        # 获取雷达与超声波数据
         if scan_active:
             radar_data = [r.read_data() for r in sensor_hub.radars]
         else:
@@ -161,32 +143,102 @@ def main():
                         'distance': _robust_distance(st['dists'])
                     })
 
-        # 更新扫描状态提示
-        if scan_active:
-            remain = max(0.0, SCAN_DURATION - (time.time() - scan_start))
-            display.set_scan_status(f"扫描中... {remain:.1f}s 请保持静止", (0, 200, 255))
-        elif scan_results:
-            n = sum(1 for r in scan_results if r['detected'])
-            if n > 0:
-                display.set_scan_status(f"检测到 {n} 个方向有幸存者", (0, 255, 80))
-            else:
-                display.set_scan_status("未检测到幸存者", (255, 90, 90))
-        else:
-            display.set_scan_status(None)
-
-        # 把固定扫描结果传给显示层（直到下次扫描前保持不变）
-        display.set_scan_results(scan_results)
-
         # 融合：返回障碍物（人体检测已改为手动扫描 + 固定显示，不再走实时融合）
         obstacles_raw, _ = fusion.fuse_measurements(radar_data, ultrasonic_data)
         # 时间滤波：仅障碍物
         obstacles, _ = fusion.temporal_filter(obstacles_raw, [])
 
-        # 显示：障碍物 + 固定扫描人体图标
-        display.draw_obstacles(obstacles)
+        # 发布共享状态（供渲染主循环非阻塞读取）
+        with lock:
+            state['obstacles'] = obstacles
+            state['scan_results'] = list(scan_results)
+            state['scan_active'] = scan_active
+            state['scan_start_time'] = scan_start
 
-        clock.tick(20)
 
+def main():
+    # reuse sensor_hub created at module import time (RealSensorHub or SimulatedSensorHub)
+    display = StereoARDisplay(1920, 1080)
+
+    running = True
+    clock = pygame.time.Clock()
+
+    # 共享状态 + 后台采集线程
+    lock = threading.Lock()
+    state = {
+        'obstacles': [],
+        'scan_results': [],
+        'scan_active': False,
+        'scan_start_time': 0.0,
+    }
+    scan_trigger = threading.Event()
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=sensor_worker, args=(lock, state, scan_trigger, stop_event), daemon=True)
+    worker.start()
+
+    # FPS 统计：每 0.5s 更新一次实测帧率，并绘制到画面左上角（设 C4002_SHOW_FPS=0 关闭）
+    show_fps = os.getenv('C4002_SHOW_FPS', '1') != '0'
+    fps_frames = 0
+    fps_t0 = time.time()
+    fps_current = 0.0
+
+    # 空闲 GPIO 按钮：按一次触发一次人体存在扫描
+    button = None
+    if GpioButton is not None:
+        try:
+            candidate = GpioButton(gpio=os.getenv('BUTTON_GPIO'))
+            if candidate.enabled:
+                button = candidate
+        except Exception:
+            button = None
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_v:
+                    display.view_mode = "top" if display.view_mode == "stereo" else "stereo"
+                elif event.key == pygame.K_SPACE:
+                    scan_trigger.set()
+
+        # GPIO 按钮触发扫描
+        if button is not None and button.poll():
+            scan_trigger.set()
+
+        # 读取最新共享状态（非阻塞）
+        with lock:
+            obstacles = state['obstacles']
+            scan_results = state['scan_results']
+            scan_active = state['scan_active']
+            scan_start_time = state['scan_start_time']
+
+        # 把扫描进行状态/起始时间传给显示层（触发扫描推进弧动画）
+        display.set_scan_active(scan_active, scan_start_time if scan_active else None)
+        display.set_scan_results(scan_results)
+
+        # FPS 统计：每 0.5s 重新计算一次实测帧率
+        if show_fps:
+            fps_frames += 1
+            now_f = time.time()
+            if now_f - fps_t0 >= 0.5:
+                fps_current = fps_frames / (now_f - fps_t0)
+                fps_frames = 0
+                fps_t0 = now_f
+
+        # 显示：障碍物 + 固定扫描人体图标（fps 叠加到画面左上角）
+        display.draw_obstacles(obstacles, fps_current if show_fps else None)
+
+        clock.tick(30)
+
+    stop_event.set()
+    # 等待后台采集线程退出：雷达/超声波一次测距最多阻塞几十~上百毫秒，
+    # 留足时间确保线程在解释器退出前结束，避免守护线程在 shutdown 阶段
+    # 还持有 stderr 缓冲锁导致 "could not acquire lock for stderr" 致命错误。
+    worker.join(timeout=5.0)
     pygame.quit()
 
 if __name__ == "__main__":

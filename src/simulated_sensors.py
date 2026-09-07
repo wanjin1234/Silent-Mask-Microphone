@@ -16,6 +16,12 @@ class SimulatedRadar:
             'distance': distance,
             'signal': random.randint(50, 200),
             'presence': presence,          # 人体存在标志
+            'presence_raw': presence,
+            'presence_stable': presence,
+            # 与真实 C4002 解析器保持一致：扫描聚合层消费 breath_evidence / motion
+            'breath_evidence': presence,
+            'motion': presence,
+            'target_status': 1 if presence else 0,
             'angle': self.angle,
             'sensor_id': self.sensor_id,
             'valid': True,
