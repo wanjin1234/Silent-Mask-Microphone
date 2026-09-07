@@ -6,15 +6,25 @@ from simulated_sensors import SimulatedSensorHub
 try:
     from c4002_parser import RealSensorHub
     ports_env = os.getenv('RADAR_PORTS')
+    # RADAR_ANGLES：显式指定每个端口对应的角度（逗号分隔），顺序与 RADAR_PORTS 一致。
+    # 例如 RADAR_PORTS=/dev/serial/by-path/p1,/dev/serial/by-path/p2,/dev/serial/by-path/p3
+    #     RADAR_ANGLES=-45,0,45
+    angles_env = os.getenv('RADAR_ANGLES')
+    angles = None
+    if angles_env:
+        try:
+            angles = [float(a.strip()) for a in angles_env.split(',') if a.strip()]
+        except Exception:
+            angles = None
     if ports_env:
         ports = [p.strip() for p in ports_env.split(',') if p.strip()]
-        sensor_hub = RealSensorHub(ports=ports)
+        sensor_hub = RealSensorHub(ports=ports, angles=angles)
     else:
         # default to common USB ports for 3 sensors if running on Linux/embedded (user confirmed /dev/ttyUSB0-2)
         try:
             if os.name != 'nt':
                 fallback_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2']
-                sensor_hub = RealSensorHub(ports=fallback_ports)
+                sensor_hub = RealSensorHub(ports=fallback_ports, angles=angles)
             else:
                 sensor_hub = SimulatedSensorHub()
         except Exception:
@@ -31,7 +41,7 @@ except Exception:
 # 人体静止扫描参数（均可通过环境变量覆盖）
 SCAN_DURATION = float(os.getenv('C4002_SCAN_DURATION', '2.0'))       # 扫描时长 s
 SCAN_BREATH_MIN = int(os.getenv('C4002_SCAN_BREATH_MIN', '2'))       # 单雷达呼吸证据命中帧数阈值
-SCAN_MOTION_MIN = int(os.getenv('C4002_SCAN_MOTION_MIN', '3'))       # 单雷达运动证据命中帧数阈值
+SCAN_MOTION_MIN = int(os.getenv('C4002_SCAN_MOTION_MIN', '2'))       # 单雷达运动证据命中帧数阈值
 
 
 def _robust_distance(dists):
