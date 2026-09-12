@@ -81,8 +81,9 @@ class StereoARDisplay:
         self.divider_color = (0, 140, 200)  # 分割线颜色（略暗，作为纵深元素）
         self.depth_fade = 0.5      # 深度衰减强度(0~1)：越大，边缘(远处)越暗越细
 
-        # 扫描波纹单次扩散耗时，与人体静止扫描时长保持一致（s）
-        self.scan_duration = float(os.getenv('C4002_SCAN_DURATION', '2.0'))
+        # 扫描波纹单次扩散耗时，与人体静止扫描时长保持一致（s）。
+        # 必须与 main_stereo.SCAN_DURATION 默认值一致（只测移动的人，3s）。
+        self.scan_duration = float(os.getenv('C4002_SCAN_DURATION', '3.0'))
 
         # 扫描推进弧动画状态（仅在扫描期间显示）
         self.scan_active = False

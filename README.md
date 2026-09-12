@@ -10,7 +10,7 @@ A project for Tsinghua University Hardware Design Competition,aiming at reduce t
 - **人体（幸存者）方向与距离** —— 黄色警示图标 + 距离数值；
 - **普通障碍物方向与距离** —— 红/黄距离条。
 
-救援人员**移动到位置 → 停下 → 按一下按钮**触发一次约 2 秒的「人体存在扫描」，
+救援人员**移动到位置 → 停下 → 按一下按钮**触发一次约 2 秒的「人体存在扫描」（检测移动的人），
 扫描结果固定在视野中，帮助定位幸存者方位；同时超声波持续提供近距离避障信息。
 
 ## 系统组成
@@ -53,12 +53,14 @@ A project for Tsinghua University Hardware Design Competition,aiming at reduce t
 ### 人体检测（C4002 毫米波雷达）
 
 - 触发方式：GPIO 按钮（或空格键）触发一次**扫描窗口**（`C4002_SCAN_DURATION`，默认 2s）。
-- 判定：**呼吸 + 运动**。扫描窗口内，某方向雷达的呼吸证据命中帧数达到
-  `C4002_SCAN_BREATH_MIN`，或运动证据命中帧数达到 `C4002_SCAN_MOTION_MIN`，即判「有人」。
-- 呼吸证据：静止呼吸的人胸腔起伏会产生低速周期性速度微变
-  （`0 < |move_target_speed| <= C4002_BREATH_SPEED_MAX`）。
-- 运动证据：速度超过 `C4002_MOTION_SPEED_MIN`，或短时距离变化超过
-  `C4002_DISTANCE_VARIANCE`。
+- 判定：**只检测移动的人**（走动 / 挥手），基于雷达的多普勒速度 `move_speed`。
+  **不使用**固件学习出的 presence / target_status，零校准、零环境学习，即插即用。
+- 极低速杂波滤除：|move_speed| 低于 `C4002_SPEED_DEADZONE`（默认 2 cm/s）一律按 0 处理，
+  滤除传感器噪声 / 桌面微振动；超过 `C4002_MOTION_SPEED_MIN`（默认 20 cm/s）才算运动。
+- 扫描窗口内某方向运动证据命中帧数达到 `C4002_SCAN_MOTION_MIN` 即判「有人」。
+
+> 说明：完全静止（只呼吸、无任何动作）的人，C4002 无法在不做环境校准的情况下
+> 与静态背景区分，故本项目明确只覆盖「移动 / 挥手可被探测」的幸存者场景。
 
 ### 障碍物检测（JSN-SR04T 超声波）
 
@@ -117,13 +119,13 @@ export RADAR_ANGLES=-45,0,45
 
 > 已把本项目实际映射固化到 `run.sh`，直接 `bash run.sh` 启动即可（端口 = by-path，角度 = 左 -45° / 中 0° / 右 +45°）。
 
-## 呼吸 / 运动判定阈值
+## 运动判定阈值
 
 | 变量 | 说明 | 默认 |
 | --- | --- | --- |
-| `C4002_SCAN_DURATION` | 单次扫描时长 s | `2.0` |
-| `C4002_SCAN_BREATH_MIN` | 判「有人」所需呼吸证据命中帧数 | `2` |
-| `C4002_SCAN_MOTION_MIN` | 判「有人」所需运动证据命中帧数 | `2` |
-| `C4002_BREATH_SPEED_MAX` | 呼吸微动速度上限 cm/s | `20` |
-| `C4002_MOTION_SPEED_MIN` | 运动速度下限 cm/s | `20` |
+| `C4002_SCAN_DURATION` | 单次扫描时长 s | `3.0` |
+| `C4002_SCAN_MOTION_MIN` | 判「有人」所需运动命中帧数 | `1` |
+| `C4002_SPEED_DEADZONE` | 极低速杂波死区 cm/s（低于此值按 0） | `2` |
+| `C4002_MOTION_SPEED_MIN` | 运动速度下限 cm/s（挥手慢速段 3~7） | `5` |
 | `C4002_DISTANCE_VARIANCE` | 运动判定的距离变化阈值 m | `0.15` |
+| `C4002_CONFIG_REPORT_PERIOD` | 上报周期（0.1s 单位） | `1`（10Hz） |

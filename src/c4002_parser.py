@@ -81,7 +81,8 @@ DEFAULT_DISTANCE_VARIANCE = float(os.getenv('C4002_DISTANCE_VARIANCE', '0.15'))
 # 能量信号（exist_en/move_en）在近距离强反射下会饱和到 99 失去区分度，
 # 而速度是真正的多普勒物理量：静止呼吸的人有低速周期性微变，静止墙面恒为 0。
 DEFAULT_BREATH_SPEED_MAX = int(os.getenv('C4002_BREATH_SPEED_MAX', '20'))   # 呼吸微动速度上限 cm/s
-DEFAULT_MOTION_SPEED_MIN = int(os.getenv('C4002_MOTION_SPEED_MIN', '20'))   # 运动速度下限 cm/s
+DEFAULT_MOTION_SPEED_MIN = int(os.getenv('C4002_MOTION_SPEED_MIN', '5'))    # 运动速度下限 cm/s（挥手慢速段 3~7，中距离峰值更弱，取 5）
+DEFAULT_SPEED_DEADZONE = int(os.getenv('C4002_SPEED_DEADZONE', '2'))        # 极低速杂波死区 cm/s
 # Cap used to reduce influence of saturated (maxed) energy readings when averaging
 DEFAULT_ENERGY_CAP = int(os.getenv('C4002_ENERGY_CAP', '80'))
 DEFAULT_SATURATION_DISTANCE = float(os.getenv('C4002_SATURATION_DISTANCE', '3.5'))  # meters
@@ -159,11 +160,16 @@ class C4002Serial:
             return None
         deadline = time.time() + timeout
         while time.time() < deadline:
-            header = self.ser.read(8)
-            if not header or len(header) < 8:
+            # 逐字节搜索帧头：流里混有通知帧/半帧时，固定 read(8) 会永久失步，
+            # 导致配置命令永远收不到响应（configure result: False）。
+            b = self.ser.read(1)
+            if not b or b[0] != FRAME_HEADER1:
                 continue
-            h = list(header)
-            if not (h[0] == FRAME_HEADER1 and h[1] == FRAME_HEADER2 and h[2] == FRAME_HEADER3 and h[3] == FRAME_HEADER4):
+            rest = self.ser.read(7)
+            if not rest or len(rest) < 7:
+                continue
+            h = [b[0]] + list(rest)
+            if not (h[1] == FRAME_HEADER2 and h[2] == FRAME_HEADER3 and h[3] == FRAME_HEADER4):
                 continue
             pack_len = (h[5] << 8) | h[4]
             if pack_len < 8 or pack_len > 64:
@@ -245,6 +251,7 @@ class C4002Serial:
           C4002_CONFIG_RESTART        配置后是否重启生效，默认 0
           C4002_AUTO_CALIBRATE        启动时自动环境底噪校准，默认 0（设为 1 开启）
           C4002_CALIBRATE_CONT_S      校准采样持续时长 s，默认 30
+          C4002_CONFIG_REPORT_PERIOD  上报周期（0.1s 单位），默认 1（=10Hz，呼吸检测需要）
         """
         if self.ser is None:
             return False
@@ -264,6 +271,11 @@ class C4002Serial:
         ok = self.set_detect_range(closest, farthest) and ok
         time.sleep(0.05)
         ok = self.set_target_disappear_delay(disappear) and ok
+        time.sleep(0.05)
+        # 上报周期（0.1s 单位）：呼吸检测需要较高采样率，才能在 0.1~0.6Hz 呼吸频段
+        # 采集到足够样本做自相关周期估计。默认 1 -> 0.1s = 10Hz。
+        report_period = int(os.getenv('C4002_CONFIG_REPORT_PERIOD', '1'))
+        ok = self.set_report_period(report_period) and ok
         time.sleep(0.05)
 
         # 环境底噪校准：让雷达把当前静态背景（如天花板强反射）学习为底噪，
@@ -420,6 +432,10 @@ class C4002Serial:
         # speed is int16 (signed)
         if move_target_speed & 0x8000:
             move_target_speed -= 0x10000
+        # 极低速死区：滤除传感器噪声/桌面微振动产生的无意义低速杂波。
+        # |speed| 低于死区一律按 0（静止）处理，只有明显移动（挥手/走动）才保留。
+        if abs(move_target_speed) < DEFAULT_SPEED_DEADZONE:
+            move_target_speed = 0
         move_target_energy = pdata[base + 16] if (base + 16) < len(pdata) else 0
         move_target_direct = pdata[base + 17] if (base + 17) < len(pdata) else 0
 
@@ -550,10 +566,11 @@ class C4002Serial:
             self.presence_on_count = 0
 
         # breath 证据（单帧，无滞后）——滞后统一交给扫描层聚合判定。
-        # 呼吸微动用 move_target_speed 判定：静止呼吸的人会产生低速周期性速度微变，
-        # 而静止天花板/墙的速度恒为 0。能量信号在强反射下饱和无区分度，故弃用。
+        # 呼吸微动【纯物理判定】：只用多普勒速度 move_target_speed，
+        # 不依赖 raw_presence/target_status（固件在已学习固定场景下才可靠，陌生环境不可信）。
+        # 静止呼吸的人 → 低速周期性速度微变；静止墙面/天花板 → 速度恒为 0。
         abs_speed = abs(move_target_speed)
-        breath_evidence = raw_presence and (0 < abs_speed <= DEFAULT_BREATH_SPEED_MAX)
+        breath_evidence = (0 < abs_speed <= DEFAULT_BREATH_SPEED_MAX)
 
         # breath hysteresis counters（带滞后清零）——保留用于 stable_presence 兼容字段
         if breath_evidence:
@@ -593,12 +610,12 @@ class C4002Serial:
         if len(nonzero) >= 2:
             distance_variation = max(nonzero) - min(nonzero)
 
-        # motion detection：速度超过运动阈值，或距离显著变化（速度字段偶发为 0 时的兜底）
-        DISTANCE_VARIANCE_THRESHOLD = DEFAULT_DISTANCE_VARIANCE
-        motion_condition = (abs_speed > DEFAULT_MOTION_SPEED_MIN) or (distance_variation >= DISTANCE_VARIANCE_THRESHOLD)
+        # motion detection：只用多普勒速度。距离变化兜底已废弃——exist 通道距离在
+        # 强反射下跳变严重（调试中 motion:True 却 move_speed:0），会误触发运动。
+        motion_condition = (abs_speed > DEFAULT_MOTION_SPEED_MIN)
 
-        # motion hysteresis counters
-        if raw_presence and motion_condition:
+        # motion hysteresis counters（纯物理：速度/距离变化，不依赖 target_status）
+        if motion_condition:
             self.motion_on_count += 1
             self.motion_off_count = 0
         else:
@@ -650,7 +667,7 @@ class C4002Serial:
 
         # debug logging if enabled
         if getattr(self, 'debug', False):
-            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} move_speed:{move_target_speed} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_speed_min:{DEFAULT_MOTION_SPEED_MIN} dist_var:{distance_variation:.3f} dist_var_th:{DISTANCE_VARIANCE_THRESHOLD} motion:{motion_condition} saturated:{saturated} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
+            print(f"[C4002] sensor:{self.sensor_id} type:{chosen_type} raw_exist_cm:{exist_target_distance} exist_en:{exist_target_energy} move_cm:{move_target_distance} move_en:{move_target_energy} move_speed:{move_target_speed} chosen_m:{distance_m:.2f} med:{med:.2f} avg_en:{avg_energy:.1f} avg_move_en:{avg_move_energy:.1f} sel_th:{SELECTION_THRESHOLD} pres_th:{PRESENCE_THRESHOLD} breath_th:{DEFAULT_BREATH_ENERGY_THRESHOLD} breath_on:{self.breath_on_count}/{DEFAULT_BREATH_ON} mot_on:{self.motion_on_count}/{DEFAULT_PRESENCE_ON} mot_speed_min:{DEFAULT_MOTION_SPEED_MIN} motion:{motion_condition} saturated:{saturated} on_count:{self.presence_on_count} off_count:{self.presence_off_count} pres_hist:{list(self.presence_history)}")
 
         return {
             'distance': float(out_distance),
@@ -661,6 +678,12 @@ class C4002Serial:
             'breath_evidence': int(breath_evidence),
             'motion': int(motion_condition),
             'target_status': int(target_status),
+            # 原始物理量（不含任何固件学习出的分类字段），供呼吸检测器使用
+            'move_speed': int(move_target_speed),
+            'move_distance': float(move_target_distance) * 0.01,
+            'move_energy': int(move_target_energy),
+            'exist_distance': float(exist_target_distance) * 0.01,
+            'exist_energy': int(exist_target_energy),
             'angle': self.angle,
             'sensor_id': self.sensor_id,
             'valid': True if out_distance > 0 else False,

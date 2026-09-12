@@ -40,9 +40,10 @@ except Exception:
     GpioButton = None
 
 # 人体静止扫描参数（均可通过环境变量覆盖）
-SCAN_DURATION = float(os.getenv('C4002_SCAN_DURATION', '2.0'))       # 扫描时长 s
-SCAN_BREATH_MIN = int(os.getenv('C4002_SCAN_BREATH_MIN', '2'))       # 单雷达呼吸证据命中帧数阈值
-SCAN_MOTION_MIN = int(os.getenv('C4002_SCAN_MOTION_MIN', '2'))       # 单雷达运动证据命中帧数阈值
+# 扫描时长：只检测移动的人（挥手/走动）。雷达上报约 1Hz，3s 能采到约 3 帧，
+# 覆盖一个挥手周期，降低峰值恰好落在采样折返点上的漏检概率。
+SCAN_DURATION = float(os.getenv('C4002_SCAN_DURATION', '3.0'))       # 扫描时长 s
+SCAN_MOTION_MIN = int(os.getenv('C4002_SCAN_MOTION_MIN', '1'))       # 判「有人」所需运动命中帧数（1=任一帧达标即判）
 
 
 def _robust_distance(dists):
@@ -115,32 +116,35 @@ def sensor_worker(lock, state, scan_trigger, stop_event):
             radar_data = []
         ultrasonic_data = [u.read_data() for u in sensor_hub.ultrasonics]
 
-        # 扫描期间逐雷达累计证据：呼吸证据（单帧）+ 运动证据（单帧），并收集有效距离
+        # 扫描期间逐雷达累计证据：运动证据（单帧）+ 呼吸周期检测器（窗口级物理判定），
+        # 并收集有效距离。呼吸不再依赖雷达固件学习出的 presence/target_status 字段。
         if scan_active:
             for d in radar_data:
-                if not d or not d.get('valid'):
+                if not d:
                     continue
-                ang = d.get('angle', 0)
-                st = scan_stats.setdefault(ang, {'breath': 0, 'motion': 0, 'dists': []})
-                # 单帧证据，滞后统一在扫描结束时按"命中帧数"判定，避免双层滞后
-                if d.get('breath_evidence') == 1:
-                    st['breath'] += 1
+                ang = d.get('angle')
+                if ang is None:
+                    # 无效帧（未接雷达/读不到帧）没有 angle 键，跳过
+                    continue
+                st = scan_stats.setdefault(ang, {'motion': 0, 'dists': []})
+                # 运动检测独立于 valid（距离）——挥手时速度有值但距离字段偶发为 0，
+                # 若用 valid 门控整帧会漏掉挥手。motion 只依赖 move_speed 物理量。
                 if d.get('motion') == 1:
                     st['motion'] += 1
                 dist = d.get('distance')
-                if dist and dist > 0:
+                if d.get('valid') and dist and dist > 0:
                     st['dists'].append(dist)
 
             if time.time() - scan_start >= SCAN_DURATION:
                 scan_active = False
-                # 每个雷达输出一个固定结果：呼吸或运动任一达标即判"有人"
+                # 每个雷达输出一个固定结果：运动证据命中帧数达标即判"有人"
                 for ang in sorted(scan_stats.keys()):
                     st = scan_stats[ang]
-                    detected = st['breath'] >= SCAN_BREATH_MIN or st['motion'] >= SCAN_MOTION_MIN
+                    detected = st['motion'] >= SCAN_MOTION_MIN
                     scan_results.append({
                         'angle': ang,
                         'detected': detected,
-                        'distance': _robust_distance(st['dists'])
+                        'distance': _robust_distance(st['dists']),
                     })
 
         # 融合：返回障碍物（人体检测已改为手动扫描 + 固定显示，不再走实时融合）
