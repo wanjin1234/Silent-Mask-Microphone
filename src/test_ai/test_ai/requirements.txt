@@ -1,0 +1,16 @@
+# test_ai 依赖
+#
+# 开发机（x86 Windows/Linux/macOS）：numpy + tensorflow 即可跑通全部脚本。
+#   pip install -r requirements.txt
+#
+# 树莓派（aarch64）注意：PyPI 没有 aarch64 的 tensorflow CPU wheel，
+# 通常需要下面之一，否则请改用 baseline_numpy.py（只依赖 numpy）：
+#   pip install tensorflow-aarch64        # 社区维护的 aarch64 轮子
+#   pip install ai-edge-litert            # 只装 TFLite 解释器（推荐，最轻）
+#   pip install tflite-runtime            # 旧包名，部分镜像仍可用
+#
+# test_ai 只额外依赖 numpy；不依赖 scikit-learn / pandas。
+# 雷达串口依赖 pyserial（与主项目共用，已在主项目环境中）。
+
+numpy>=1.24
+tensorflow>=2.16; platform_machine != "aarch64"
