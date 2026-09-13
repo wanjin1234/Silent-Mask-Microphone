@@ -256,7 +256,7 @@ class StereoARDisplay:
                                  (x_pos, y_top + tick_len), tick_w)
 
         # 人体信号图标（沿弧线排布，对齐三个方向）
-        icon_size = int(30 * self.ui_scale)
+        icon_size = int(45 * self.ui_scale)
 
         def draw_human_icon(surface, x, y, size, distance):
             half = size // 2
@@ -270,10 +270,10 @@ class StereoARDisplay:
             ex_rect = exclaim.get_rect(center=(x, y))
             surface.blit(exclaim, ex_rect)
 
-            # 距离数值（浅蓝色）
-            font_dist = self._font(max(14, int(20 * self.ui_scale)))
+            # 距离数值（浅蓝色，紧挨图标下方且与图标中心对齐）
+            font_dist = self._font(max(18, int(30 * self.ui_scale)))
             dist_text = font_dist.render(f"{distance:.1f}m", True, hud_blue)
-            dist_rect = dist_text.get_rect(center=(x, y + half + int(15 * self.ui_scale)))
+            dist_rect = dist_text.get_rect(center=(x, y + half + int(17 * self.ui_scale)))
             surface.blit(dist_text, dist_rect)
 
         icon_t_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0]
