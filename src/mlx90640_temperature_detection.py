@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import signal
 import statistics
 import sys
@@ -216,19 +217,82 @@ def refresh_rate_enum(rate_hz: float):
     return rates[rate_hz]
 
 
+class _SmbusI2C:
+    """把 smbus2 封装成 adafruit_bus_device 所需的 busio 兼容接口。
+
+    Adafruit 的 MLX90640 库通过 board/busio 只能使用 I2C1（GPIO2/3）。
+    若传感器接到其他 I2C 总线（例如树莓派 4B 的 I2C4：SDA=GPIO8/物理24、
+    SCL=GPIO9/物理21，需先在 config.txt 加 dtoverlay=i2c4），就用本类通过
+    smbus2 直接操作对应的 /dev/i2c-N 设备。
+    """
+
+    def __init__(self, bus: int, frequency: int = 400_000) -> None:
+        import smbus2
+
+        self._smbus2 = smbus2
+        self._bus = smbus2.SMBus(bus)
+        self._frequency = frequency
+
+    def try_lock(self) -> bool:
+        return True
+
+    def unlock(self) -> None:
+        return None
+
+    def writeto(self, address: int, buffer, *, start: int = 0, end=None) -> None:
+        data = bytes(buffer[start:end])
+        if not data:
+            # I2CDevice 构造时的空写探测，直接跳过
+            return
+        self._bus.i2c_rdwr(self._smbus2.i2c_msg.write(address, data))
+
+    def readfrom_into(self, address: int, buffer, *, start: int = 0, end=None) -> None:
+        length = len(buffer) if end is None else end - start
+        read_msg = self._smbus2.i2c_msg.read(address, length)
+        self._bus.i2c_rdwr(read_msg)
+        buffer[start : start + length] = read_msg.buf[:length]
+
+    def writeto_then_readfrom(
+        self,
+        address: int,
+        out_buffer,
+        in_buffer,
+        *,
+        out_start: int = 0,
+        out_end=None,
+        in_start: int = 0,
+        in_end=None,
+    ) -> None:
+        out_data = bytes(out_buffer[out_start:out_end])
+        in_length = len(in_buffer) if in_end is None else in_end - in_start
+        write_msg = self._smbus2.i2c_msg.write(address, out_data)
+        read_msg = self._smbus2.i2c_msg.read(address, in_length)
+        self._bus.i2c_rdwr(write_msg, read_msg)
+        in_buffer[in_start : in_start + in_length] = read_msg.buf[:in_length]
+
+
 def open_sensor(rate_hz: float):
     try:
         import adafruit_mlx90640
-        import board
-        import busio
     except ImportError as exc:
         raise RuntimeError(
             "未安装硬件库。请在虚拟环境中执行：\n"
             "python -m pip install adafruit-blinka adafruit-circuitpython-mlx90640"
         ) from exc
 
-    # Raspberry Pi 的 I2C1 默认位于 GPIO2(SDA) 与 GPIO3(SCL)，频率 400 kHz 足够稳定。
-    i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
+    # 默认用 I2C1；若传感器接在 I2C4（GPIO8/9），运行前设：
+    #   export MLX90640_I2C_BUS=4
+    i2c_bus = int(os.getenv("MLX90640_I2C_BUS", "1"))
+    if i2c_bus == 1:
+        # I2C1：SDA=GPIO2(物理3)、SCL=GPIO3(物理5)，Blinka 默认支持。
+        import board
+        import busio
+
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
+    else:
+        # 其他 I2C 总线（如 I2C4），用 smbus2 直连 /dev/i2c-N。
+        i2c = _SmbusI2C(i2c_bus, frequency=400_000)
+
     sensor = adafruit_mlx90640.MLX90640(i2c, address=SENSOR_ADDRESS)
     sensor.refresh_rate = refresh_rate_enum(rate_hz)
     return sensor

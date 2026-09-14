@@ -76,6 +76,8 @@ fi
 log "[5/8] 安装 Python 运行依赖（装进 venv）"
 "${VENV}/bin/pip" install --upgrade pip
 "${VENV}/bin/pip" install pyserial pigpio smbus2 numpy
+# 热成像（MLX90640）：依赖 Adafruit 的 board/busio/mlx90640
+"${VENV}/bin/pip" install adafruit-blinka adafruit-circuitpython-mlx90640
 # pygame 必须从源码编译：PyPI wheel 内置的 SDL2 无 kmsdrm 支持，
 # 源码编译会通过 sdl2-config 链接系统 SDL2（树莓派官方带 kmsdrm），HDMI 才能显示。
 "${VENV}/bin/pip" install --no-binary pygame pygame
@@ -90,7 +92,9 @@ sudo modprobe i2c-dev || true
 log "[7/8] 从源码编译 pigpio 并设置开机自启（新版系统已无 apt 包）"
 if ! command -v pigpiod >/dev/null 2>&1; then
   cd /tmp
-  git clone https://github.com/joan2937/pigpio.git
+  # 优先用 Gitee 镜像（国内 github 经常连不上）；失败再回退 github
+  git clone https://gitee.com/mirrors/pigpio.git pigpio || \
+    git clone https://github.com/joan2937/pigpio.git pigpio
   cd pigpio
   make -j"$JOBS"
   sudo make install
