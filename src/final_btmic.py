@@ -40,6 +40,92 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
    改配置不用编辑 systemd 单元：往 /etc/default/bt-mic 写 KEY=VALUE 即可；
    详见下方"蓝牙耳机（A2DP Sink / HFP 下行 → 3.5mm 耳机口）"一节
 
+放音链路（"电脑音频放不出来/只有某个孔不出声"）：
+- **下行 PCM 的发现方式**：旧实现只从 bluealsa-aplay -L 与 bluealsa-cli
+  list-pcms 里挑"以 bluealsa: 开头"的行——而 bluealsa-cli 打的是 D-Bus 对象
+  路径（/org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk/source），被这层
+  前缀过滤全部丢掉。于是下行只剩 bluealsa-aplay 一个来源：它不可用（属于
+  bluez-alsa-utils，且实测各版本选项差异极大）时程序永远认为"本机没有下行
+  PCM"——电脑在放歌、树莓派一点声音都没有，而麦克风上行有 aplay -L 与构造名
+  兜底所以照常可用，这就是"麦克风能用、放音不能用"。现在下行与上行同一套
+  多来源：bluealsa-aplay -L/--list-devices、aplay -L、bluealsa-cli list-pcms
+  （D-Bus 路径按 dev_XX_.../a2dpsnk|hfphf|hsphs/source 转成
+  bluealsa:DEV=...,PROFILE=a2dp|sco），再补"按标准命名构造"的候选；每个候选
+  都真的打开一次才算数，打不开的名字 20 秒内不重复实测（避免反复等超时）
+- **声音送给哪个孔可以指定**：PLAYBACK_PREFER=onboard|hat|hdmi|other（默认
+  any = 与麦克风不同卡的声卡优先）。耳机插在**树莓派板载 3.5mm 孔**上就写
+  PLAYBACK_PREFER=onboard：这一类声卡（连同"与麦克风同卡"的情况）一起优先，
+  不再被"同卡时钟冲突"的预防逻辑否决而把声音送给另一张卡的孔——那种情况下
+  耳机插着也一点声音都没有，日志里却看不出异常。精确指定仍可用
+  PLAYBACK_DEVICE=plughw:C,D 或 --find-output（逐张试听）
+- **本机实测声卡布局（2026-09-14 aplay -l）**：card 0 = bcm2835 HDMI 1、
+  card 1 = **bcm2835 Headphones（树莓派自己的 3.5mm 孔）**、card 2 =
+  seeed2micvoicec（HAT，也就是麦克风所在卡，它上面的 3.5mm 是另一张卡上的孔）。
+  耳机插在板载孔上 → 必须送 plughw:1,0。自动选择会优先挑"与麦克风不同卡"的声卡
+  （板载排在 HDMI 之前），所以**不要把 PLAYBACK_DEVICE 手工写成麦克风那张卡**
+- **配置指向麦克风那张卡时默认不采用**（PLAYBACK_DEVICE_FORCE=1 可强制）：那种
+  配置下 ① 声音只会从被选中那张卡的孔出来——耳机插在另一个孔上就完全没声音；
+  ② 同一张卡的放音与采集只能同采样率，同时用互相挤。两条合起来就是现场症状：
+  "电脑在放歌、耳机一声不出、麦克风也跟着卡"。现在遇到就自动重挑一张不同卡的
+  声卡并在日志里说明原因
+- **下行缓冲单独放宽**（HP_PERIOD_TIME/HP_BUFFER_TIME，默认 40ms/200ms）：下行是
+  单向音乐，怕的是蓝牙到达抖动（实测 1~17 秒停顿），沿用上行那套 20ms/60ms 小
+  缓冲一抖就 underrun；上行（人声）仍保持小缓冲以控延迟
+- **断开一次不等于整场没有放音**：播放器随链路断开而死时，耳机输出线程现在
+  会等链路回来（HP_RECONNECT_WAIT_SECS，默认 60 秒）再重建播放器。旧实现在那里
+  直接退出线程——2026-09-14 实测：链路 21:23:08 掉、21:23:11 就恢复了，麦克风
+  照常工作，但耳机输出线程已经死了，之后整场都没有播放器（日志里再没出现过
+  "播放器已启动"），用户看到的就是"提示音能听见、电脑的声音一直听不到"
+- **通路纠错加快**：DOWNLINK_CHECK_SECS 10→5 秒、DOWNLINK_STALL_SECS 15→8 秒。
+  电脑只往它在声音设置里选中的那条输出送音频（Stereo=A2DP / Hands-Free=SCO），
+  选错时现在最多 8~13 秒就会自动切到有数据的那条；提示里也把两条通路各自对应的
+  Windows 设备名写清楚
+- **断开原因与链路质量**：断开时打印 BlueZ 的 `Reason:` 行（如 Connection
+  Timeout 0x08 = 链路监督超时、Remote User Terminated 0x13 = 对端主动断）与
+  `bluetoothctl info` 的 RSSI——RSSI < -75dBm 就说明是射频问题而不是软件问题
+- **2.4GHz WiFi 共存提示**：Pi4 的 WiFi 与蓝牙共用一颗芯片和天线（用 SSH 看日志
+  时正好是这种组合），2.4GHz 在线会抢射频，表现为 SCO 反复停顿、声音断续，严重
+  时链路被判超时断开；启动时只读检查一次并提示换 5GHz 或有线
+- **三段提示音**（NOTIFY_TONES=0 关闭，音量 NOTIFY_TONE_VOLUME 默认 0.3）：
+  蓝牙已连接 = 两声上行（440→660Hz）；降噪准备完成 = 三声上行琶音
+  （523/659/784Hz）；放音准备完成 = 两声下行（988→740Hz）。提示音由本机
+  声卡直接放（不经蓝牙），所以它同时是"耳机口这条路通不通"的现场验证：
+  放不出来时日志里有 aplay 的退出码与原因（声卡被下行播放器占用、混音静音、
+  选错孔），发生时间点也都落在声卡空闲的时刻（管道启动之前）
+- **同卡必须同率（"电脑在放歌、耳机一声不出"的真正原因）**：麦克风与耳机口在
+  同一张声卡时，codec 的 DAC 与 ADC 共用一路 I2S 时钟，两个方向只能同一个采样
+  率。2026-09-14 的 journal 把这条钉死了：hp-play 持续 underrun（最长 6023 ms）、
+  麦克风 arecord overrun 24 s、转发 aplay underrun 26 s、下行累计字节数不再增长
+  （下游不消费 → 反压 → 上游读不动）。所以：
+    * 启动时自动实测麦克风能否按 44100/48000 Hz 采集（判据是**真的采到非数字
+      静音**，这台 HAT 上"能打开、不报错、没数据"出现过多次），能就让采集跟上
+      放音——放音保持 44.1kHz 立体声（本卡上唯一被证实可闻的配置），上行链路
+      自动插一个重采样到 16kHz 的阶段（等价于 HEADPHONE_CAPTURE_RATE=44100，
+      只是不用人去试）；麦克风只能 16k 采集时才退回 HEADPHONE_HAT_MODE
+    * 运行时再兜一层：电脑协商出来的 A2DP 采样率（44.1k 还是 48k）要等它开始
+      播放才知道，所以每次建下行管道都拿它和采集采样率比，不一致就重采样过去
+      （shared_rate，见 build_downlink_player）——"差一点"同样是抢时钟
+- **播放声卡清单**：启动时打印全部播放声卡、每张是"哪个孔"、当前用哪张、另一个
+  孔该写哪一行 PLAYBACK_DEVICE。本机有两个 3.5mm 孔（树莓派板载 + HAT），
+  "耳机插着却没声音、日志全绿"最常见的原因就是送错了卡（配置里的
+  PLAYBACK_DEVICE 优先级最高，一旦选错就会一直错）
+- **HFP 服务级连接（SLC）判定修好**：查 D-Bus 时对象路径写成了 "/"，实测本机
+  bluealsa 回 `Object does not exist at path "/"`，于是 SLC 永远被判定为"未建立"
+  → 会误触发"等不到 SLC 就断开重连"把好链路掐掉（旧日志里每 25 秒那句就是）。
+  现在两个路径都试，并以"PCM 列表里有没有 SCO/HFP 通道"兜底
+- **日志不再被 bluealsa 调试流水淹没**：插件在某些版本会一秒打上百行
+  `[pid] D: bluealsa-pcm.c:…`，把 underrun/报错整片盖住还白写 SD 卡；现在只丢
+  这类纯调试行（同一行里带 error/underrun 的照样保留）
+- **连接不再被反复断开**：旧实现在等不到 HFP 服务级连接时每 25 秒
+  bluetoothctl disconnect 一次、指望 Windows 自动重连后发起 HFP——在
+  Windows 不自动重连、或重连后仍等不到 SLC 的场景里这就是死循环：正在放的
+  音频、配对与服务发现被反复打断，表现是"连上又断、之后连不上，只能重启
+  服务"。现在默认 BT_FORCE_RECONNECT=once（每台设备每次运行最多强制断开一次，
+  两次之间还有 BT_FORCE_RECONNECT_MIN_GAP 秒下限；电脑正在用 A2DP 放音时
+  一律不断），并且：强制断开后立刻恢复可发现/可配对、每次会话结束（断开）
+  后立刻恢复可发现并在 hci0 消失时恢复适配器、放音期间不重启 bluealsa
+  （重启会把正在收的 A2DP 流整个掐断）
+
 开机可靠性（修复"电脑搜不到树莓派"）：
 - 等待蓝牙适配器就绪（Powered: yes）后才设置 discoverable，期间反复
   rfkill unblock；设置后立即校验，失败自动重试
@@ -371,6 +457,12 @@ PCM_WAIT_TIMEOUT = int(os.environ.get("PCM_WAIT_TIMEOUT", "60"))
 # 拿到过小 period 导致 xrun
 PERIOD_TIME_US = int(os.environ.get("PERIOD_TIME", "20000"))   # 20ms
 BUFFER_TIME_US = int(os.environ.get("BUFFER_TIME", "60000"))   # 60ms
+# 下行（电脑 → 耳机口）单独用一套缓冲：音乐是单向的，多一点延迟无所谓，但很怕
+# 蓝牙侧到达抖动（这台机器上 SCO/A2DP 都实测过 1~17 秒的停顿）。沿用上行那套
+# 20ms/60ms 小缓冲时，一次抖动就 underrun（听感是"咔咔"或断音）。默认放宽到
+# 40ms/200ms；想更跟手可以调小
+HP_PERIOD_TIME_US = int(os.environ.get("HP_PERIOD_TIME", "40000"))
+HP_BUFFER_TIME_US = int(os.environ.get("HP_BUFFER_TIME", "200000"))
 DF_NUM_THREADS = int(os.environ.get("DF_NUM_THREADS", "2"))  # torch 线程数（Pi4 四核，1~4 可按 env 实测调节）
 DF_MODEL = os.environ.get("DF_MODEL", "deepfilternet2")  # 模型选择：deepfilternet2 比 deepfilternet3 轻量数倍；空串=库默认（DF3）
 DF_CHUNK_MS = int(os.environ.get("DF_CHUNK_MS", "320"))      # 降噪每次处理的时长（毫秒），auto 模式的起始块大小
@@ -426,6 +518,31 @@ A2DP_SINK_ENABLE = os.environ.get("A2DP_SINK_ENABLE", "1").strip().lower() not i
     "no",
 )
 PLAYBACK_DEVICE = os.environ.get("PLAYBACK_DEVICE", "")
+# PLAYBACK_DEVICE 指向"麦克风所在的那张声卡"时是否仍然强制使用（默认 0 = 不）。
+# 这种配置有两个问题，实测都指向"耳机插着一点声都没有"：
+#   ① 声音只会从被选中那张卡的 3.5mm 孔出来——耳机插在另一个孔上就完全没声
+#      （本机有两个孔：树莓派自己的 bcm2835 Headphones 和 HAT 的 codec 孔）；
+#   ② 同一张卡的放音与采集抢同一路 I2S 时钟，只能同采样率，同时用会互相挤
+#      （实测：放音持续 underrun 6 秒、麦克风 overrun 24 秒、两边都卡）。
+# 所以默认忽略这种配置，改为自动挑一张"与麦克风不同"的卡（原因会打日志），
+# 需要照旧强制使用那张卡时写 PLAYBACK_DEVICE_FORCE=1
+PLAYBACK_DEVICE_FORCE = os.environ.get("PLAYBACK_DEVICE_FORCE", "0").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
+# 播放设备优先级——不用记 plughw 号也能把声音指定到"某个孔"：
+#   any（默认）= 优先与麦克风**不同卡**的声卡（跨卡不共享 I2S 时钟，互不影响）
+#   onboard    = 优先树莓派板载 3.5mm（aplay -l 里的 "bcm2835 Headphones"），
+#                即使它与麦克风同卡也优先——用户说"就放这个孔"时不再被
+#                "同卡时钟冲突"的预防逻辑否决（表现为声音被送给另一张卡的孔）
+#   hat        = 优先 reSpeaker HAT 的 3.5mm（seeed/wm8960/voicecard）
+#   hdmi       = 优先 HDMI
+#   other      = 优先 USB 声卡等其它声卡
+# 例：耳机插在树莓派板载孔上就写 PLAYBACK_PREFER=onboard；也可以直接用
+# PLAYBACK_DEVICE=plughw:C,D 精确指定，或跑 --find-output 逐张试听后自动写入
+PLAYBACK_PREFER = os.environ.get("PLAYBACK_PREFER", "any").strip().lower()
 HEADPHONE_VOLUME = os.environ.get("HEADPHONE_VOLUME", "80%")
 # A2DP 下行静音缩放修复：BlueALSA 对 A2DP 默认开 SoftVolume，样本按 PCM 自身
 # 音量缩放；AVRCP 协商异常时该音量可能是 0 或读不到，整条流就成了静音
@@ -504,12 +621,51 @@ HEADPHONE_CROSS_ROUTE = os.environ.get("HEADPHONE_CROSS_ROUTE", "1").strip().low
     "no",
 )
 # 麦克风在声卡上的采集采样率：默认与 SCO 一致（16kHz）。设成 44100/48000 时上行
-# 链路会插一个"重采样到 16kHz"的阶段（HAT 同卡共存用，见上面说明）
+# 链路会插一个"重采样到 16kHz"的阶段（同卡共存用，见上面说明）。
+# 不设这个变量时：麦克风与耳机口若在**同一张声卡**上，启动时会自动实测麦克风能否
+# 按 44.1/48k 采集并自动采用（同一路 I2S 时钟要求两个方向同率，放音侧已被证实
+# 只有 44.1k 立体声可闻——见 decide_hat_mode）；一旦显式写了值（包括显式写回
+# 16000），就完全按写的来，不再自动调整
 MIC_CAPTURE_RATE = int(os.environ.get("HEADPHONE_CAPTURE_RATE", str(SAMPLE_RATE)))
+# 是否由用户显式指定了采集采样率：显式指定时完全按用户说的来，不再自动改成
+# "能跟上放音"的采样率——写 HEADPHONE_CAPTURE_RATE=16000 就是想让它保持 16kHz
+CAPTURE_RATE_EXPLICIT = "HEADPHONE_CAPTURE_RATE" in os.environ
 HP_MIXER_CHECK_SECS = int(os.environ.get("HP_MIXER_CHECK_SECS", "15"))  # 混音看门狗间隔
 # 下行电平表心跳：每隔这么久打印一次"已转发字节数+峰值"。没有心跳时无法区分
 # "通路正常但一直没声音"和"通路卡住了"——上一轮排查就卡在这里
 HP_METER_HEARTBEAT_SECS = float(os.environ.get("HP_METER_HEARTBEAT_SECS", "15"))
+
+# 提示音：蓝牙连接、降噪准备完成、放音准备完成各放一段**不同**的提示音，
+# 不看日志也知道进行到哪一步了（三段音的音高走向/音数/长短都不一样，
+# 见 play_notify_tone）。提示音走本机声卡直接放，所以同时也是"耳机口这条
+# 路通不通"的现场验证；放不出来时日志里会带上 aplay 的错误原因。
+#   NOTIFY_TONES=0       关掉全部提示音
+#   NOTIFY_TONE_VOLUME   提示音幅度（0~1，默认 0.3；听不清可调到 0.6）
+#   NOTIFY_TONE_DEVICE   提示音走哪张声卡（默认跟随耳机口播放设备）
+NOTIFY_TONES = os.environ.get("NOTIFY_TONES", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
+# 幅度夹在 0~1：超过 1 会在生成样本时溢出 int16（提示音是"顺手放一下"的
+# 东西，不能因为它把服务搞崩），0 = 静音
+NOTIFY_TONE_VOLUME = min(1.0, max(0.0, float(os.environ.get("NOTIFY_TONE_VOLUME", "0.3"))))
+NOTIFY_TONE_DEVICE = os.environ.get("NOTIFY_TONE_DEVICE", "").strip()
+
+# 强制断开重连策略——修"连上以后突然断开、之后再也连不上"：
+# HFP 的服务级连接（RFCOMM）只能由 Windows 发起，树莓派无法主动拉起，所以旧实现
+# 在等不到 SLC 时每 25 秒就 bluetoothctl disconnect 一次，指望 Windows 自动重连
+# 之后再发起 HFP。但在 Windows 不自动重连、或重连后又等不到 SLC 的场景里，这就
+# 变成了"反复断开"的死循环：正在放的音频被打断、配对/服务发现被打断，用户看到的
+# 就是"连上又断、之后连不上，只能重启服务"。
+#   once（默认）= 本次运行对同一台电脑最多强制断开一次，之后耐心等待并打印
+#                 Windows 侧需要做的事（不再反复断链）
+#   always      = 旧行为（每次超时都断，只在确认对你有用时使用）
+#   off         = 从不主动断开（最保守；麦克风完全依赖 Windows 自己发起 HFP）
+BT_FORCE_RECONNECT = os.environ.get("BT_FORCE_RECONNECT", "once").strip().lower()
+BT_FORCE_RECONNECT_DELAY = int(os.environ.get("BT_FORCE_RECONNECT_DELAY", "25"))
+BT_FORCE_RECONNECT_MIN_GAP = int(os.environ.get("BT_FORCE_RECONNECT_MIN_GAP", "600"))
 
 BACKUP_DIR = "/tmp/bt_mic_backup"
 BT_OVERRIDE = "/etc/systemd/system/bluetooth.service.d/override.conf"
@@ -536,8 +692,9 @@ SERVICE_UNIT_PATH = "/etc/systemd/system/bt-mic.service"
 # 构建标记：每次改动都要更新，启动时和 --audio-info 都会打印。
 # 用途很实在——已经多次出现"复制了新脚本但服务还在跑旧进程"（systemctl start
 # 对已运行的服务是空操作），日志里能一眼看出跑的到底是哪一版
-BUILD_ID = ("2026-09-11-14 播放设备选择优先『与麦克风不同卡』+ /etc/default/bt-mic "
-            "配置文件 + --find-output 逐卡试听（换耳机插孔后没声音）")
+BUILD_ID = ("2026-09-14-04 断开后不再永久放弃放音（等链路回来重建播放器）+ 通路"
+            "纠错加快（5s/8s，并说明两条通路各对应 Windows 里哪个设备）+ 断开原因"
+            "（Reason/RSSI）与 2.4GHz WiFi 共存提示 + 03 的全部修复")
 _SCRIPT_MTIME = [None]
 _UPDATE_WARNED = [False]
 _LAST_DOWNLINK_ERR = [""]  # 下行 PCM 打不开的原因（只在变化时打日志，避免刷屏）
@@ -1194,14 +1351,18 @@ def a2dp_uuid_conflict(journal_text):
     )
 
 
-def log_bt_disconnect_reason():
+def log_bt_disconnect_reason(device=None):
     """蓝牙断开时打印 BlueZ 日志里的断开原因（链路超时 / 对端主动断开 / 被本机断开）。
 
-    只有断开时才调用，用于区分"Windows 自己断的"、"链路超时（信号/带宽问题）"
-    和"被本程序断的"，避免只看到"已断开"却不知道原因。
+    只有断开时才调用，用于区分"Windows 自己断的"、"链路超时（信号或带宽问题）"
+    和"被本程序断的"：现场只看到"已断开"是没法继续查的，所以这里把
+    `Reason:`（BlueZ 会给出 HCI 断开原因，如 Connection Timeout 0x08 = 链路监督
+    超时、Remote User Terminated 0x13 = 对端主动断）、supervision timeout、
+    以及链路质量（RSSI）都打出来——RSSI 很低就说明是射频/干扰问题（Pi4 的 WiFi
+    与蓝牙共用天线），而不再是软件问题。
     """
     res = run(
-        "journalctl -u bluetooth -n 60 --no-pager 2>&1",
+        "journalctl -u bluetooth -n 120 --no-pager 2>&1",
         check=False,
         timeout=10,
         verbose=False,
@@ -1211,12 +1372,38 @@ def log_bt_disconnect_reason():
         for line in ((res.stdout or "") if res else "").splitlines()
         if line.strip()
     ]
-    keys = ("disconnect", "reason", "timeout", "link key", "connection", "supervision")
-    hits = [line for line in lines if any(k in line.lower() for k in keys)]
-    if hits:
-        print("  -- BlueZ 日志（断开相关，用于判断是谁断的）--")
-        for line in hits[-6:]:
+    keys = ("reason", "disconnect", "supervision", "timeout", "link key",
+            "connection", "hci0")
+    # "Reason:" 是最关键的一行，单独找出来放在最前面
+    reason = [l for l in lines if "reason:" in l.lower()]
+    hits = [l for l in lines if any(k in l.lower() for k in keys)]
+    print("  -- BlueZ 日志（断开相关，用于判断是谁断的）--")
+    for line in reason[-3:]:
+        print(f"    ★ {line}")
+    for line in hits[-10:]:
+        print(f"    {line}")
+    if len(hits) <= 10 and len(lines) > 10:
+        print("    （以上是关键字匹配；下面是 BlueZ 原始日志末尾，供无 Reason 行时排查）")
+        for line in lines[-8:]:
             print(f"    {line}")
+    if device:
+        info = run(f"bluetoothctl info {device}", check=False, timeout=8, verbose=False)
+        rssi = tx = None
+        for line in ((info.stdout or "") if info else "").splitlines():
+            s = line.strip()
+            if s.startswith("RSSI:"):
+                rssi = s.split(":", 1)[1].strip()
+            elif s.startswith("TxPower:"):
+                tx = s.split(":", 1)[1].strip()
+        if rssi is not None:
+            print("  链路质量: RSSI=%s%s" % (rssi, "  TxPower=%s" % tx if tx else ""))
+            try:
+                if int(rssi) < -75:
+                    print("  !! RSSI 偏低（<-75dBm）：射频环境差——Pi4 的 WiFi 与蓝牙")
+                    print("     共用一颗芯片和天线，2.4GHz WiFi 忙时正是这种表现"
+                          "（SCO 反复停顿、甚至链路被断开）。改用 5GHz 或有线网")
+            except ValueError:
+                pass
 
 
 def bluealsa_a2dp_profile_name(ba_path):
@@ -1738,26 +1925,42 @@ def hfp_slc_state(device):
 
     Windows（AG）先对 BlueALSA 注册的 RFCOMM 通道发起 HFP 服务级连接，
     BlueALSA 才会创建 dev_XX/hfphf/... PCM。返回 (SLC是否建立, 诊断文本)。
+
+    **对象路径**：bluealsa 的 Manager1 挂在 /org/bluealsa 上。旧实现查的是 "/"，
+    实测（见 journal）回的是
+      Error org.freedesktop.DBus.Error.UnknownMethod: Object does not exist at path "/"
+    ——于是 SLC 永远被判定为"未建立"，进而误触发"等不到 SLC 就主动断开重连"，
+    把本来好用的链路掐掉（日志里"25 秒仍无 HFP 服务级连接"就是这么来的）。
+    这里两个路径都试，并以"PCM 列表里有没有 SCO/HFP 通道"作为兜底判据：通道
+    真的建起来了，bluealsa 才会发布 hfphf/sink|source 这类 PCM。
     """
     lines = []
     has_transport = False
     for method in ("GetPCMs", "GetDevices"):
-        res = run(
-            f"dbus-send --system --print-reply --dest=org.bluealsa / "
-            f"org.bluealsa.Manager1.{method}",
-            check=False,
-            timeout=8,
-            verbose=False,
-        )
-        text = ""
-        if res:
-            text = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
-        if text:
+        for path in ("/org/bluealsa", "/"):
+            res = run(
+                f"dbus-send --system --print-reply --dest=org.bluealsa {path} "
+                f"org.bluealsa.Manager1.{method}",
+                check=False,
+                timeout=8,
+                verbose=False,
+            )
+            text = ((res.stdout or "") + "\n" + (res.stderr or "")).strip() if res else ""
+            if not text or "UnknownMethod" in text or "does not exist" in text.lower():
+                continue
             head = text.splitlines()[0].strip() if text.splitlines() else ""
-            lines.append(f"$ org.bluealsa.Manager1.{method}  ->  {head}")
-            # 返回体里出现 object path 说明 BlueALSA 已拿到 HFP 传输通道
-            if "object path" in text:
+            lines.append(f"$ Manager1.{method}({path})  ->  {head}")
+            # 返回体里出现 object path 说明 BlueALSA 已把（某个设备的）PCM 挂出来
+            if "object path" in text or "/dev_" in text:
                 has_transport = True
+            break
+    if not has_transport:
+        # D-Bus 没给出结论（版本差异）：退回"列表里有没有 SCO/HFP 的 PCM"
+        for pcm in list_bluealsa_pcms(device):
+            if pcm_profile_of(pcm) == "sco":
+                has_transport = True
+                lines.append("PCM 列表里已有 SCO/HFP 通道: %s" % pcm)
+                break
     return has_transport, "\n".join(lines)
 
 
@@ -1830,6 +2033,48 @@ def request_hfp_profile(device, uuid="0000111e-0000-1000-8000-00805f9b34fb"):
     return res.returncode == 0
 
 
+# 强制断开重连的记账（BT_FORCE_RECONNECT=once 时每台设备每次运行只断一次）
+_FORCE_RECONNECT_DONE = set()
+_LAST_FORCE_RECONNECT = [0.0]
+
+
+def _audio_stream_busy(device):
+    """电脑是否正在往本机送音频（A2DP 流已建立）。
+
+    重启 bluealsa 会把正在收的 A2DP 流整个掐断——Windows 侧听起来就是
+    "放着放着突然断了"，而且重新协商常常要重连一次。所以只要在放音就不动
+    bluealsa：等不到 HFP 服务级连接时，宁可不重启也别打断用户正在听的声音。
+    """
+    if not HEADPHONE_ENABLE:
+        return False
+    return a2dp_stream_active(device)
+
+
+def _force_reconnect_allowed(device):
+    """现在能不能主动断开蓝牙逼 Windows 重连？返回 (是否允许, 不允许的原因)。
+
+    旧实现每 25 秒就断一次，在"Windows 不自动重连"或"重连后仍等不到 HFP"的
+    场景里就成了死循环：正在放的音频被打断、配对与服务发现被反复打断，用户
+    看到的是"连上又断、之后连不上，只能重启服务"。默认只断一次，之后耐心等
+    并把 Windows 侧要做的事打出来。
+    """
+    if BT_FORCE_RECONNECT in ("off", "0", "false", "no"):
+        return False, "配置为 BT_FORCE_RECONNECT=off（从不主动断开）"
+    gap = time.time() - _LAST_FORCE_RECONNECT[0]
+    if BT_FORCE_RECONNECT == "always":
+        if gap < BT_FORCE_RECONNECT_MIN_GAP:
+            return False, ("距上次强制断开仅 %.0f 秒（下限 %d 秒），避免反复断链"
+                           % (gap, BT_FORCE_RECONNECT_MIN_GAP))
+        return True, ""
+    if device in _FORCE_RECONNECT_DONE:
+        return False, ("本次运行已经为该设备强制断开过一次——反复断开只会让音频与"
+                       "配对反复中断（要恢复旧行为：BT_FORCE_RECONNECT=always）")
+    if gap < BT_FORCE_RECONNECT_MIN_GAP:
+        return False, ("距上次强制断开仅 %.0f 秒（下限 %d 秒），先耐心等 Windows"
+                       % (gap, BT_FORCE_RECONNECT_MIN_GAP))
+    return True, ""
+
+
 def find_working_pcm(device, timeout=90):
     print_status(f"等待 BlueALSA SCO PCM 出现（本轮最长 {timeout} 秒）")
     # 连接后先尝试一次 ConnectProfile。注意方向性（见 request_hfp_profile）：
@@ -1900,28 +2145,50 @@ def find_working_pcm(device, timeout=90):
             request_hfp_profile(device, uuid=uuids[hfp_variant % len(uuids)])
             hfp_variant += 1
             if kill_bt_profile_conflicts():
-                print("    -> 清理了重新出现的冲突进程，重启 bluealsa 重新注册 profile")
-                run("systemctl restart bluealsa", check=False, verbose=False)
-                time.sleep(3)
+                if _audio_stream_busy(device):
+                    print("    -> 清理了重新出现的冲突进程，但电脑正在用 A2DP 播放"
+                          "音频：不重启 bluealsa（重启会把正在放的音乐掐断）")
+                else:
+                    print("    -> 清理了重新出现的冲突进程，重启 bluealsa 重新注册 profile")
+                    run("systemctl restart bluealsa", check=False, verbose=False)
+                    time.sleep(3)
 
-        # 约 25 秒仍无 SLC：强制断开 ACL 触发 Windows 自动重连。实测旧版
-        # 就是 Windows 重连之后才拉起 HFP 并成功传送的——干等会等到超时。
-        # 例外：电脑正在用 A2DP 放音（只当耳机用、没启用麦克风）时不能断，
-        # 否则会把正在播放的音频掐断，且重连也不会让 Windows 去开麦克风
-        if not slc_up and not forced_disconnect and time.time() - start >= 25:
+        # 等不到 SLC：可以主动断开 ACL 逼 Windows 自动重连（实测旧版就是
+        # Windows 重连之后才拉起 HFP 并成功传送的）。但**必须克制**——反复
+        # 断链会把正在播的音频和配对/服务发现一起打断，用户看到的就是
+        # "连上又断、之后连不上"（见 _force_reconnect_allowed 与配置项
+        # BT_FORCE_RECONNECT）。此外电脑正在用 A2DP 放音时一律不断（重连也
+        # 不会让 Windows 去开麦克风，只会把音乐掐断）
+        if (not slc_up and not forced_disconnect
+                and time.time() - start >= BT_FORCE_RECONNECT_DELAY):
             forced_disconnect = True
-            if HEADPHONE_ENABLE and a2dp_stream_active(device):
-                print("  -> 25 秒仍无 HFP 服务级连接，但检测到 A2DP 正在播放音频")
+            if _audio_stream_busy(device):
+                print("  -> 仍无 HFP 服务级连接，但检测到 A2DP 正在播放音频")
                 print("     （电脑只把它当耳机、未启用麦克风）：不主动断开，继续等")
                 print("     如需使用麦克风，请在 Windows 声音设置→输入选 Hands-Free")
             else:
-                print("  -> 25 秒仍无 HFP 服务级连接：主动断开蓝牙，触发 Windows")
-                print("     自动重连并重试 Hands-Free 服务（Windows 数秒内重连）")
-                run(f"bluetoothctl disconnect {device}", check=False,
-                    timeout=15, verbose=False)
-                print("  -> 若重连后依旧如此，说明 Windows 缓存的设备服务里没有 HFP：")
-                print("     请在 Windows 蓝牙设置中删除该设备，等本程序显示可发现后")
-                print("     重新添加配对（配对那一刻树莓派必须已注册好 HFP）。")
+                allowed, why = _force_reconnect_allowed(device)
+                if not allowed:
+                    print("  -> 仍无 HFP 服务级连接，但不主动断开蓝牙：%s" % why)
+                    print("     请在 Windows 侧确认这几项（都会让设备不发起 HFP）：")
+                    print("       * 蓝牙设置里删除本设备后重新添加（最有效）")
+                    print("       * 『更多蓝牙选项』里勾选『允许蓝牙设备播放音频』")
+                    print("       * 设备属性→『服务』里勾上『免提电话』，再断开重连")
+                else:
+                    print("  -> 仍无 HFP 服务级连接：主动断开蓝牙**一次**，触发 Windows")
+                    print("     自动重连并重试 Hands-Free 服务（Windows 数秒内重连）")
+                    run(f"bluetoothctl disconnect {device}", check=False,
+                        timeout=15, verbose=False)
+                    _FORCE_RECONNECT_DONE.add(device)
+                    _LAST_FORCE_RECONNECT[0] = time.time()
+                    # 断开后立刻恢复可发现/可配对并确认适配器还活着：否则 Windows
+                    # 想重连也搜不到（"断开之后就再也连不上"正是这么来的）
+                    ensure_pairing_agent()
+                    set_discoverable(True)
+                    print("  -> 已恢复可发现/可配对，等待 Windows 重连；")
+                    print("     若重连后依旧如此，说明 Windows 缓存的设备服务里没有 HFP：")
+                    print("     请在 Windows 蓝牙设置中删除该设备，等本程序显示可发现后")
+                    print("     重新添加配对（配对那一刻树莓派必须已注册好 HFP）。")
 
         time.sleep(3)
 
@@ -2086,28 +2353,50 @@ def test_alsa_playback(dev, rate=48000, channels=2):
 def select_playback_device(mic_device=None):
     """探测耳机所在播放设备，返回 (设备名, 说明)。
 
-    mic_device = 麦克风设备名（如 plughw:3,0），用来避开"同卡时钟冲突"：本机的
-    麦克风与 HAT 的 3.5mm 口在同一张卡上，那张卡的收发共用 codec 的一路 I2S 时钟，
-    两个方向只能同一个采样率。所以**优先选与麦克风不同卡的声卡**（板载 3.5mm、
-    USB 声卡），跨声卡时两个方向互不影响、也没有音质取舍。
+    mic_device = 麦克风设备名（如 plughw:2,0），用来避开"同卡时钟冲突"：麦克风与
+    耳机口如果在同一张卡上，那张卡的收发共用 codec 的一路 I2S 时钟，两个方向只能
+    同一个采样率。所以**优先选与麦克风不同卡的声卡**（树莓派板载 3.5mm、USB 声卡），
+    跨声卡时两个方向互不影响、也没有音质取舍。
 
     偏好顺序：
-      1. PLAYBACK_DEVICE（环境变量或 /etc/default/bt-mic 里配置）
-      2. 与麦克风**不同卡**的声卡：HAT 类 → 其它 → 板载 3.5mm → HDMI
-      3. 与麦克风同卡的那张（例如耳机插在 HAT 的 3.5mm 孔上）——能用，但两个
+      1. PLAYBACK_DEVICE（环境变量或 /etc/default/bt-mic 里配置）——但它指向
+         麦克风所在那张卡时默认**不采用**（声音不会从另一个孔出来，而且同卡只能
+         同采样率、同时用会互相挤；实测原样就是"耳机插着没声音"）；要照旧强制
+         使用它：PLAYBACK_DEVICE_FORCE=1
+      2. PLAYBACK_PREFER 点名的那一类声卡（onboard = 树莓派板载 3.5mm、
+         hat = reSpeaker HAT 的 3.5mm、hdmi、other）——即使它与麦克风同卡
+      3. 与麦克风**不同卡**的声卡：HAT 类 → 其它 → 板载 3.5mm → HDMI
+      4. 与麦克风同卡的那张（例如耳机插在 HAT 的 3.5mm 孔上）——能用，但两个
          方向会抢同一个时钟，这里会打印对策开关
     用 plughw 打开，让 ALSA 负责采样率/声道转换。找不到时返回 (None, 原因)。
     """
     if not shutil.which("aplay"):
         return None, "缺少 aplay（请安装 alsa-utils）"
+    mic_card = _playback_card(mic_device) if mic_device else None
     if PLAYBACK_DEVICE:
         ok, err = test_alsa_playback(PLAYBACK_DEVICE)
-        if ok:
+        same_as_mic = (
+            mic_card is not None
+            and _playback_card(PLAYBACK_DEVICE) == mic_card
+        )
+        if ok and same_as_mic and not PLAYBACK_DEVICE_FORCE:
+            # 配置把放音送到了麦克风所在的同一张卡：见配置项 PLAYBACK_DEVICE_FORCE
+            # 的说明——这不是"能用但打点折扣"，而是"另一个孔完全没声音 + 两个方向
+            # 抢时钟两边都卡"，所以不采用，落到下面自动挑一张与麦克风不同卡的
+            print("  !! 配置的 PLAYBACK_DEVICE=%s 与麦克风（%s）是**同一张声卡**："
+                  % (PLAYBACK_DEVICE, mic_device))
+            print("     ① 声音只会从被选中那张卡的 3.5mm 孔出来——耳机插在另一个"
+                  "孔上就完全没声音；")
+            print("     ② 同一张卡的放音与采集只能同采样率，同时用会互相挤"
+                  "（实测：放音持续 underrun、麦克风 overrun，两边都卡）")
+            print("     已改为自动重挑一张与麦克风不同卡的声卡（原因见下）；"
+                  "确实要用配置值：PLAYBACK_DEVICE_FORCE=1")
+        elif ok:
             return PLAYBACK_DEVICE, f"配置的 PLAYBACK_DEVICE={PLAYBACK_DEVICE}"
-        print(f"  !! PLAYBACK_DEVICE={PLAYBACK_DEVICE} 打不开：{err}")
-        print("     改配置：sudo nano %s 或 sudo python3 %s --find-output"
-              % (CONFIG_FILE, os.path.basename(__file__)))
-    mic_card = _playback_card(mic_device) if mic_device else None
+        else:
+            print(f"  !! PLAYBACK_DEVICE={PLAYBACK_DEVICE} 打不开：{err}")
+            print("     改配置：sudo nano %s 或 sudo python3 %s --find-output"
+                  % (CONFIG_FILE, os.path.basename(__file__)))
     hat, others, onboard, hdmi = [], [], [], []
     for card, dev, label in probe_playback_devices():
         low = label.lower()
@@ -2121,12 +2410,27 @@ def select_playback_device(mic_device=None):
             onboard.append(item)
         else:
             others.append(item)
-    # 不同卡的排前面（跨声卡没有时钟冲突）；同卡的放最后兜底
-    ordered = []
-    for group in (hat, others, onboard, hdmi):
-        ordered += [x for x in group if not x[3]]
-    for group in (hat, others, onboard, hdmi):
-        ordered += [x for x in group if x[3]]
+    groups = {"hat": hat, "other": others, "onboard": onboard, "hdmi": hdmi}
+    # PLAYBACK_PREFER 显式点名的这一类**连同与麦克风同卡的**一起排最前——用户
+    # 说"就放这个孔"时，不再拿"同卡时钟冲突"的预防逻辑去否决它（否则声音会被
+    # 送给另一张卡的孔，表现就是"耳机插在板载孔上却一点声音都没有"）；
+    # 其余仍按老规矩：不同卡的排前面（跨声卡没有时钟冲突），同卡的放最后兜底
+    if PLAYBACK_PREFER in groups:
+        print("  -> PLAYBACK_PREFER=%s：这一类声卡优先（含与麦克风同卡的）"
+              % PLAYBACK_PREFER)
+        ordered = list(groups[PLAYBACK_PREFER])
+        rest = [g for g in ("hat", "other", "onboard", "hdmi")
+                if g != PLAYBACK_PREFER]
+    else:
+        if PLAYBACK_PREFER not in ("", "any"):
+            print("  !! PLAYBACK_PREFER=%s 不是有效取值（hat/onboard/hdmi/other/any），"
+                  "按 any 处理" % PLAYBACK_PREFER)
+        ordered = []
+        rest = ["hat", "other", "onboard", "hdmi"]
+    for group in rest:
+        ordered += [x for x in groups[group] if not x[3]]
+    for group in rest:
+        ordered += [x for x in groups[group] if x[3]]
     for card, dev, label, same in ordered:
         cand = f"plughw:{card},{dev}"
         ok, err = test_alsa_playback(cand)
@@ -2502,18 +2806,51 @@ def same_sound_card(dev_a, dev_b):
     return _playback_card(dev_a) == _playback_card(dev_b)
 
 
-def decide_hat_mode(playback_device, mic_device):
+def auto_match_capture_rate(mic_device, mic_channels, rates=(44100, 48000)):
+    """同卡共存时让**采集**跟上**放音**的采样率，返回可用的采样率或 None。
+
+    为什么是这个方向：这台卡的 44.1kHz 立体声放音是确定可闻的（--find-output
+    就是靠它确认耳机插孔的），而把下行降到 16kHz 实测反而没声音。所以只要麦克风
+    也能按 44.1/48k 采集，两个方向就同率了——放音保持原生、无需重采样。
+
+    判据必须是**真的采到非数字静音**：这台 HAT 上"能打开、不报错、但没有数据"
+    出现过多次（放音/采集都有），只看 arecord 退出码会得出错误结论。
+    先试 44100（Windows 的 A2DP/SBC 多数协商到 44.1k），不行再试 48000。
+    """
+    for rate in rates:
+        level = measure_capture_level(mic_device, rate, mic_channels, seconds=1)
+        ok = bool(level) and "数字静音" not in level
+        print("  -> 同卡自检：麦克风按 %d Hz 采集 -> %s%s"
+              % (rate, level or "打不开/读不到", "" if ok else "（不可用）"))
+        if ok:
+            return rate
+    return None
+
+
+def decide_hat_mode(playback_device, mic_device, mic_channels=CHANNELS):
     """同卡（麦克风与耳机口同一张声卡）时的共存策略，返回"是否统一下行采样率"。
 
-    结论来自实测：这张卡上**44.1kHz 立体声放音是确定可闻的**（--hp-test 的测试音、
-    以及麦克风关闭时的正常放音），而把下行强行改成 16kHz 单声道之后**反而彻底没声**
-    （打开成功、aplay 不报错、数据也在流，就是不出声）。所以默认不再动下行采样率，
-    只做加法（HP 交叉路由 + 混音看门狗），把两个开关留给实测决定：
-      HEADPHONE_HAT_MODE=1  → 下行统一到采集采样率（16kHz 单声道，重采样）
-      HEADPHONE_CAPTURE_RATE=44100 → 反过来让麦克风按 44.1kHz 采集、上行重采样到 16kHz
+    为什么必须处理：同卡时 codec 的 **DAC 与 ADC 共用一路 I2S 时钟**（LRCLK/BCLK
+    由 codec 产生），两个方向只能同一个采样率。麦克风走 HFP 固定 16kHz，A2DP 音乐
+    是 44.1/48kHz——同时跑就是互相抢时钟。实测日志（2026-09-14）里表现为：
+      * hp-play（写耳机口）持续 underrun，最长 6023 ms —— 数据在流、声卡不消费；
+      * 麦克风 arecord overrun 24 s、转发 aplay underrun 26 s；
+      * 下行累计字节数不再增长（下游不消费 → 反压 → arecord 读不动）。
+    结果就是"电脑在放歌、树莓派一声不出"，而且麦克风也跟着卡。
 
-    返回 True 表示"下行需要统一到 _HAT_OUT"（只有显式 =1 才会）。
+    策略（auto 默认，按成功率从高到低实测选择）：
+      1. 让采集跟上放音：实测麦克风能否按 44100/48000 Hz 采集，能就把它设为
+         采集采样率（等价于手工写 HEADPHONE_CAPTURE_RATE=44100，上行链路会自动
+         插一个重采样到 16kHz 的阶段）。放音保持原生 44.1kHz 立体声——这台卡上
+         唯一被证实可闻的配置；
+      2. 不放音让路到低采样率：HEADPHONE_HAT_MODE=1 时把下行统一到采集采样率
+         （16kHz 单声道），但实测这个方向在本卡上可能无声，所以只在第 1 步失败、
+         或用户显式要求时用；
+      3. 都不可行就打印对策（最稳的是把耳机插到另一张声卡，跨卡没有时钟冲突）。
+
+    返回 True 表示"下行需要统一到 _HAT_OUT"。
     """
+    global MIC_CAPTURE_RATE
     if not playback_device or not mic_device:
         return False
     if not same_sound_card(playback_device, mic_device):
@@ -2523,11 +2860,18 @@ def decide_hat_mode(playback_device, mic_device):
     print("  !! 麦克风与耳机口是同一张声卡（%s）：收发共用 codec 的一路 I2S 时钟，"
           "两个方向只能同一个采样率" % playback_device)
     print("     麦克风走 HFP 固定 %d Hz，A2DP 音乐是 44100/48000 Hz —— 同时使用时"
-          "会互相挤" % SAMPLE_RATE)
+          "会互相挤（实测：放音持续 underrun、麦克风 overrun，两边都卡）"
+          % SAMPLE_RATE)
     if MIC_CAPTURE_RATE != SAMPLE_RATE:
         print("  -> 已设 HEADPHONE_CAPTURE_RATE=%d：麦克风按该采样率采集，上行链路"
               "内置重采样到 %d Hz" % (MIC_CAPTURE_RATE, SAMPLE_RATE))
         print("     （放音保持原生采样率：两个方向同率，且放音是实测可闻的配置）")
+        return False
+    if CAPTURE_RATE_EXPLICIT:
+        print("  -> 已显式指定 HEADPHONE_CAPTURE_RATE=%d（与 SCO 同率）：按你的设置"
+              "采集，不做自动调整" % MIC_CAPTURE_RATE)
+        print("     同卡时两个方向只能有一个采样率：若放音被采集挤掉，删掉这行配置"
+              "让程序自动选（自动选出来的值见下面日志），或改 HEADPHONE_HAT_MODE=1")
         return False
     opt = HEADPHONE_HAT_MODE
     if opt in ("1", "on", "true", "yes"):
@@ -2547,9 +2891,21 @@ def decide_hat_mode(playback_device, mic_device):
         print("  !! 耳机口不支持 %d Hz 放音，无法统一到采集采样率；自检：%s"
               % (SAMPLE_RATE, "；".join(tested)))
         return False
-    print("  -> 默认策略（HEADPHONE_HAT_MODE=auto）：放音保持原生采样率（实测可闻），")
-    print("     不为了让路而牺牲放音；并行使用时若被时钟冲突挤掉，日志会说明。")
-    print("     两个可选对策（各试一次，用 --hp-test 听有没有声音）：")
+    # auto（默认）：先试"让采集跟上放音"
+    print("  -> 同卡共存策略（HEADPHONE_HAT_MODE=auto）：先实测麦克风能否按放音的")
+    print("     采样率采集（放音保持 44.1kHz 立体声是这台卡上确定可闻的配置）")
+    matched = auto_match_capture_rate(mic_device, mic_channels)
+    if matched:
+        MIC_CAPTURE_RATE = matched
+        print("  -> 已自动同卡共存：麦克风改按 %d Hz 采集（上行链路内置重采样到 "
+              "%d Hz 送 SCO），放音保持原生采样率——两个方向同率，不再抢时钟"
+              % (matched, SAMPLE_RATE))
+        print("     （等价于手工配置 HEADPHONE_CAPTURE_RATE=%d；想改回 16kHz 采集就"
+              "显式写它）" % matched)
+        return False
+    print("  !! 麦克风无法按 44100/48000 Hz 采集，只剩 %d Hz 采集可用："
+          "放音与采集只能有一个采样率" % SAMPLE_RATE)
+    print("     两个对策（各试一次，用 --hp-test 听有没有声音）：")
     print("       HEADPHONE_HAT_MODE=1             下行降到 16kHz 单声道（本卡可能无声）")
     print("       HEADPHONE_CAPTURE_RATE=44100     麦克风按 44.1kHz 采集 + 上行重采样")
     print("     最稳的做法仍是让两个方向用不同声卡：耳机插树莓派板载 3.5mm 或 USB")
@@ -2557,25 +2913,117 @@ def decide_hat_mode(playback_device, mic_device):
     return False
 
 
+# bluealsa 的 D-Bus 对象路径形如
+#   /org/bluealsa/hci0/dev_AA_BB_CC_DD_EE_FF/a2dpsnk/source
+# （MAC 用下划线分隔）。bluealsa-cli list-pcms 打的就是这种路径，而它**不以
+# bluealsa: 开头**，所以按前缀过滤等于把这一路来源整个丢掉——旧实现的下行 PCM
+# 只剩 bluealsa-aplay -L 一个来源：该工具缺失或输出格式变了（文档里就记着
+# "某个版本的 bluealsa-aplay 选项差异极大"），程序就永远认为"本机没有下行
+# PCM"，电脑在放歌、树莓派一点声音都没有；而麦克风上行有 aplay -L 与构造名
+# 兜底，照常可用——这正是"麦克风能用、放音不能用"的一种由来。
+_BLUEALSA_DBUS_RE = re.compile(
+    r"dev_([0-9a-fA-F]{2}(?:_[0-9a-fA-F]{2}){5})/([a-z0-9]+)/(source|sink)"
+)
+
+
+def _pcm_name_from_dbus_path(path, device=None):
+    """把 bluealsa 的 D-Bus 对象路径换成 arecord/aplay 能用的 ALSA PCM 名。
+
+    只保留**下行**（direction=source，即本机要读数据的那个方向）：A2DP 接收是
+    a2dpsnk/source，HFP/HSP 下行是 hfphf/source、hsphs/source。返回 None 表示
+    这条路径不是本机设备的下行流。
+    """
+    m = _BLUEALSA_DBUS_RE.search(path or "")
+    if not m:
+        return None
+    mac = m.group(1).replace("_", ":").upper()
+    if device and mac.lower() != device.lower():
+        return None
+    if m.group(3) != "source":
+        return None
+    profile = m.group(2)
+    if "a2dp" in profile:
+        return "bluealsa:DEV=%s,PROFILE=a2dp" % mac
+    if "hfp" in profile or "hsp" in profile:
+        return "bluealsa:DEV=%s,PROFILE=sco" % mac
+    return None
+
+
+def _collect_cmd_lines(cmd):
+    """运行列表命令并返回全部非空行（命令缺失或失败返回空列表）。"""
+    if not shutil.which(cmd.split()[0]):
+        return []
+    res = run(cmd, check=False, timeout=8, verbose=False)
+    if not res or res.returncode != 0:
+        return []
+    return [s.strip() for s in (res.stdout or "").splitlines() if s.strip()]
+
+
 def playable_bluealsa_pcms(device):
     """本机 MAC 当前可播放（下行）的 BlueALSA PCM 名。
 
     A2DP（PROFILE=a2dp）与 SCO 下行（PROFILE=sco，即 Hands-Free 放音）都会
-    列出；bluealsa-aplay -L 与 bluealsa-cli list-pcms 互相兜底。
+    列出。三个来源互相兜底，任何一个可用就能发现通路：
+      * bluealsa-aplay -L / --list-devices → bluealsa:DEV=...,PROFILE=...
+      * aplay -L                           → bluealsa:DEV=...,PROFILE=...
+        （上面两个都可能缺失：bluealsa-aplay 属于 bluez-alsa-utils，不是所有
+        安装都有；麦克风上行一直在用 aplay -L，下行过去却没有用）
+      * bluealsa-cli list-pcms             → D-Bus 对象路径，转成 ALSA PCM 名
     """
     keys = (device.lower(), device.lower().replace(":", ""))
     found = []
-    for cmd in ("bluealsa-aplay -L", "bluealsa-cli list-pcms"):
+    for cmd in ("bluealsa-aplay -L", "bluealsa-aplay --list-devices", "aplay -L"):
         for s in _collect_bluealsa_lines(cmd):
-            low = s.lower()
-            if any(k in low for k in keys):
+            if any(k in s.lower() for k in keys):
                 found.append(s)
+    for s in _collect_cmd_lines("bluealsa-cli list-pcms"):
+        name = _pcm_name_from_dbus_path(s, device)
+        if name:
+            found.append(name)
     seen, unique = set(), []
     for c in found:
         if c not in seen:
             seen.add(c)
             unique.append(c)
     return unique
+
+
+def downlink_pcm_candidates(device):
+    """下行 PCM 候选：列表工具报出的 + 按标准命名构造的（由调用方实测过滤）。
+
+    构造名这一层是"列表工具全都不可用/输出格式变了"时的兜底，做法与麦克风
+    上行的 get_bluealsa_pcm_candidates 一致——旧实现的下行没有它，工具一失效
+    就永远认为"本机没有下行 PCM"，电脑放什么都不会出声。
+
+    同一个 profile 只要已经被列表工具报出来，就不再补构造名：构造名要用
+    arecord 实际打开一次才知道真假，而打不开时每次要等超时，不该无谓地付这个代价。
+    """
+    seen, out = set(), []
+    listed = playable_bluealsa_pcms(device)
+    for c in listed:
+        prof = pcm_profile_of(c)
+        if prof and c not in seen:
+            seen.add(c)
+            out.append(c)
+    have = {pcm_profile_of(c) for c in listed}
+    for prof in ("a2dp", "sco"):
+        if prof in have:
+            continue
+        name = "bluealsa:DEV=%s,PROFILE=%s" % (device.upper(), prof)
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def listed_downlink_pcms(device):
+    """列表工具（BlueALSA 自己发布的）报出的下行 PCM 名。
+
+    这些名字是"通路存在"的强证据，用途见 build_downlink_player：SCO 下行采样率
+    固定（16kHz 单声道），列表报出来就可以直接用，不必再实测——实测会在"这条流
+    正被另一端占用"时误判，反而把本来可用的通路丢掉（旧实现同样不实测它）。
+    """
+    return [c for c in playable_bluealsa_pcms(device) if pcm_profile_of(c)]
 
 
 def pcm_profile_of(pcm_name):
@@ -2959,8 +3407,15 @@ def write_downlink_mix_script(path, in_rate, in_channels, out_rate, out_channels
     )
 
 
+# 下行 PCM 实测打不开的短期记忆：同一名字在这个时间内不再重复实测（一次实测
+# 最多要等两轮超时≈8 秒，而调用方每 3 秒就问一次——不留记忆就会一直在等超时）。
+# 5 秒：既省掉绝大部分无谓等待，又不至于"电脑开始播放了还要干等十几秒"。
+_DOWNLINK_PROBE_FAILED = {}
+DOWNLINK_PROBE_RETRY_SECS = 5
+
+
 def build_downlink_player(device, playback_device, python=None, prefer=None,
-                          hat_mode=False):
+                          hat_mode=False, shared_rate=None):
     """构造"电脑下行音频 → 耳机口"的播放管道，返回 dict（无下行 PCM 时 None）。
 
     返回 {"pcm","profile","rate","channels","out_rate","out_channels",
@@ -2969,6 +3424,16 @@ def build_downlink_player(device, playback_device, python=None, prefer=None,
     （Hands-Free 下行）；指定的那条不在就自动用另一条。hat_mode=True 时把
     下行统一到采集的采样率与声道数（见 HEADPHONE_HAT_MODE 的说明：这台 HAT
     收发共用 codec 的 I2S 时钟，两个采样率不能同时跑）。
+
+    shared_rate = 麦克风与耳机口**同一张声卡**时传入"采集采样率"：下行只要不是
+    这个采样率就重采样过去。这条判据放在这里（而不是只看 hat_mode）是为了让
+    实际协商出来的下行采样率算进来——A2DP 是 44.1k 还是 48k 要等电脑开始播放
+    才知道，同卡必须同率，差一点都不行（实测差异表现为放音持续 underrun）。
+
+    下行 PCM 的候选来自三个地方（见 downlink_pcm_candidates）：列表工具、
+    bluealsa-cli 的 D-Bus 路径、以及按标准命名直接构造的名字——每个候选都
+    真的打开一次才算数。只有"真能打开"才建管道，避免建出来一条永远读不到
+    样本的死管道（那种情况日志看着一切正常，就是没声音）。
 
     为什么不用 bluealsa-aplay：它的命令行选项在各版本间差异极大——实测某个
     版本根本没有指定 ALSA 输出设备的选项，照它的老写法传 -d 会直接
@@ -2980,44 +3445,71 @@ def build_downlink_player(device, playback_device, python=None, prefer=None,
     5 秒打印一次峰值，用来区分"链路里根本没数据/全静音"和"有数据但耳机没声"
     ——这正是之前一直无法判断的地方。
     """
-    pcm_list = playable_bluealsa_pcms(device)
-    found = {}
-    for p in pcm_list:
-        prof = pcm_profile_of(p)
-        if prof and prof not in found:
-            found[prof] = p
+    # 候选按"优先通路"分组后逐个**实测能否打开**：列表工具报出的名字可能失效
+    # （电脑刚把输出切走、流被重协商），构造名也可能根本不存在——只有真打开
+    # 一次才算数。某个候选短时间内打不开会被记住，避免每 3 秒重复等超时。
     order = ["sco", "a2dp"] if prefer == "sco" else ["a2dp", "sco"]
+    candidates = downlink_pcm_candidates(device)
+    listed = set(listed_downlink_pcms(device))
     profile = pcm_name = None
+    rate = channels = None
+    errs = []
     for prof in order:
-        if prof in found:
-            profile, pcm_name = prof, found[prof]
+        for cand in candidates:
+            if pcm_profile_of(cand) != prof:
+                continue
+            failed = _DOWNLINK_PROBE_FAILED.get(cand)
+            if failed and time.time() - failed[0] < DOWNLINK_PROBE_RETRY_SECS:
+                errs.append("%s：%s" % (cand, failed[1]))
+                continue
+            cand_rate = cand_channels = None
+            err = ""
+            if prof == "a2dp":
+                # 元数据能读到就不用实测（省一轮 44.1k/48k 试探）
+                path = bluealsa_source_pcm_path(device, "a2dp")
+                if path:
+                    cand_rate, cand_channels = bluealsa_pcm_format(path, "a2dp")
+            elif cand in listed:
+                # 列表工具报出的 SCO 下行：名字本身就说明通路在，采样率固定
+                # 16kHz 单声道，直接用（不再实测，理由见 listed_downlink_pcms）
+                cand_rate, cand_channels = SAMPLE_RATE, 1
+            if not cand_rate:
+                cand_rate, cand_channels, err = probe_downlink_params(cand, prof)
+            if not cand_rate:
+                _DOWNLINK_PROBE_FAILED[cand] = (time.time(), err or "打不开")
+                errs.append("%s：%s" % (cand, err or "打不开"))
+                continue
+            _DOWNLINK_PROBE_FAILED.pop(cand, None)
+            profile, pcm_name = prof, cand
+            rate, channels = cand_rate, cand_channels
+            break
+        if profile:
             break
     if profile is None:
+        # 只在错误内容变化时提示，避免每 3 秒刷屏
+        note = "；".join(errs) if errs else "本机没有任何下行 PCM"
+        if note != _LAST_DOWNLINK_ERR[0]:
+            _LAST_DOWNLINK_ERR[0] = note
+            print("  !! 没有可用的下行 PCM（A2DP/Hands-Free 都试过）：%s" % note[-300:])
+            print("     电脑开始播放后会自动重试；一直是这个状态请看 "
+                  "sudo python3 %s --audio-info" % os.path.basename(__file__))
         return None
-    rate, channels = None, None
-    if profile == "a2dp":
-        path = bluealsa_source_pcm_path(device, "a2dp")
-        if path:
-            rate, channels = bluealsa_pcm_format(path, "a2dp")
-        if not rate:
-            rate, channels, err = probe_downlink_params(pcm_name, "a2dp")
-            if not rate:
-                # 只在错误内容变化时提示，避免每 3 秒刷屏
-                if err and err != _LAST_DOWNLINK_ERR[0]:
-                    _LAST_DOWNLINK_ERR[0] = err
-                    print("  !! 打不开 A2DP 下行 PCM（44.1k/48k 都试过）：%s" % err)
-                    print("     电脑开始播放后会自动重试")
-                return None
-        if not channels:
-            channels = 2
-    else:
-        rate, channels = SAMPLE_RATE, 1
-    # 输出格式：HAT 兼容模式下与采集一致（见 decide_hat_mode 自检出的格式），
-    # 否则与下行原生一致。混音阶段能否落地要先定下来，再据此写 aplay 的参数
-    # （写不出脚本就必须放弃统一采样率，否则 aplay 会按错采样率播数据）
+    _LAST_DOWNLINK_ERR[0] = ""
+    if not channels:
+        channels = 2 if profile == "a2dp" else 1
+    # 输出格式：与下行原生一致；同卡（shared_rate）或 HAT 兼容模式时改成与采集
+    # 同率。混音阶段能否落地要先定下来，再据此写 aplay 的参数（写不出脚本就必须
+    # 放弃统一采样率，否则 aplay 会按错采样率播数据）
     out_rate, out_channels = rate, channels
     if hat_mode:
         out_rate, out_channels = _HAT_OUT[0], _HAT_OUT[1]
+    elif shared_rate and rate != shared_rate:
+        # 同卡必须同率：44.1k 的 A2DP 遇到 48k 的采集这种"差一点"的情况同样会
+        # 让两边互相挤，所以按采集采样率重采样下行（单声道，该卡放音本来就是
+        # 单声道通路；重采样走写好的抗混叠脚本）
+        out_rate, out_channels = shared_rate, 1
+        print("  -> 同卡共存：下行 %d Hz %d ch → 重采样到采集采样率 %d Hz 单声道"
+              "（共用一个 I2S 时钟，只能同率）" % (rate, channels, shared_rate))
     mix_stage = None
     need_mix = python and (rate != out_rate or channels != out_channels)
     if need_mix:
@@ -3029,6 +3521,8 @@ def build_downlink_player(device, playback_device, python=None, prefer=None,
         except OSError as exc:
             print("  !! 无法写出下行混音脚本（%s）：本次不做采样率统一" % exc)
             out_rate, out_channels = rate, channels
+    # 下行两侧都用 HP_* 那套放宽的缓冲（见配置处说明）：这里不是延迟敏感的人声
+    # 链路，而是"要扛住蓝牙到达抖动"的音乐播放，20ms/60ms 的小缓冲一抖就 underrun
     rec_cmd = [
         "arecord",
         "-t",
@@ -3042,9 +3536,9 @@ def build_downlink_player(device, playback_device, python=None, prefer=None,
         "-c",
         str(channels),
         "--period-time",
-        str(PERIOD_TIME_US),
+        str(HP_PERIOD_TIME_US),
         "--buffer-time",
-        str(BUFFER_TIME_US),
+        str(HP_BUFFER_TIME_US),
     ]
     play_cmd = [
         "aplay",
@@ -3059,9 +3553,9 @@ def build_downlink_player(device, playback_device, python=None, prefer=None,
         "-c",
         str(out_channels),
         "--period-time",
-        str(PERIOD_TIME_US),
+        str(HP_PERIOD_TIME_US),
         "--buffer-time",
-        str(BUFFER_TIME_US),
+        str(HP_BUFFER_TIME_US),
     ]
     # 阶段名统一加 hp- 前缀：原先和麦克风上行管道一样叫 arecord/aplay，
     # 日志里两套管道混在一起（"aplay underrun"到底是谁），排查时白费功夫
@@ -3232,11 +3726,14 @@ A2DP_CHECK_SECS = 30  # 耳机输出线程检查"电脑有没有在用 A2DP 音�
 #     完全看不出问题，旧实现此时既不报日志也不做任何处理（这是本次修复的核心）
 #   ROUTE_PROBE_SECS / ROUTE_PROBE_COOLDOWN = 切换通路前探活的读取时长与最小
 #     间隔：只有"另一条通路真的读得到字节"才切，避免在两条死通路之间来回跳
-DOWNLINK_CHECK_SECS = 10
-DOWNLINK_STALL_SECS = 15
+DOWNLINK_CHECK_SECS = 5
+DOWNLINK_STALL_SECS = 8
 ROUTE_PROBE_SECS = 2
 ROUTE_PROBE_COOLDOWN = 25
 MAX_ROUTE_SWITCHES = 6
+# 链路断开后等它回来的时长：播放器随断开而死时不能立刻退出线程（否则链路几秒后
+# 自动恢复、麦克风照常工作，电脑的音频却整场再也听不到），这里等回来就重建
+HP_RECONNECT_WAIT_SECS = int(os.environ.get("HP_RECONNECT_WAIT_SECS", "60"))
 
 ROUTE_LABELS = {
     "a2dp": "A2DP 音乐通路（电脑里的『…  Stereo』，44.1/48kHz 立体声）",
@@ -3341,6 +3838,10 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
           % (playback_device,
              "（HAT 兼容模式：下行统一为 %d Hz 单声道，与麦克风同率）"
              % SAMPLE_RATE if hat_mode else ""))
+    # 「放音准备完成」提示音：播放设备与混音都已就位、下行播放器还没启动
+    # （此刻声卡是空的，提示音一定放得出去），顺便当场验证这条路能不能出声
+    _NOTIFY_DEVICE[0] = playback_device
+    play_notify_tone("playback", device=playback_device)
     write_headphone_status(
         state="running",
         playback_device=playback_device,
@@ -3378,6 +3879,33 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
     mixer_refix = 0         # 混音被改回后的重设次数（防止和驱动来回拉锯）
     mixer_giveup_noted = False
     prev_bytes = None       # 上一次检查时电平表报出的累计字节数（不涨=通路卡死）
+
+    def wait_link_back(where):
+        """链路断了：**等它回来**（不再直接退出线程），返回是否已恢复。
+
+        为什么：播放器/麦克风都会随断开而死，但 Windows 通常几秒内就自动重连，
+        麦克风那条链路（run_audio_forwarding）会自己重启恢复。旧实现的耳机输出
+        线程在断开时直接 break 退出，本轮会话就再也没人重建播放器——2026-09-14
+        实测：链路 21:23:08 掉、21:23:11 就恢复了，之后整场日志里再没出现过
+        "播放器已启动"，用户听到的就是"提示音能听见、电脑的声音一直听不到"。
+        两条断开路径（轮询检查、播放器退出）都走这里，避免只修一半。
+        """
+        print("  -> 耳机输出：蓝牙连接已断开（%s），停止播放并等待链路恢复，最多 %d 秒"
+              % (where, HP_RECONNECT_WAIT_SECS))
+        log_bt_disconnect_reason(device)
+        waited = 0.0
+        while waited < HP_RECONNECT_WAIT_SECS and not stop_event.is_set():
+            stop_event.wait(2)
+            waited += 2
+            if is_device_connected(device):
+                print("  -> 耳机输出：蓝牙已恢复（断开约 %.0f 秒），继续放音" % waited)
+                return True
+        if stop_event.is_set():
+            print("  -> 耳机输出：收到停止信号，结束本线程")
+        else:
+            print("  -> 耳机输出：链路 %d 秒未恢复，本会话不再尝试（下次连接重新开始）"
+                  % HP_RECONNECT_WAIT_SECS)
+        return False
 
     def switch_downlink_route(reason, target=None, force=False):
         """把下行切到另一条（或 target 指定的）通路，返回是否真的切了。
@@ -3442,8 +3970,13 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
             if time.time() - last_bt_check >= 5:
                 last_bt_check = time.time()
                 if not is_device_connected(device):
-                    print("  -> 耳机输出：蓝牙连接已断开，停止播放")
-                    break
+                    # 断开时等链路回来（见 wait_link_back），不要退出线程：播放器
+                    # 的进程这时都已随断开而死，恢复后会由下面的"播放器管理"重建
+                    if not wait_link_back("轮询检查"):
+                        break
+                    restart = 0
+                    lines = []
+                    continue
             # 每 A2DP_CHECK_SECS 秒确认一次"电脑有没有在用音乐通道"：状态变化
             # 打日志、写状态文件；一直没建立则给一次排查提示（见下）
             if time.time() - last_a2dp_check >= A2DP_CHECK_SECS:
@@ -3537,13 +4070,19 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
                     # 阻塞，字节数停在那一刻不再增长）
                     if not stall_noted:
                         stall_noted = True
+                        other = "sco" if cur_profile == "a2dp" else "a2dp"
                         print("  !! 耳机输出：%s 上没有新数据了（已运行 %.0f 秒，"
                               "累计字节 %s）"
                               % (describe_route(cur_profile), uptime,
                                  "未知" if now_bytes is None else now_bytes))
-                        print("     通路建好了不等于电脑在往它送音频；也可能是下游"
-                              "声卡不再消费（同卡采样率冲突）")
-                        print("     正在探活另一条通路…")
+                        # 电脑只往"它在声音设置里选中的那条输出"送音频，所以这里
+                        # 要把两条通路各自对应 Windows 里的哪个设备名说清楚
+                        print("     电脑只往它在『声音设置→输出』里选中的那条通路送"
+                              "音频：")
+                        print("       当前听的这条 = %s" % describe_route(cur_profile))
+                        print("       另一条       = %s" % describe_route(other))
+                        print("     若 Windows 里选的是另一条，程序会自动切过去"
+                              "（正在探活…；也可用 HEADPHONE_PROFILE=sco 固定）")
                     if switch_downlink_route("当前通路没有新数据"):
                         continue
                 elif level in ("silence", "low"):
@@ -3573,8 +4112,12 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
                     silent_hint_shown = False
             # 播放器管理：只在有下行 PCM 时启动，避免空转
             if not procs:
+                # 同卡（cross_route = 麦克风与耳机口同一张声卡）时把采集采样率交给
+                # 下行：只要电脑协商出来的采样率和采集不一致，就重采样过去。
+                # 采集采样率本身已在启动时按"能跟上放音"自动选过（见 decide_hat_mode）
                 player = build_downlink_player(
-                    device, playback_device, python, prefer, hat_mode=hat_mode
+                    device, playback_device, python, prefer, hat_mode=hat_mode,
+                    shared_rate=(MIC_CAPTURE_RATE if cross_route else None),
                 )
                 if player is None:
                     if not no_pcm_noted:
@@ -3623,10 +4166,13 @@ def headphone_monitor(device, stop_event, playback_device=None, hat_mode=False,
             stop_downlink_player(procs)
             procs = []
             if not is_device_connected(device):
-                # 播放器随蓝牙断开而死：这时候才值得打印 BlueZ 的断开原因
-                print("  -> 耳机输出：蓝牙连接已断开，停止播放")
-                log_bt_disconnect_reason()
-                break
+                # 播放器随蓝牙断开而死：等链路回来再重建（见 wait_link_back）
+                if not wait_link_back("播放器退出"):
+                    break
+                restart = 0
+                lines = []
+                no_pcm_noted = False
+                continue
             restart += 1
             # 同一条通路反复起不来（PCM 打不开/立刻退出）时，先换另一条试试：
             # 常见于电脑刚把输出切走、这条通路的 PCM 已经失效或正被重协商
@@ -3692,6 +4238,111 @@ def ensure_a2dp_audible(device):
         return "volume=%d/127 softvol=%s" % (vol2, _soft_volume_text(soft))
     print("     设置未生效（音量仍读不到）；不再改动 SoftVolume，避免打断正在播放的流")
     return note
+
+
+# ---------------- 提示音（蓝牙连接 / 降噪就绪 / 放音就绪） ----------------
+#
+# 三段提示音要"一耳朵能分清"，所以音高走向、音数、长短都不一样：
+#   bt       = 两声上行（440 → 660 Hz）        蓝牙已连接
+#   denoise  = 三声上行琶音（523/659/784 Hz）  降噪准备完成
+#   playback = 两声下行（988 → 740 Hz）        放音准备完成
+# 提示音由本机声卡直接放（不经蓝牙），所以它同时也是"耳机口这条路通不通"的
+# 现场验证：听不到就看紧随其后的日志——aplay 的退出码和错误会打出来。
+# 声卡被占用（下行播放器正在放音）时会失败，只记一行日志，绝不影响主链路。
+# 关掉：NOTIFY_TONES=0；听不清：NOTIFY_TONE_VOLUME=0.6
+NOTIFY_PATTERNS = {
+    "bt": ("蓝牙已连接", ((440.0, 0.13), (660.0, 0.20))),
+    "denoise": ("降噪准备完成", ((523.25, 0.10), (659.25, 0.10), (783.99, 0.18))),
+    "playback": ("放音准备完成", ((987.77, 0.15), (739.99, 0.24))),
+}
+NOTIFY_TONE_RATE = 44100
+_NOTIFY_TONE_LOCK = threading.Lock()
+_NOTIFY_DEVICE = [None]        # 耳机口播放设备（main 探测到后写入，提示音用它）
+_NOTIFY_DENOISE_DONE = threading.Event()
+
+
+def make_notify_tone_wav(path, kind):
+    """按 NOTIFY_PATTERNS 生成提示音 WAV（每声自带淡入淡出，避免咔哒声）。"""
+    _label, notes = NOTIFY_PATTERNS[kind]
+    frames = bytearray()
+    fade = max(1, int(0.006 * NOTIFY_TONE_RATE))
+    gap = b"\x00\x00\x00\x00" * int(0.03 * NOTIFY_TONE_RATE)   # 两声之间留 30ms
+    for freq, dur in notes:
+        n = max(1, int(dur * NOTIFY_TONE_RATE))
+        for i in range(n):
+            env = 1.0
+            if i < fade:
+                env = i / fade
+            elif i > n - fade:
+                env = max(0.0, (n - i) / fade)
+            v = int(
+                32767
+                * NOTIFY_TONE_VOLUME
+                * env
+                * math.sin(2.0 * math.pi * freq * i / NOTIFY_TONE_RATE)
+            )
+            sample = int(v).to_bytes(2, "little", signed=True)
+            frames += sample + sample      # 两声道同一份样本（单声道卡也出声）
+        frames += gap
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(NOTIFY_TONE_RATE)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def play_notify_tone(kind, device=None):
+    """在耳机口放一段提示音（best-effort：失败只记一行日志，不影响任何链路）。
+
+    返回是否真的放出来了。上一段还没放完时直接跳过（不叠加、不排队）：既不
+    让两段提示音互相盖住，也不阻塞调用方（降噪决策发生在后台线程里）。
+    """
+    if not NOTIFY_TONES:
+        return False
+    label, _notes = NOTIFY_PATTERNS[kind]
+    if not _NOTIFY_TONE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        dev = device or NOTIFY_TONE_DEVICE or _NOTIFY_DEVICE[0]
+        if not dev:
+            print("  [提示音] %s：还没有可用的播放设备，跳过（可在电脑上直接看日志）"
+                  % label)
+            return False
+        if shutil.which("aplay") is None:
+            return False
+        path = "/tmp/bt_notify_%s.wav" % kind
+        try:
+            make_notify_tone_wav(path, kind)
+        except OSError as exc:
+            print("  [提示音] %s：生成失败（%s）" % (label, exc))
+            return False
+        res = run(
+            "timeout 8 aplay -q -D '%s' '%s' 2>&1" % (dev, path),
+            check=False,
+            timeout=12,
+            verbose=False,
+        )
+        if res is None or res.returncode != 0:
+            err = ("超时" if res is None else
+                   " ".join(((res.stdout or "") + (res.stderr or "")).split()))
+            print("  [提示音] %s：在 %s 上播放失败（%s）——常见原因：该声卡正被"
+                  "下行播放器占用、混音静音或音量太小" % (label, dev, err[-160:]))
+            return False
+        print("  [提示音] %s（已在 %s 播放）" % (label, dev))
+        return True
+    finally:
+        _NOTIFY_TONE_LOCK.release()
+
+
+def notify_denoise_ready(mode):
+    """「降噪准备完成」提示音：降噪模式定下来的那一次放一次（含降级结论）。"""
+    if _NOTIFY_DENOISE_DONE.is_set():
+        return
+    _NOTIFY_DENOISE_DONE.set()
+    print("  -> 降噪准备完成（模式: %s）"
+          % ({"df": "DeepFilterNet", "spec": "轻量谱减法", None: "无降噪"}[mode]))
+    play_notify_tone("denoise")
 
 
 def make_test_tone_raw(seconds=2.0, freq=1000.0, rate=44100, channels=2, side=None):
@@ -3847,7 +4498,9 @@ def headphone_test():
         print("  -> 麦克风与耳机口%s"
               % ("**在同一张声卡上**（收发共用 I2S 时钟，只能同一个采样率）" if same
                  else "是两张不同的声卡（互不影响）"))
-    hat_mode = decide_hat_mode(dev, mic_device) if mic_device else False
+    hat_mode = (
+        decide_hat_mode(dev, mic_device, mic_channels) if mic_device else False
+    )
     cross_route = bool(mic_device) and same_sound_card(dev, mic_device)
     print("-- 按上面的判断设置耳机口混音（含交叉路由）--")
     apply_playback_mixer(dev, cross_route=cross_route)
@@ -3935,6 +4588,49 @@ def headphone_test():
     print("     可以事后对照（服务运行时阶段名是 hp-*，不会再和麦克风管道混淆）")
 
 
+def describe_output_card(label):
+    """把 aplay -l 的声卡标签翻成"这是哪个孔"——排查时最需要的一句话。"""
+    low = (label or "").lower()
+    if any(k in low for k in HAT_OUTPUT_HINTS):
+        return "reSpeaker HAT 的 3.5mm 孔"
+    if any(k in low for k in HDMI_OUTPUT_HINTS):
+        return "HDMI（不是耳机孔）"
+    if label_is_onboard_output(label):
+        return "树莓派自己的 3.5mm 孔"
+    return "其它声卡"
+
+
+def print_playback_choices(playback_device, mic_device):
+    """列出全部播放声卡，标出当前用的是哪张、耳机孔在哪张、以及怎么换。
+
+    值得每次启动都打：本机有两个 3.5mm 孔（树莓派板载 + HAT），声音只从"被选中
+    那张卡"的孔出来——"耳机插着一点声没有、日志却全绿"最常见的原因就是送错了卡
+    （配置里写了 PLAYBACK_DEVICE= 时它优先级最高，选错会一直错）。所以这里把
+    每个孔是什么、当前用哪个、另一个孔该怎么切，一次说清楚。
+    """
+    cards = probe_playback_devices()
+    if not cards:
+        return
+    mic_card = _playback_card(mic_device) if mic_device else None
+    print("  -- 本机播放声卡（声音只从被选中那张卡的孔出来）--")
+    others = []
+    for card, dev, label in cards:
+        cand = "plughw:%d,%d" % (card, dev)
+        mark = "  ← 当前使用" if cand == playback_device else ""
+        if mic_card is not None and str(card) == mic_card:
+            mark += "  [与麦克风同一张声卡]"
+        print("     %-13s %-20s %s%s" % (cand, describe_output_card(label), label, mark))
+        if cand != playback_device and not any(
+                k in label.lower() for k in HDMI_OUTPUT_HINTS):
+            others.append((cand, describe_output_card(label)))
+    if others:
+        print("  -> 耳机若是插在另一张卡的孔上，声音不会从那边出来；切换只需一行配置：")
+        print("     echo 'PLAYBACK_DEVICE=%s' | sudo tee -a %s  然后 sudo systemctl "
+              "restart bt-mic" % (others[0][0], CONFIG_FILE))
+        print("     （%s：%s；逐张放测试音确认用 sudo python3 %s --find-output）"
+              % (others[0][0], others[0][1], os.path.basename(__file__)))
+
+
 def list_playback_cards(mic_device=None):
     """打印所有播放声卡（plughw 全名 + 名称 + 是否与麦克风同卡），返回列表。
 
@@ -3954,7 +4650,8 @@ def list_playback_cards(mic_device=None):
     for idx, (card, dev, label) in enumerate(cards, 1):
         cand = "plughw:%d,%d" % (card, dev)
         mark = "  [与麦克风同一张声卡]" if (mic_card and str(card) == mic_card) else ""
-        print("  [%d] %-14s %s%s" % (idx, cand, label, mark))
+        print("  [%d] %-14s %s（%s）%s"
+              % (idx, cand, label, describe_output_card(label), mark))
     return cards
 
 
@@ -4230,8 +4927,18 @@ def print_audio_info():
                     print("        ——默认设置会在检测到通信活动(我们在当麦克风)时把其他")
                     print("        声音降低 80% 甚至静音，表现就是『一开始有声后面没声』")
         else:
-            print("  （没有可播放的 PCM：电脑还没把本机选为输出设备）")
-        print(f"  已连接设备: {', '.join(devices)}")
+            print("  （列表工具没报出可播放的 PCM：电脑还没把本机选为输出设备）")
+        # 列表工具报不出来不等于没有通路（bluealsa-cli 打的是 D-Bus 路径，
+        # 过去这一路会被前缀过滤丢掉），所以把服务实际会去试的候选也列出来
+        cands = downlink_pcm_candidates(devices[0])
+        print("  服务会按顺序实测这些候选（能打开的那条就是实际使用的通路）:")
+        for c in cands:
+            print("    %s    [%s]" % (c, pcm_profile_of(c) or "?"))
+    print("  提示音: %s（蓝牙已连接 / 降噪准备完成 / 放音准备完成，各不同；"
+          "幅度 %.2f，设备 %s）"
+          % ("开启" if NOTIFY_TONES else "关闭（NOTIFY_TONES=0）",
+             NOTIFY_TONE_VOLUME,
+             NOTIFY_TONE_DEVICE or "跟随耳机口播放设备"))
 
     print("-- 耳机输出播放方式与服务状态 --")
     print("  播放方式: arecord <下行 PCM> | aplay -D <耳机口>（本程序内置）")
@@ -5342,12 +6049,30 @@ if __name__ == "__main__":
 """
 
 
+# bluealsa 的 ALSA 插件在某些版本/配置下会往 stderr 打库内调试流水（形如
+# "[13740] D: bluealsa-pcm.c:1538: ..."）——实测一秒上百行，把真正的信息
+# （underrun/overrun/报错）整片淹掉，还要在 SD 卡上白写很多字节。这里只丢
+# "纯调试行"：同一行里带 error/underrun 等关键字的（调试与报错被交错在同一
+# 行的情况）照样保留。
+_LOG_NOISE_RE = re.compile(r"\[\d+\]\s+[DWI]:\s+bluealsa-\w+\.c:\d+:")
+_LOG_NOISE_KEEP = ("error", "underrun", "overrun", "fail", "invalid", "busy")
+
+
+def _is_log_noise(line):
+    if not _LOG_NOISE_RE.search(line):
+        return False
+    low = line.lower()
+    return not any(k in low for k in _LOG_NOISE_KEEP)
+
+
 def drain_stream(stream, label, sink):
     try:
         for raw_line in iter(stream.readline, b""):
             if not raw_line:
                 break
             line = raw_line.decode(errors="replace").rstrip()
+            if _is_log_noise(line):
+                continue
             sink.append(line)
             print(f"    [{label}] {line}", flush=True)
     except ValueError:
@@ -6155,6 +6880,17 @@ _DF_DECIDE_LOCK = threading.Lock()
 
 
 def _select_denoise_mode(venv_python, mic_channels):
+    """决定降噪模式（薄包装）：模式定下来后放一次「降噪准备完成」提示音。
+
+    预热线程（开机后后台预加载）与转发线程都会调用这里，但模式只会真正决策
+    一次，提示音也只放一次。
+    """
+    mode = _decide_denoise_mode(venv_python, mic_channels)
+    notify_denoise_ready(mode)
+    return mode
+
+
+def _decide_denoise_mode(venv_python, mic_channels):
     """
     决定降噪模式，返回 "df" | "spec" | None。
     - DENOISE_MODE=auto（默认）：用 --benchmark 实测 DeepFilterNet 的 RTF，
@@ -6571,7 +7307,11 @@ def main():
     print("=== Raspberry Pi 蓝牙麦克风（BlueALSA + DeepFilterNet）完成版 ===")
     print("等待 Windows 主动连接；免 PIN 配对；断开后保持运行等待重连")
     print("同时作为蓝牙耳机/扬声器：电脑音频送到耳机口（自动选，优先与麦克风不同卡")
-    print("的声卡；换了耳机插孔没声音时跑 --find-output 重新确认是哪个孔）")
+    print("的声卡；换了耳机插孔没声音时跑 --find-output 重新确认是哪个孔，"
+          "或直接写")
+    print("  PLAYBACK_PREFER=onboard（树莓派板载 3.5mm）/ hat（reSpeaker HAT）)")
+    print("三段提示音区分进度：蓝牙已连接 / 降噪准备完成 / 放音准备完成"
+          "（NOTIFY_TONES=0 关闭）")
     print("构建版本: %s" % BUILD_ID)
     if _CONFIG_APPLIED:
         print("已读取配置 %s: %s"
@@ -6581,6 +7321,7 @@ def main():
               % CONFIG_FILE)
     check_script_updated()
     disable_wifi_powersave()
+    warn_wifi_coexistence()
 
     backup_system_state()
     try:
@@ -6625,13 +7366,19 @@ def main():
             playback_device, play_why = select_playback_device(mic_device)
             if playback_device:
                 print(f"  -> 耳机口播放设备: {playback_device}（{play_why}）")
+                # 把"另一个孔是哪张卡、怎么切"一并打出来：声音送错卡（耳机插在
+                # 另一个孔上）是"插着耳机却没声音、日志全绿"最常见的原因
+                print_playback_choices(playback_device, mic_device)
                 # 同卡时：① 打开 HP 交叉路由（该卡放音数据只在一路 DAC 上，
                 # 不开交叉时另一个耳塞完全没声）；② 由 decide_hat_mode 说明
                 # "两个方向抢同一个 I2S 时钟"这件事并给出可实测的对策开关
                 cross_route = same_sound_card(playback_device, mic_device)
-                hat_mode = decide_hat_mode(playback_device, mic_device)
+                hat_mode = decide_hat_mode(playback_device, mic_device, mic_channels)
                 _HAT_MODE[0] = hat_mode
                 apply_playback_mixer(playback_device, cross_route=cross_route)
+                # 提示音（蓝牙连接 / 降噪就绪 / 放音就绪）都走这个耳机口设备：
+                # 提示音放不出来时会打印 aplay 的错误，正好当场暴露"这个孔不出声"
+                _NOTIFY_DEVICE[0] = playback_device
             else:
                 print(f"  !! 未找到可用的播放设备（{play_why}）：")
                 print("     蓝牙耳机（扬声器）功能不可用；麦克风功能不受影响")
@@ -6671,6 +7418,11 @@ def main():
             # 清理上一会话残留的转发进程：旧 aplay 独占 SCO 时，新实例
             # 测不通任何 PCM 却仍能收到旧管道的声音，先杀干净再探测
             kill_stale_audio_pipelines()
+
+            # 「蓝牙已连接」提示音：放在音频管道启动之前、且先杀干净上一会话
+            # 的播放进程之后，此时声卡是空的，提示音一定放得出来（同时也把
+            # "耳机口能不能出声"提前验证一次）
+            play_notify_tone("bt")
 
             # 耳机（扬声器）输出：独立线程，与麦克风链路并行。放在这里而不是
             # 转发启动之后，是因为电脑经常只把它当耳机放音、不开麦克风——
@@ -6716,6 +7468,17 @@ def main():
                 hp_thread.join(timeout=8)
                 print("  -> 耳机输出已停止（本次会话结束）")
 
+            # 本次会话结束（尤其是链路断开）后**立刻**恢复可发现/可配对，并确认
+            # 适配器还在：旧实现要等下一轮会话开头才重新设置，中间这段时间
+            # Windows 搜不到树莓派、也不知道能不能重连——"断开之后再连不上"
+            # 有一半出在这里（另一半是反复强制断开，见 find_working_pcm）。
+            if not get_connected_devices():
+                ensure_pairing_agent()
+                if discoverable_state() is None:
+                    print("  !! 蓝牙控制器不见了（hci0 可能掉了固件）：尝试恢复")
+                    recover_bt_adapter()
+                ensure_discoverable()
+
     except KeyboardInterrupt:
         print("\n  用户中断程序")
     except (RuntimeError, FileNotFoundError, OSError, subprocess.SubprocessError) as e:
@@ -6723,6 +7486,43 @@ def main():
         sys.exit(1)
     finally:
         restore_default()
+
+
+def warn_wifi_coexistence():
+    """检查 WiFi 是不是在 2.4GHz 上（只读，给提示）。
+
+    树莓派 4 的 WiFi 与蓝牙是**同一颗二合一芯片、共用天线**：2.4GHz WiFi 在线
+    时会和蓝牙音频抢射频，实测表现是 SCO 反复停顿（日志里 aplay underrun /
+    arecord overrun 十几二十秒）、声音断续，严重时链路直接被打断（HCI 断开原因
+    多为 supervision timeout 0x08）。用 SSH + 2.4GHz WiFi 跑这套程序正好是这种
+    组合，所以启动时把这件事明确说出来：换 5GHz 或有线网即可。
+    """
+    if shutil.which("iw") is None:
+        return
+    res = run("ls /sys/class/net", check=False, timeout=8, verbose=False)
+    ifaces = [
+        i for i in ((res.stdout or "") if res else "").split()
+        if i.startswith(("wlan", "wlp"))
+    ]
+    for iface in ifaces:
+        info = run(f"iw dev {iface} info", check=False, timeout=8, verbose=False)
+        text = (info.stdout or "") if info else ""
+        m = re.search(r"channel\s+(\d+)\s*\((\d+)\s*MHz\)", text)
+        if not m:
+            continue
+        freq = int(m.group(2))
+        if freq < 2500:
+            print("  !! WiFi %s 工作在 2.4GHz（channel %s / %d MHz）：本机 WiFi 与"
+                  "蓝牙共用一颗芯片和天线，" % (iface, m.group(1), freq))
+            print("     2.4GHz WiFi 忙时（尤其用 SSH 看日志、传文件）会抢射频，表现"
+                  "为 SCO 反复停顿（日志里")
+            print("     aplay underrun / arecord overrun 十几秒）、声音断续，严重时"
+                  "蓝牙链路被判超时断开。")
+            print("     对策：把 WiFi 换到 5GHz，或直接用有线网口（对调试也更快）。")
+            return
+        print("  -> WiFi %s 在 5GHz（%d MHz）：与蓝牙的射频争用较小"
+              % (iface, freq))
+        return
 
 
 def disable_wifi_powersave():
