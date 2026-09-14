@@ -60,6 +60,14 @@ class StereoARDisplay:
         self.scan_status_color = (0, 200, 255)
         self.scan_results = []   # 固定扫描结果：[{'angle', 'detected', 'distance'}]
 
+        # UPS 电池状态（{voltage, current_ma, power_w, percent, charging}）
+        self.battery = None
+        try:
+            self.battery_low_percent = float(os.getenv('UPS_LOW_PERCENT', '20'))
+        except Exception:
+            self.battery_low_percent = 20.0
+        self._battery_bottom = 20   # 电池图标下边缘 y（FPS 文字据此下移避让）
+
         # 颜色定义
         self.colors = {
             'bg': (20, 20, 30),
@@ -483,6 +491,8 @@ class StereoARDisplay:
         else:
             self.draw_top_view(obstacles)
 
+        self._draw_battery()
+
         if fps is not None:
             self._draw_fps(fps)
         t1 = time.perf_counter()
@@ -495,13 +505,14 @@ class StereoARDisplay:
         self.flip_ms = self.flip_ms * 0.9 + (t2 - t1) * 1000 * 0.1
 
     def _draw_fps(self, fps):
-        """在画面左上角绘制实测帧率与分阶段耗时（带阴影）。"""
+        """在画面左上角绘制实测帧率与分阶段耗时（带阴影，避让电池图标）。"""
         font = pygame.font.Font(None, 32)
         text = f"{fps:.1f} fps   draw {self.draw_ms:.0f}ms   flip {self.flip_ms:.0f}ms"
         shadow = font.render(text, True, (0, 0, 0))
         surf = font.render(text, True, (255, 255, 255))
-        self.screen.blit(shadow, (22, 22))
-        self.screen.blit(surf, (20, 20))
+        y = self._battery_bottom + 8
+        self.screen.blit(shadow, (22, y + 2))
+        self.screen.blit(surf, (20, y))
 
     def set_scan_status(self, text, color=(0, 200, 255)):
         """设置/清除人体扫描状态提示。text 为 None 时清除。"""
@@ -511,6 +522,80 @@ class StereoARDisplay:
     def set_scan_results(self, results):
         """设置固定的逐雷达扫描结果，保持显示到下次更新。"""
         self.scan_results = list(results) if results else []
+
+    def set_battery(self, status):
+        """设置 UPS 电池状态（{voltage, current_ma, power_w, percent, charging}）。"""
+        self.battery = dict(status) if status else None
+
+    def _draw_battery(self):
+        """左上角叠加 UPS 电池图标：外框 + 内部矩形格子，低电量闪烁。
+
+        充电时外框与正极凸起变青色；电量 >50% 绿 / 20%~50% 黄 / <=20% 红；
+        低电量（<=UPS_LOW_PERCENT）时整个图标以约 2Hz 闪烁。
+        """
+        st = self.battery
+        if not st:
+            self._battery_bottom = 20
+            return
+        percent = max(0.0, min(100.0, float(st.get('percent', 0.0))))
+        charging = bool(st.get('charging', False))
+        low = percent <= self.battery_low_percent
+        # 低电量：每 0.5s 切换一次显示/隐藏，实现闪烁
+        if low and (int(time.time() * 2) % 2 == 1):
+            self._battery_bottom = 20
+            return
+
+        u = self.ui_scale
+        bw = max(44, int(66 * u))     # 电池主体宽
+        bh = max(24, int(34 * u))     # 电池主体高
+        nub_w = max(3, int(4 * u))    # 正极凸起宽
+        nub_h = max(12, int(18 * u))  # 正极凸起高
+        x0, y0 = 20, 20
+
+        outline = (90, 220, 255) if charging else (200, 220, 235)
+        pygame.draw.rect(self.screen, outline, (x0, y0, bw, bh), 2)
+        pygame.draw.rect(self.screen, outline,
+                         (x0 + bw, y0 + (bh - nub_h) // 2, nub_w, nub_h))
+
+        # 内部矩形格子（5 格）
+        cells = 5
+        gap = max(1, int(2 * u))
+        margin = 3
+        seg_w = (bw - 2 * margin - (cells - 1) * gap) // cells
+        seg_h = bh - 2 * margin
+        if percent > 50:
+            color = (0, 200, 80)
+        elif percent > self.battery_low_percent:
+            color = (255, 200, 0)
+        else:
+            color = (255, 60, 60)
+        filled = int(round(percent / 100.0 * cells))
+        seg_x = x0 + margin
+        for i in range(cells):
+            if i < filled:
+                pygame.draw.rect(self.screen, color,
+                                 (seg_x, y0 + margin, seg_w, seg_h))
+            seg_x += seg_w + gap
+
+        # 右侧百分比文字（带阴影）
+        font = self._font(max(18, int(26 * u)))
+        text = f"{percent:.0f}%"
+        shadow = font.render(text, True, (0, 0, 0))
+        surf = font.render(text, True, (255, 255, 255))
+        tx = x0 + bw + nub_w + 16
+        ty = y0 + (bh - surf.get_height()) // 2
+        self.screen.blit(shadow, (tx + 2, ty + 2))
+        self.screen.blit(surf, (tx, ty))
+
+        # 充电时在百分比文字左侧画一个闪电标记
+        if charging:
+            bx = x0 + bw + nub_w + 4
+            cy = y0 + bh // 2
+            bolt = [(bx + 5, cy - 8), (bx, cy), (bx + 3, cy),
+                    (bx + 2, cy + 8), (bx + 9, cy - 1), (bx + 5, cy - 1)]
+            pygame.draw.polygon(self.screen, (255, 240, 100), bolt)
+
+        self._battery_bottom = y0 + bh
 
     def set_scan_active(self, active, start_time=None):
         """设置扫描进行状态，用于触发扫描推进弧动画。

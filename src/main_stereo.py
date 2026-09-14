@@ -1,8 +1,14 @@
 import time
 import pygame
 import os
+import json
 import threading
 from simulated_sensors import SimulatedSensorHub
+# UPS HAT (E) 电池监测（可选：无 smbus / 非树莓派时自动禁用）
+try:
+    import ups_battery
+except Exception:
+    ups_battery = None
 # try to use real C4002 driver if available; set RADAR_PORTS env var to comma-separated ports (e.g. /dev/ttyUSB0,/dev/ttyUSB1,/dev/ttyUSB2)
 try:
     from c4002_parser import RealSensorHub
@@ -73,6 +79,42 @@ def _robust_distance(dists):
     if not kept:            # 极端情况全部被剔除，退回原始样本
         kept = sd
     return kept[len(kept) // 2]
+
+def _save_and_shutdown(battery_status, state, battery=None):
+    """低电压时保存运行状态到磁盘，随后切断 UPS 输出并关机（UPS HAT (E)）。"""
+    try:
+        save_dir = os.getenv('UPS_SAVE_DIR', 'logs')
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, 'last_state.json')
+        payload = {
+            'event': 'low_voltage_shutdown',
+            'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'battery': battery_status,
+            'scan_results': state.get('scan_results', []),
+        }
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        print(f'[UPS] 已保存运行状态到 {path}')
+    except Exception as e:
+        print(f'[UPS] 保存运行状态失败：{e}')
+    # 把缓冲数据刷到磁盘
+    try:
+        os.sync()
+    except Exception:
+        pass
+    print('[UPS] 电量过低，正在关机…')
+    # UPS HAT (E)：写 0x55 切断输出，保护电池不再过放（数据已 sync 落盘）。
+    if battery is not None:
+        try:
+            battery.power_off()
+            print('[UPS] 已发送 UPS 断电指令')
+        except Exception as e:
+            print(f'[UPS] UPS 断电指令失败：{e}')
+    # 兜底：正常系统关机（断电指令失败时）
+    if ups_battery is not None:
+        ups_battery.shutdown_system()
 
 def sensor_worker(lock, state, scan_trigger, stop_event):
     """后台采集线程：串口/超声波读取、扫描证据聚合、融合均在此执行。
@@ -197,6 +239,18 @@ def main():
         except Exception:
             button = None
 
+    # UPS HAT (E) 电池监测（I2C 0x2D）。无硬件/Windows 下自动禁用。
+    battery = ups_battery.UpsBattery() if ups_battery is not None else None
+    batt_status = None
+    last_batt_t = 0.0
+    low_voltage_streak = 0
+    shutdown_done = False
+    # 关机触发：电量百分比（BQ4050 直接给出，最可靠）；UPS_SHUTDOWN_VOLTAGE>0 时也叠加电压判定
+    shutdown_percent = float(os.getenv('UPS_SHUTDOWN_PERCENT', '10'))
+    shutdown_voltage = float(os.getenv('UPS_SHUTDOWN_VOLTAGE', '0'))
+    shutdown_consecutive = int(os.getenv('UPS_SHUTDOWN_CONSECUTIVE', '3'))
+    shutdown_enabled = os.getenv('UPS_SHUTDOWN_ENABLED', '1') != '0'
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -223,6 +277,28 @@ def main():
         # 把扫描进行状态/起始时间传给显示层（触发扫描推进弧动画）
         display.set_scan_active(scan_active, scan_start_time if scan_active else None)
         display.set_scan_results(scan_results)
+
+        # UPS 电池轮询（约每秒一次）+ 低电压自动保存并关机
+        if battery is not None:
+            now_b = time.time()
+            if now_b - last_batt_t >= battery.poll_seconds:
+                last_batt_t = now_b
+                st = battery.read()
+                if st is not None:
+                    batt_status = st
+                    percent_low = st['percent'] <= shutdown_percent
+                    voltage_low = shutdown_voltage > 0 and st['voltage'] <= shutdown_voltage
+                    trigger = (shutdown_enabled and battery.real
+                               and (percent_low or voltage_low))
+                    low_voltage_streak = low_voltage_streak + 1 if trigger else 0
+                    if low_voltage_streak >= shutdown_consecutive and not shutdown_done:
+                        shutdown_done = True
+                        _save_and_shutdown(st, state, battery)
+                        running = False
+                        break
+                else:
+                    low_voltage_streak = 0
+            display.set_battery(batt_status)
 
         # FPS 统计：每 0.5s 重新计算一次实测帧率
         if show_fps:

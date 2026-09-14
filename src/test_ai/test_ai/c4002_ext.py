@@ -175,7 +175,10 @@ class RawC4002Serial(C4002Serial):
         self.frames_ok += 1
 
         data_len = (pdata[11] << 8) | pdata[10]
-        if data_len + 14 != pack_len:
+        # 通知帧总长 = 8(帧头+长度+类型) + data_len(含 cmd 头4字节) + 2(校验)
+        # 即 pack_len == data_len + 10。之前误写成 +14（把 cmd 头重复计入），
+        # 导致每一帧都被误判为"长度异常"。
+        if data_len + 10 != pack_len:
             self.frames_bad_len += 1
 
         base = 12  # 检测结果结构体起点

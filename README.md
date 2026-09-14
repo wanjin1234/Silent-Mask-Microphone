@@ -24,6 +24,7 @@ A project for Tsinghua University Hardware Design Competition,aiming at reduce t
 | 树莓派 + ReSpeaker 2-Mic Pi HAT | 1 | 主控；音频；板载 GPIO 驱动超声波 |
 | 双目分屏显示器 | 1 | AR 立体 HUD（1920×1080，左右各一） |
 | 轻触按钮 | 1 | 接 GPIO，按一次触发一次扫描 |
+| 微雪 UPS HAT (E) + 锂电池 | 1 | 顶针给树莓派（Pi 4/5）供电；I2C 上报电量 |
 
 - 超声波优先使用**树莓派板载 GPIO + pigpio**（微秒级硬件定时，近距离也准）；
   备选 **FT232H + pyftdi**（`ultrasonic_mpsse.py`）。
@@ -92,6 +93,39 @@ bash run.sh
 | `BUTTON_GPIO` | 按钮引脚 BCM 编号 | `4` |
 | `BUTTON_DEBOUNCE_S` | 两次触发最小间隔秒数（扫描自身还有冷却时间兜底） | `0.2` |
 | `BUTTON_DEBUG` | 设为 `1` 打印按键事件，便于在树莓派上验证 | `0` |
+
+## UPS 电池监测与低电压关机（UPS HAT (E)）
+
+用微雪 **UPS HAT (E)**（弹簧顶针给树莓派 Pi 4/5 供电）作不间断电源，板载 IP2368
+（充电）+ BQ4050（电量计）经 I2C 上报电池电压/电流/电量，在 AR 画面左上角显示电池图标：
+**外框 + 内部 5 格矩形**，电量 >50% 绿 / 20%~50% 黄 / ≤20% 红；充电时外框变青，
+低电量（≤ `UPS_LOW_PERCENT`）时图标闪烁。
+
+电量过低（默认 ≤ `UPS_SHUTDOWN_PERCENT` 且连续 `UPS_SHUTDOWN_CONSECUTIVE` 次命中）时，
+自动把运行状态保存到 `logs/last_state.json`，向 UPS 写 `0x55` 切断输出（保护电池不过放），
+并执行系统关机作为兜底。
+
+环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `UPS_I2C_BUS` | `1` | I2C 总线号 |
+| `UPS_I2C_ADDR` | `0x2D` | UPS HAT (E) 从站地址（官方默认） |
+| `UPS_POLL_SECONDS` | `1.0` | 轮询间隔 s |
+| `UPS_LOW_PERCENT` | `20` | 低于该百分比判为低电量并闪烁 |
+| `UPS_SHUTDOWN_PERCENT` | `10` | 低于该百分比自动保存并关机 |
+| `UPS_SHUTDOWN_VOLTAGE` | `0` | 关机电压阈值 V（0=禁用，仅用百分比判定） |
+| `UPS_SHUTDOWN_CONSECUTIVE` | `3` | 连续多少次低电量才关机（防瞬时抖动） |
+| `UPS_SHUTDOWN_ENABLED` | `1` | `0` 关闭实际关机（仅告警，调试用） |
+| `UPS_SAVE_DIR` | `logs` | 关机前保存运行状态的目录 |
+| `UPS_SIMULATE` | `0` | `1` 用模拟电量（Windows 调试图标/闪烁用） |
+
+依赖与启用：
+- 树莓派 venv 里装 `smbus2`（`pip install smbus2`），或系统装 `python3-smbus`。
+- I2C 需在 `raspi-config` 中开启（官方：Interfacing Options → I2C）。
+- 数据读取照搬官方寄存器文档（`UPS HAT (E) Register`，详见 `src/ups_battery.py` 注释）：
+  电量百分比直接由 BQ4050 电量计给出（寄存器 `0x24/0x25`），无需电压换算；
+  电池电压 `0x20/0x21`(mV)、电流 `0x22/0x23`(有符号 mA，正=充电/负=输出)、充电状态 `0x02` bit7。
 
 ## 雷达端口与角度映射
 
