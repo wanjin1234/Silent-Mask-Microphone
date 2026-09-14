@@ -76,6 +76,20 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   直接退出线程——2026-09-14 实测：链路 21:23:08 掉、21:23:11 就恢复了，麦克风
   照常工作，但耳机输出线程已经死了，之后整场都没有播放器（日志里再没出现过
   "播放器已启动"），用户看到的就是"提示音能听见、电脑的声音一直听不到"
+- **刚连上时不肯"共存"的原因（PCM 实测把 SCO 链路反复起停）**：`find_working_pcm`
+  每轮（约 3 秒）会把**所有**候选名都实测一遍（`timeout 2 aplay … /dev/zero`）。
+  对 SCO 来说，每次实测都是一次 HFP 音频链路的打开+播放+关闭，而日志里同一轮里
+  `PROFILE=sco,SRV=org.bluealsa` 与 `PROFILE=sco` 各测一次——刚连上的半分钟里
+  SCO 链路被反复起停，现场就是用户描述的"**刚开始耳机无法与麦克风共存，过一会
+  自己恢复正常**"，链路被反复打扰也是随后被判超时断开的嫌疑。现在两条措施：
+  同一 profile 只实测一个候选名（等价名字测两次没有意义），且同一个名字
+  PCM_TEST_RETRY_SECS（默认 6 秒）内不重复实测——SCO 链路的起停次数降到约 1/5
+- **下行优先用 SCO（有麦克风时）**：`HEADPHONE_PROFILE=auto`（默认）在麦克风可用时
+  改为优先 Hands-Free（SCO）下行，A2DP 作为自动备选。原因见 default_downlink_profile：
+  电脑把输出选成『Hands-Free AG Audio』时，旧默认会先挂在 A2DP 通路上等 0 字节、
+  同时麦克风占用 SCO——两条蓝牙链路同时挂着会让链路反复停顿十几二十秒；两条方向
+  都走同一条 SCO 链路最稳。要立体声音乐（16kHz 单声道换音质）写
+  HEADPHONE_PROFILE=a2dp
 - **通路纠错加快**：DOWNLINK_CHECK_SECS 10→5 秒、DOWNLINK_STALL_SECS 15→8 秒。
   电脑只往它在声音设置里选中的那条输出送音频（Stereo=A2DP / Hands-Free=SCO），
   选错时现在最多 8~13 秒就会自动切到有数据的那条；提示里也把两条通路各自对应的
@@ -723,9 +737,9 @@ SERVICE_UNIT_PATH = "/etc/systemd/system/bt-mic.service"
 # 用途很实在——已经多次出现"复制了新脚本但服务还在跑旧进程"（systemctl start
 # 对已运行的服务是空操作），日志里能一眼看出跑的到底是哪一版
 BUILD_ID = (
-    "2026-09-14-04 断开后不再永久放弃放音（等链路回来重建播放器）+ 通路"
-    "纠错加快（5s/8s，并说明两条通路各对应 Windows 里哪个设备）+ 断开原因"
-    "（Reason/RSSI）与 2.4GHz WiFi 共存提示 + 03 的全部修复"
+    "2026-09-14-05 PCM 实测不再反复起停 SCO 链路（同 profile 只测一个名、6 秒内"
+    "不重测）+ 有麦克风时下行优先走 SCO（避免 A2DP+SCO 两条链路同时挂着导致十几"
+    "秒停顿）+ 04 的断开恢复/诊断与 03 的全部修复"
 )
 _SCRIPT_MTIME = [None]
 _UPDATE_WARNED = [False]
@@ -2051,6 +2065,34 @@ def dump_pcm_diagnostics():
                 print(f"  $ systemctl is-active  ->  {line.strip()}")
 
 
+# PCM 实测（test_pcm）的最小重试间隔——**这条是"刚连上时耳机与麦克风不能共存"的
+# 主要来源**：每次实测都是"用 aplay 打开 PCM、写最多 2 秒静音、再关闭"，对 SCO
+# 来说就是一次 HFP 音频链路的起停。旧实现每一轮（约 3 秒）把**所有**候选名都测一遍
+# （实测日志里同一轮里 PROFILE=sco,SRV=org.bluealsa 与 PROFILE=sco 各测一次，等于
+# 每 3 秒开关两次 SCO 链路），刚连上的半分钟里链路被反复重建：现象就是用户描述的
+# "刚开始耳机无法与麦克风共存，过一会自己恢复正常"，也是链路被判超时断开的嫌疑。
+# 所以：① 同一 profile 只留一个候选名（等价名字测两次没有意义）；
+#       ② 同一个名字在这个间隔内不重复实测。
+PCM_TEST_RETRY_SECS = float(os.environ.get("PCM_TEST_RETRY_SECS", "6"))
+_PCM_TEST_FAILED = {}
+
+
+def dedupe_pcm_candidates(candidates):
+    """同一个 profile 只保留第一个候选名。
+
+    `bluealsa:DEV=x,PROFILE=sco,SRV=org.bluealsa` 与 `bluealsa:DEV=x,PROFILE=sco`
+    指向同一条链路，两个都实测只是多开关一次 SCO 音频链路。
+    """
+    seen, out = set(), []
+    for pcm in candidates:
+        prof = pcm_profile_of(pcm) or pcm   # profile 判不出来就按名字去重
+        if prof in seen:
+            continue
+        seen.add(prof)
+        out.append(pcm)
+    return out
+
+
 def test_pcm(pcm):
     """实测 PCM 是否可打开，返回 (可用?, 失败原因)。"""
     # -t raw 显式声明原始流：/dev/zero 不是 WAV 文件，个别 aplay 版本
@@ -2166,13 +2208,25 @@ def find_working_pcm(device, timeout=90):
             log_bt_disconnect_reason()
             return None
         listed = list_bluealsa_pcms(device)
-        candidates = listed + [c for c in fallback_pcm_names(device) if c not in listed]
+        candidates = dedupe_pcm_candidates(
+            listed + [c for c in fallback_pcm_names(device) if c not in listed]
+        )
         detailed = round_no == 1 or round_no % 5 == 0
         for pcm in candidates:
+            # 实测过、且刚刚还不可用的名字先跳过：反复实测会反复起停 SCO 音频链路
+            # （见 PCM_TEST_RETRY_SECS 的说明），等过了重试间隔再测
+            failed_at = _PCM_TEST_FAILED.get(pcm)
+            if failed_at and time.time() - failed_at < PCM_TEST_RETRY_SECS:
+                if detailed:
+                    print("  测试: %s  ->  刚刚实测不可用，%.0f 秒内不重复实测"
+                          "（避免反复起停 SCO 链路）" % (pcm, PCM_TEST_RETRY_SECS))
+                continue
             ok, err = test_pcm(pcm)
             if ok:
+                _PCM_TEST_FAILED.pop(pcm, None)
                 print(f"  ** 找到可用 PCM: {pcm}")
                 return pcm
+            _PCM_TEST_FAILED[pcm] = time.time()
             if detailed:
                 print(f"  测试: {pcm}  ->  不可用{('：' + err) if err else ''}")
 
@@ -2287,8 +2341,7 @@ def find_working_pcm(device, timeout=90):
     request_hfp_profile(device)
     time.sleep(5)
 
-    candidates = get_bluealsa_pcm_candidates(device)
-    for pcm in candidates:
+    for pcm in dedupe_pcm_candidates(get_bluealsa_pcm_candidates(device)):
         if test_pcm(pcm)[0]:
             return pcm
 
@@ -3903,6 +3956,41 @@ def describe_route(profile):
     return ROUTE_LABELS.get(profile, profile or "未知通路")
 
 
+_PREFER_NOTED = [False]
+
+
+def default_downlink_profile(mic_device=None):
+    """auto（默认）时下行优先用哪条通路。
+
+    结论来自实测（2026-09-14 两份 journal）：这台机器上"麦克风 + 耳机口同时工作"
+    时，**两条方向都走同一条 SCO 链路最稳**。旧默认是先 A2DP（音质好），但在电脑
+    把输出选成『Hands-Free AG Audio』的场景里，程序会先挂在 A2DP 通路上等（0 字节），
+    同时麦克风正在用 SCO——两条蓝牙链路（一条 A2DP、一条 SCO）同时挂着时链路反复
+    停顿，十几二十秒听不到声音，切到 SCO 之后才稳定下来。用户感受就是"刚开始耳机
+    与麦克风不能共存，过一会自己好了"。
+
+    所以有麦克风时默认先用 SCO 下行（16kHz 单声道，音质一般但最稳），A2DP 作为
+    自动备选（本通路长时间没数据时程序会切到有数据的那条，见 DOWNLINK_STALL_SECS）。
+    想强制 A2DP 立体声（只听音乐、不介意共存风险）写 HEADPHONE_PROFILE=a2dp。
+    """
+    if HEADPHONE_PROFILE in ("a2dp", "sco"):
+        return HEADPHONE_PROFILE
+    if HEADPHONE_PROFILE not in ("", "auto") and not _PREFER_NOTED[0]:
+        print("  !! HEADPHONE_PROFILE=%s 不是有效取值（auto/a2dp/sco），按 auto 处理"
+              % HEADPHONE_PROFILE)
+    prefer = "sco" if mic_device else "a2dp"
+    if not _PREFER_NOTED[0]:
+        _PREFER_NOTED[0] = True
+        if prefer == "sco":
+            print("  -> 下行优先通路: Hands-Free（SCO，16kHz 单声道）——麦克风在用 HFP，")
+            print("     两条方向都走同一条 SCO 链路最稳（避免 A2DP 与 SCO 两条链路同时")
+            print("     挂着互相干扰）；本通路没数据时会自动切到 A2DP。要立体声音乐:")
+            print("     HEADPHONE_PROFILE=a2dp（固定用 A2DP）")
+        else:
+            print("  -> 下行优先通路: A2DP（44.1/48kHz 立体声）；没数据时自动切到 Hands-Free")
+    return prefer
+
+
 def alternate_downlink_route(device, cur_profile):
     """除当前通路外，另一条下行通路 (profile, pcm 名)；不存在则 (None, None)。
 
@@ -4035,7 +4123,7 @@ def headphone_monitor(
     no_a2dp_hint = False
     silent_hint_shown = False
     # 下行优先通路与"近乎静音/没有数据"的自动处理状态（详见检查块里的注释）
-    prefer = HEADPHONE_PROFILE if HEADPHONE_PROFILE in ("a2dp", "sco") else "a2dp"
+    prefer = default_downlink_profile(mic_device)
     cur_profile = None  # 当前播放器实际在用的下行通路
     silent_strikes = 0
     volume_fix_done = False
