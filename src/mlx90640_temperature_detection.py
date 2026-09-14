@@ -220,10 +220,12 @@ def refresh_rate_enum(rate_hz: float):
 class _SmbusI2C:
     """把 smbus2 封装成 adafruit_bus_device 所需的 busio 兼容接口。
 
-    Adafruit 的 MLX90640 库通过 board/busio 只能使用 I2C1（GPIO2/3）。
-    若传感器接到其他 I2C 总线（例如树莓派 4B 的 I2C4：SDA=GPIO8/物理24、
-    SCL=GPIO9/物理21，需先在 config.txt 加 dtoverlay=i2c4），就用本类通过
-    smbus2 直接操作对应的 /dev/i2c-N 设备。
+    这是树莓派上读 MLX90640 的**首选**路径：Adafruit 库默认走 Blinka 的
+    ``busio.I2C``，其在 Linux 上把块读转发给 SMBus 的 ``read_i2c_block_data``，
+    单次 block read 有 32 字节上限；而 MLX90640 的 RAM 帧需一次性读 832 字
+    (1664 字节)，被截断后帧数据几乎全 0，导致 ``_GetTa`` 中 ptat/ptatArt 同时
+    为 0 而除零。smbus2 的 ``i2c_rdwr`` 走原始 I2C_RDWR ioctl，无此长度限制，
+    并正确处理 repeated-start 读取，可完整读回 1664 字节。
     """
 
     def __init__(self, bus: int, frequency: int = 400_000) -> None:
@@ -280,21 +282,29 @@ def open_sensor(rate_hz: float):
             "python -m pip install adafruit-blinka adafruit-circuitpython-mlx90640"
         ) from exc
 
-    # 默认用 I2C1；若传感器接在 I2C4（GPIO8/9），运行前设：
+    # 总线号：默认 I2C1；传感器接在其它总线（如 I2C4、i2c-gpio）时设：
     #   export MLX90640_I2C_BUS=4
     i2c_bus = int(os.getenv("MLX90640_I2C_BUS", "1"))
-    if i2c_bus == 1:
-        # I2C1：SDA=GPIO2(物理3)、SCL=GPIO3(物理5)，Blinka 默认支持。
+    # 默认用 smbus2 直连（绕开 Blinka 的 SMBus 32 字节限制）；
+    # 设 MLX90640_USE_BLINKA=1 才回退到 Blinka 的 busio.I2C（不推荐）。
+    use_blinka = os.getenv("MLX90640_USE_BLINKA", "0") == "1"
+    if i2c_bus == 1 and use_blinka:
         import board
         import busio
 
         i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
     else:
-        # 其他 I2C 总线（如 I2C4），用 smbus2 直连 /dev/i2c-N。
         i2c = _SmbusI2C(i2c_bus, frequency=400_000)
 
     sensor = adafruit_mlx90640.MLX90640(i2c, address=SENSOR_ADDRESS)
     sensor.refresh_rate = refresh_rate_enum(rate_hz)
+    # 打印序列号：能读到合法序列号，说明 I2C 地址正确、EEPROM 读取正常，
+    # 可据此区分「地址/接线错误」与「RAM 帧读取的时钟拉伸问题」。
+    try:
+        serial = sensor.serial_number
+        logging.info("MLX90640 序列号：%s", [hex(value) for value in serial])
+    except Exception as exc:  # 序列号读取失败不阻断，但记录便于诊断
+        logging.warning("读取 MLX90640 序列号失败：%s", exc)
     return sensor
 
 
@@ -304,12 +314,18 @@ def read_frame(sensor, retries: int = 3) -> list[float]:
     for attempt in range(1, retries + 1):
         try:
             sensor.getFrame(frame)
+            # Adafruit 库在帧数据全 0 时会于 _GetTa 中除零；此处提前识别，
+            # 转化为可重试的错误，而不是让 ZeroDivisionError 直接崩溃。
+            if not any(value != 0.0 for value in frame):
+                raise ValueError("帧数据全为 0（传感器未就绪或 I2C 时钟拉伸超时）")
+            if not all(math.isfinite(value) for value in frame):
+                raise ValueError("帧数据含非有限值")
             return frame
-        except (OSError, RuntimeError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError, ArithmeticError) as exc:
             last_error = exc
             logging.warning("读取第 %d/%d 帧失败：%s", attempt, retries, exc)
             time.sleep(0.05 * attempt)
-    raise RuntimeError(f"连续 {retries} 次读取 MLX90640 失败") from last_error
+    raise RuntimeError(f"连续 {retries} 次读取 MLX90640 失败：{last_error}") from last_error
 
 
 def build_parser() -> argparse.ArgumentParser:
