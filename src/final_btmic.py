@@ -293,6 +293,16 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   USB 声卡）按通用名 PCM/Master/HP/... 处理——音量类设音量并取消静音，开关类
   直接打开。两种 amixer 写法（sget/sset 与 cget/cset name=）都试：部分 amixer
   版本不接受 name= 形式，旧实现因此在这些声卡上静默什么都没做
+- **开机音量默认拉满**（修"每次开机 alsamixer 音量又被调小"）：声卡驱动每次开机
+  都会把混音复位到驱动默认值（常见是个偏小的音量，或只开一侧，甚至静音），
+  alsamixer 里手调的值不会被保留。所以启动时不再只设认识的那几个控制名，而是把
+  该声卡上**所有播放侧音量控制**（含驱动自己起的名字，凡读数带百分比的）统一拉到
+  HEADPHONE_VOLUME（默认 100%）并取消静音；运行中混音看门狗也会复查"音量有没有
+  被改小"并重设（最多 MIXER_REFIX_MAX=8 次，之后打日志提示手工处理）。
+  采集侧（Capture/PGA/ADC/Mic/Boost/AGC）一律不碰——那是麦克风增益，拉满会把
+  底噪一起放大，上行增益由 GAIN_BOOST_DB / MIC_PGA_GAIN 单独控制。
+  觉得太响写 HEADPHONE_VOLUME=80%（照样会在开机时归位，只是归到 80%）；
+  PLAYBACK_VOLUME_MAX=0 恢复旧行为（只设预置名，不主动归位、也不看门狗复查音量）
 - A2DP 静音缩放修复（本机测试音正常、电脑音频无声的根因）：bluealsa(8) 明确
   A2DP 默认开 SoftVolume，此时样本按 PCM 自身音量缩放；AVRCP 协商异常时该音量
   可能是 0 或读不到，整条流就被缩放到静音（`--audio-info` 里表现为
@@ -371,7 +381,8 @@ Raspberry Pi 作为蓝牙麦克风（BlueALSA + DeepFilterNet）— 完成版
   用 Hands-Free 通路放音）；HEADPHONE_HAT_MODE=auto|1 是否把下行统一到采集采样率；
   HEADPHONE_CAPTURE_RATE=44100/48000 让麦克风按该采样率采集（上行内置重采样到
   16kHz，与放音同率）；HEADPHONE_CROSS_ROUTE=0 关掉 HP 交叉路由；HEADPHONE_VOLUME
-  设耳机口音量；PLAYBACK_DEVICE 指定耳机所在声卡；HP_METER_HEARTBEAT_SECS 调电平表
+  设耳机口音量（默认 100%，开机把播放侧音量统一归位到它，见 PLAYBACK_VOLUME_MAX）；
+  PLAYBACK_DEVICE 指定耳机所在声卡；HP_METER_HEARTBEAT_SECS 调电平表
   心跳间隔（0 = 只在档位变化时报）
 """
 
@@ -540,7 +551,9 @@ MIC_PGA_GAIN = os.environ.get("MIC_PGA_GAIN", "")
 #   A2DP_SINK_ENABLE = 1/0 是否让 BlueALSA 额外注册 A2DP Sink。1 = 电脑可选
 #     "Stereo/耳机"（44.1kHz 立体声）；0 = 只能用 HFP/HSP 下行（16kHz 单声道）
 #   PLAYBACK_DEVICE  = 耳机口所在的 ALSA 播放设备（如 plughw:1,0）；空 = 自动探测
-#   HEADPHONE_VOLUME = 启动时给 wm8960 播放/耳机音量设置的 amixer 值
+#   HEADPHONE_VOLUME = 播放侧音量目标值（默认 100% = 最大）。开机时把该声卡上
+#     所有播放侧音量控制都设成这个值（见 PLAYBACK_VOLUME_MAX），觉得太响就写
+#     80% / 60% 到 /etc/default/bt-mic，重启服务即生效
 HEADPHONE_ENABLE = os.environ.get("HEADPHONE_ENABLE", "1").strip().lower() not in (
     "0",
     "false",
@@ -581,7 +594,25 @@ PLAYBACK_DEVICE_FORCE = os.environ.get(
 # 例：耳机插在树莓派板载孔上就写 PLAYBACK_PREFER=onboard；也可以直接用
 # PLAYBACK_DEVICE=plughw:C,D 精确指定，或跑 --find-output 逐张试听后自动写入
 PLAYBACK_PREFER = os.environ.get("PLAYBACK_PREFER", "any").strip().lower()
-HEADPHONE_VOLUME = os.environ.get("HEADPHONE_VOLUME", "80%")
+# 开机音量归位（默认 100% = 最大）：每次开机声卡驱动会把混音复位到驱动默认值
+# （常见形态是音量偏小、或只开一侧、或干脆静音），alsamixer 里手调的值不会被
+# 保留——"每次开机音量又被调小"就是这么来的。所以启动时不再只设认识的那几个
+# 控制名，而是把该声卡上**所有**播放侧音量控制统一拉到 HEADPHONE_VOLUME 并取消
+# 静音（见 maximize_playback_volume），运行中混音看门狗也会复查"音量有没有被
+# 改小"并重设。
+#   PLAYBACK_VOLUME_MAX=1（默认）= 开机把播放侧音量全部拉满
+#   PLAYBACK_VOLUME_MAX=0        = 旧行为（只设 PLAYBACK_MIXER_CONTROLS 与
+#                                  GENERIC_PLAYBACK_CONTROLS 里认识的音量控制）
+# HEADPHONE_VOLUME 同时是这次"归位"的目标值：想要小一点就写 80% / 60%。
+# 采集侧（Capture/PGA/ADC/Mic/Boost/AGC）一律不碰：那是麦克风增益，拉满会把
+# 底噪一起放大，上行增益由 GAIN_BOOST_DB / MIC_PGA_GAIN 单独控制。
+HEADPHONE_VOLUME = os.environ.get("HEADPHONE_VOLUME", "100%")
+PLAYBACK_VOLUME_MAX = os.environ.get("PLAYBACK_VOLUME_MAX", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
 # A2DP 下行静音缩放修复：BlueALSA 对 A2DP 默认开 SoftVolume，样本按 PCM 自身
 # 音量缩放；AVRCP 协商异常时该音量可能是 0 或读不到，整条流就成了静音
 # （症状：链路全绿、本机测试音正常、电脑音频无声）。默认自动把音量抬到
@@ -671,6 +702,9 @@ MIC_CAPTURE_RATE = int(os.environ.get("HEADPHONE_CAPTURE_RATE", str(SAMPLE_RATE)
 # "能跟上放音"的采样率——写 HEADPHONE_CAPTURE_RATE=16000 就是想让它保持 16kHz
 CAPTURE_RATE_EXPLICIT = "HEADPHONE_CAPTURE_RATE" in os.environ
 HP_MIXER_CHECK_SECS = int(os.environ.get("HP_MIXER_CHECK_SECS", "15"))  # 混音看门狗间隔
+# 混音看门狗自动重设次数上限：既覆盖"开机被复位"和"开麦克风被复位"两轮，
+# 又不会和驱动无限拉锯（超过就打日志提示手工处理）
+MIXER_REFIX_MAX = int(os.environ.get("MIXER_REFIX_MAX", "8"))
 # 下行电平表心跳：每隔这么久打印一次"已转发字节数+峰值"。没有心跳时无法区分
 # "通路正常但一直没声音"和"通路卡住了"——上一轮排查就卡在这里
 HP_METER_HEARTBEAT_SECS = float(os.environ.get("HP_METER_HEARTBEAT_SECS", "15"))
@@ -737,9 +771,9 @@ SERVICE_UNIT_PATH = "/etc/systemd/system/bt-mic.service"
 # 用途很实在——已经多次出现"复制了新脚本但服务还在跑旧进程"（systemctl start
 # 对已运行的服务是空操作），日志里能一眼看出跑的到底是哪一版
 BUILD_ID = (
-    "2026-09-14-05 PCM 实测不再反复起停 SCO 链路（同 profile 只测一个名、6 秒内"
-    "不重测）+ 有麦克风时下行优先走 SCO（避免 A2DP+SCO 两条链路同时挂着导致十几"
-    "秒停顿）+ 04 的断开恢复/诊断与 03 的全部修复"
+    "2026-09-15-06 开机音量归位：启动时把该声卡所有播放侧音量控制统一拉到"
+    "HEADPHONE_VOLUME（默认 100%=最大，不再只设认识的名字），混音看门狗同时复查"
+    "「音量被改小」并重设（MIXER_REFIX_MAX=8）+ 05 的全部修复"
 )
 _SCRIPT_MTIME = [None]
 _UPDATE_WARNED = [False]
@@ -2085,7 +2119,7 @@ def dedupe_pcm_candidates(candidates):
     """
     seen, out = set(), []
     for pcm in candidates:
-        prof = pcm_profile_of(pcm) or pcm   # profile 判不出来就按名字去重
+        prof = pcm_profile_of(pcm) or pcm  # profile 判不出来就按名字去重
         if prof in seen:
             continue
         seen.add(prof)
@@ -2218,8 +2252,10 @@ def find_working_pcm(device, timeout=90):
             failed_at = _PCM_TEST_FAILED.get(pcm)
             if failed_at and time.time() - failed_at < PCM_TEST_RETRY_SECS:
                 if detailed:
-                    print("  测试: %s  ->  刚刚实测不可用，%.0f 秒内不重复实测"
-                          "（避免反复起停 SCO 链路）" % (pcm, PCM_TEST_RETRY_SECS))
+                    print(
+                        "  测试: %s  ->  刚刚实测不可用，%.0f 秒内不重复实测"
+                        "（避免反复起停 SCO 链路）" % (pcm, PCM_TEST_RETRY_SECS)
+                    )
                 continue
             ok, err = test_pcm(pcm)
             if ok:
@@ -2879,14 +2915,88 @@ def _mixer_is_silent(token):
     return False
 
 
+# 采集侧混音控制名的特征：音量归位时**跳过**这些（见 maximize_playback_volume）。
+# 拉满 PGA/ADC 会把麦克风底噪一起放大，上行增益另有 GAIN_BOOST_DB 数字增益与
+# MIC_PGA_GAIN 模拟增益两个专门的开关，不该被"开机音量拉满"顺手改掉。
+CAPTURE_CTL_HINTS = ("capture", "pga", "adc", "mic", "boost", "agc")
+
+
+def _mixer_lowest_percent(raw):
+    """读数里最小的音量百分比（多声道取最小）；开关类/读不到返回 None。
+
+    取最小而不是第一行：右声道被归零正是"只有一个耳朵有声音"的软件形态，
+    只看第一行会把 100%/0% 这种读成"正常"（见 hp_mixer_drift）。
+    """
+    if not raw or "%" not in raw:
+        return None
+    pcts = [int(p) for p in re.findall(r"(\d+)%", raw)]
+    return min(pcts) if pcts else None
+
+
+def maximize_playback_volume(playback_device, skip=(), quiet=False):
+    """把该声卡上**播放侧**的音量控制全部拉到 HEADPHONE_VOLUME 并取消静音。
+
+    为什么需要：每次开机声卡驱动会把混音复位到驱动默认值，而这个默认值往往是
+    个偏小的音量（或只开一侧），alsamixer 里手调的值不会被保留——用户看到的就是
+    "每次开机音量又被调小了"。所以这里不依赖"控制名认不认识"（PCM / Master /
+    Playback / Headphone / Speaker / DAC / Digital / HP / Line …每种驱动叫法都
+    不同），而是把该卡上**所有报百分比的播放侧控制**统一拉满。
+
+    skip 里的控制名跳过（apply_playback_mixer 已经设过的不重复设）。
+    采集侧（名字含 Capture/PGA/ADC/Mic/Boost/AGC）一律不碰。
+    返回 (控制名, 值) 列表，供混音看门狗复查——音量被驱动改小也会被它发现并重设。
+    """
+    if shutil.which("amixer") is None:
+        return []
+    card = _playback_card(playback_device)
+    target = HEADPHONE_VOLUME
+    names = [n for n, _v in PLAYBACK_MIXER_CONTROLS]
+    names += [n for n in GENERIC_PLAYBACK_CONTROLS if n not in names]
+    # 再补上这张卡上"名字我们没预置"的控制（USB 声卡、其它 HAT 的叫法）
+    for ctl in list_mixer_control_names(card):
+        if ctl not in names:
+            names.append(ctl)
+    applied, done, failed = [], [], []
+    for ctl in names:
+        if ctl in skip:
+            continue
+        if any(h in ctl.lower() for h in CAPTURE_CTL_HINTS):
+            continue
+        cur = mixer_control_value(card, ctl)
+        # 只处理"报百分比"的音量控制：读不到的控制、以及开关类（on/off）交给
+        # apply_playback_mixer 的开关逻辑，不在这里猜值
+        if cur is None or "%" not in cur:
+            continue
+        ok = False
+        # 立体声控制逐声道写（只写一个值在部分 amixer 版本上只作用于第一声道）
+        for form in ("%s,%s" % (target, target), target):
+            if amixer_set(card, ctl, form):
+                ok = True
+                break
+        if ok:
+            amixer_set(card, ctl, "unmute")
+            done.append("%s=%s" % (ctl, target))
+            applied.append((ctl, target))
+        else:
+            failed.append(ctl)
+    if done and not quiet:
+        print("  -> 播放侧音量已归位到最大（%s）: %s" % (target, ", ".join(done)))
+    if failed and not quiet:
+        print("  !! 以下音量控制设置失败: %s" % ", ".join(failed))
+    return applied
+
+
 def apply_playback_mixer(playback_device, cross_route=False, quiet=False):
     """打开耳机口的播放通路并设置音量（wm8960 专用控制 + 通用播放控制）。
 
     wm8960（reSpeaker HAT）：Playback/Headphone/Speaker 音量 + 左右输出混音器。
     其它声卡（板载 bcm2835 Headphones、tlv320aic3x 等 HAT、USB 声卡）：按
     GENERIC_PLAYBACK_CONTROLS 里存在的名字处理——音量控制设 HEADPHONE_VOLUME
-    并取消静音（逐声道 `80%,80%`），开关控制直接打开（输出路由开关没开，
-    耳机插着也不出声）。控制项不存在就跳过，失败只提示，不影响麦克风链路。
+    并取消静音（逐声道 `100%,100%`，默认就是最大），开关控制直接打开（输出路由
+    开关没开，耳机插着也不出声）。控制项不存在就跳过，失败只提示，不影响麦克风链路。
+    PLAYBACK_VOLUME_MAX=1（默认）时最后再扫一遍该卡上所有播放侧音量控制并拉满
+    （maximize_playback_volume），这样"驱动默认音量偏小/名字没预置"也能归位——
+    开机音量被复位调小就是靠这一步解决的。
 
     cross_route=True 时额外打开 HAT_MIXER_EXTRA_CONTROLS（HP 交叉路由，让两个
     耳塞都有声——该卡放音数据只在一路 DAC 上，只开直连那侧时另一个耳塞没声）。
@@ -2935,6 +3045,14 @@ def apply_playback_mixer(playback_device, cross_route=False, quiet=False):
             applied.append((ctl, want))
         else:
             failed.append(ctl)
+    # 开机音量归位：再把该卡上**所有**播放侧音量控制（含名字没预置的，如 USB
+    # 声卡）扫一遍拉满——声卡驱动开机复位后的默认音量偏小/只开一侧，正是
+    # "每次开机音量又被调小"的原因。这一步设过的控制也记进 _HP_MIXER_APPLIED，
+    # 所以混音看门狗同样会在它被改小时重设。
+    if PLAYBACK_VOLUME_MAX:
+        applied.extend(
+            maximize_playback_volume(playback_device, skip=seen, quiet=quiet)
+        )
     if done and not quiet:
         print("  -> 耳机口混音已设置: %s" % ", ".join(done))
     if failed and not quiet:
@@ -2942,7 +3060,7 @@ def apply_playback_mixer(playback_device, cross_route=False, quiet=False):
             "  !! 以下混音控制设置失败: %s（可用 amixer -c %s scontrols 查看控制名）"
             % (", ".join(failed), card)
         )
-    if not done and not failed and not quiet:
+    if not applied and not failed and not quiet:
         names = list_mixer_control_names(card)
         print(
             "  -> 声卡 %s 上没找到已知的播放混音控制: %s"
@@ -2954,12 +3072,17 @@ def apply_playback_mixer(playback_device, cross_route=False, quiet=False):
 
 
 def hp_mixer_drift(playback_device):
-    """比对当前混音与 apply_playback_mixer 设过的值，返回"变静音了"的改动列表。
+    """比对当前混音与 apply_playback_mixer 设过的值，返回需要重设的改动列表。
 
-    只报"我们设过、现在却变成关掉/音量为 0"的控制——声卡驱动在开采集流/重配
-    codec 时会把混音重置回默认（默认往往是静音或只开一侧），表现就是"本来有
-    声音、一开麦克风就没声"。返回值只用于日志和自动重设；空列表 = 混音正常。
-    音量从 80% 被调成 50% 这类不算（不影响能否出声，不值得反复重设）。
+    报两类：
+      * "变成关掉 / 音量为 0"——声卡驱动在开采集流/重配 codec 时会把混音重置回
+        默认（默认往往是静音或只开一侧），表现就是"本来有声音、一开麦克风就没声"；
+      * "音量被改小"——开机时驱动复位到一个偏小的默认音量就是这种形态，用户看到
+        的就是"每次开机音量又被调小"。默认目标就是最大（HEADPHONE_VOLUME=100%），
+        所以只报"比我们设的值小"（留 5% 余量，避免驱动档位换算来回抖），比目标大
+        的（驱动自己的增益补偿）不管；PLAYBACK_VOLUME_MAX=0 时不做这项判断，
+        以免在用户自己调低音量时反复拉回去。
+    返回值只用于日志和自动重设；空列表 = 混音正常。
     """
     if shutil.which("amixer") is None or not _HP_MIXER_APPLIED:
         return []
@@ -2972,6 +3095,14 @@ def hp_mixer_drift(playback_device):
         tok = _mixer_state_token(cur)
         if _mixer_is_silent(tok) and not _mixer_is_silent(_mixer_state_token(want)):
             drift.append("%s: %s -> %s" % (ctl, want, cur.strip()))
+            continue
+        if not PLAYBACK_VOLUME_MAX:
+            continue
+        want_pct = _mixer_lowest_percent(want)
+        cur_pct = _mixer_lowest_percent(cur)
+        # 留 5% 余量：驱动把离散档位换算成百分比时可能差一两档，避免来回抖
+        if want_pct is not None and cur_pct is not None and cur_pct < want_pct - 5:
+            drift.append("%s: %s -> %s（音量被调小）" % (ctl, want, cur.strip()))
     return drift
 
 
@@ -3976,18 +4107,24 @@ def default_downlink_profile(mic_device=None):
     if HEADPHONE_PROFILE in ("a2dp", "sco"):
         return HEADPHONE_PROFILE
     if HEADPHONE_PROFILE not in ("", "auto") and not _PREFER_NOTED[0]:
-        print("  !! HEADPHONE_PROFILE=%s 不是有效取值（auto/a2dp/sco），按 auto 处理"
-              % HEADPHONE_PROFILE)
+        print(
+            "  !! HEADPHONE_PROFILE=%s 不是有效取值（auto/a2dp/sco），按 auto 处理"
+            % HEADPHONE_PROFILE
+        )
     prefer = "sco" if mic_device else "a2dp"
     if not _PREFER_NOTED[0]:
         _PREFER_NOTED[0] = True
         if prefer == "sco":
-            print("  -> 下行优先通路: Hands-Free（SCO，16kHz 单声道）——麦克风在用 HFP，")
+            print(
+                "  -> 下行优先通路: Hands-Free（SCO，16kHz 单声道）——麦克风在用 HFP，"
+            )
             print("     两条方向都走同一条 SCO 链路最稳（避免 A2DP 与 SCO 两条链路同时")
             print("     挂着互相干扰）；本通路没数据时会自动切到 A2DP。要立体声音乐:")
             print("     HEADPHONE_PROFILE=a2dp（固定用 A2DP）")
         else:
-            print("  -> 下行优先通路: A2DP（44.1/48kHz 立体声）；没数据时自动切到 Hands-Free")
+            print(
+                "  -> 下行优先通路: A2DP（44.1/48kHz 立体声）；没数据时自动切到 Hands-Free"
+            )
     return prefer
 
 
@@ -4298,8 +4435,9 @@ def headphone_monitor(
                         % os.path.basename(__file__)
                     )
             # 混音看门狗：开麦克风（采集流）时声卡驱动常把耳机口混音重置回
-            # 默认（音量归零 / 输出路由关掉），那"一开麦克风耳机就没声"就是它。
-            # 开麦克风前后各查一次，平时也定期复查，发现变静音立刻重设并说明
+            # 默认（音量归零 / 输出路由关掉），那"一开麦克风耳机就没声"就是它；
+            # 驱动开机复位成"偏小的默认音量"则是"每次开机音量被调小"。
+            # 开麦克风前后各查一次，平时也定期复查，发现变静音/音量被改小立刻重设
             active_now = _UPLINK_ACTIVE.is_set()
             if active_now != uplink_seen:
                 uplink_seen = active_now
@@ -4317,20 +4455,25 @@ def headphone_monitor(
                 drift = hp_mixer_drift(playback_device)
                 if drift:
                     print(
-                        "  !! 耳机口混音被声卡驱动改回默认（采集流打开/重配 "
-                        "codec 时会这样，正是开麦克风后没声音的原因）："
+                        "  !! 耳机口混音被改回去了（声卡驱动在采集流打开/重配 codec "
+                        "时会复位默认值，正是开机/开麦克风后音量被调小、没声音的原因）："
                     )
                     for line in drift[:8]:
                         print("     %s" % line)
-                    if mixer_refix < 5:
+                    if mixer_refix < MIXER_REFIX_MAX:
                         mixer_refix += 1
                         apply_playback_mixer(
                             playback_device, cross_route=cross_route, quiet=True
                         )
-                        print("  -> 已重新设置耳机口混音（第 %d 次）" % mixer_refix)
+                        print(
+                            "  -> 已重新设置耳机口混音（音量归位到最大，第 %d 次）"
+                            % mixer_refix
+                        )
                     elif not mixer_giveup_noted:
                         mixer_giveup_noted = True
-                        print("  !! 混音被反复改回（与驱动来回拉锯），不再自动重设。")
+                        print(
+                            "  !! 混音被反复改回（与驱动来回拉锯），不再自动重设。"
+                        )
                         print(
                             "     可手工用 alsamixer -c %s 确认，或把耳机改插到"
                             "另一张声卡（PLAYBACK_DEVICE=plughw:C,D）"
@@ -5143,7 +5286,7 @@ def play_test_tone():
     run(f"aplay -D '{dev}' '{path}'", check=False, timeout=20)
     print("  -> 测试结束：听到提示音说明耳机口与混音正常；")
     print("     无声请确认耳机插的是 reSpeaker HAT 的 3.5mm 孔、插紧，")
-    print("     并可调高音量（HEADPHONE_VOLUME=100% 后重跑本命令）")
+    print("     并可调高音量（HEADPHONE_VOLUME 默认已是 100%=最大，重跑本命令即会拉满）")
 
 
 def print_audio_info():
@@ -7825,6 +7968,18 @@ def main():
                 print("     蓝牙耳机（扬声器）功能不可用；麦克风功能不受影响")
         else:
             print("  -> HEADPHONE_ENABLE=0：不启用蓝牙耳机（扬声器）输出")
+
+        # 播放侧音量归位（麦克风那张卡）：耳机口经常被自动选到**另一张**声卡
+        # （PLAYBACK_PREFER=any 优先跨卡，避开同卡 I2S 时钟冲突），那么用户打开
+        # alsamixer 看到的那张卡（麦克风所在卡，HAT 就是它）依旧会被驱动复位成
+        # 偏小的默认音量——"每次开机音量被调小"照旧。所以这里也给它归位一次；
+        # 耳机口与麦克风同卡时上面的 apply_playback_mixer 已经扫过，跳过。
+        # 只动播放侧音量（采集侧由 GAIN_BOOST_DB / MIC_PGA_GAIN 控制）。
+        if PLAYBACK_VOLUME_MAX and not (
+            playback_device and same_sound_card(playback_device, mic_device)
+        ):
+            print_status("音量归位（麦克风所在声卡）")
+            maximize_playback_volume(mic_device)
 
         # 后台预选降噪模式：利用等待连接的时间加载模型并实测 RTF，
         # 连接建立后转发管道可直接启动，无需再等模型加载
