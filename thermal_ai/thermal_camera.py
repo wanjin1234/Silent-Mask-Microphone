@@ -76,6 +76,29 @@ class _SmbusI2C:
         self._bus.i2c_rdwr(read_msg)
         buffer[start : start + length] = read_msg.buf[:length]
 
+    def writeto_then_readfrom(
+        self,
+        address: int,
+        out_buffer,
+        in_buffer,
+        *,
+        out_start: int = 0,
+        out_end=None,
+        in_start: int = 0,
+        in_end=None,
+    ) -> None:
+        """写寄存器地址后紧接读（repeated-start），供 EEPROM 读取使用。
+
+        ``adafruit_bus_device.I2CDevice.write_then_readinto`` 会调用本方法，
+        在打开传感器读 EEPROM(0x2400) 时是必经路径。
+        """
+        out_data = bytes(out_buffer[out_start:out_end])
+        in_length = len(in_buffer) if in_end is None else in_end - in_start
+        write_msg = self._smbus2.i2c_msg.write(address, out_data)
+        read_msg = self._smbus2.i2c_msg.read(address, in_length)
+        self._bus.i2c_rdwr(write_msg, read_msg)
+        in_buffer[in_start : in_start + in_length] = read_msg.buf[:in_length]
+
     def read_words(self, address: int, register: int, count: int) -> list[int]:
         """从寄存器连续读 count 个字（16bit，repeated-start 读取）。"""
         cmd = bytes([(register >> 8) & 0xFF, register & 0xFF])
@@ -94,7 +117,8 @@ class ThermalCamera:
     """读出一帧 768 个摄氏温度值的 MLX90640 传感器。"""
 
     def __init__(self, rate_hz: float = 2.0, i2c_bus: int | None = None,
-                 address: int = SENSOR_ADDRESS, i2c_frequency: int = 400_000) -> None:
+                 address: int = SENSOR_ADDRESS, i2c_frequency: int = 400_000,
+                 open_retries: int = 5) -> None:
         if rate_hz not in VALID_RATES:
             raise ValueError(f"rate_hz 必须是 {VALID_RATES} 之一")
         try:
@@ -104,20 +128,28 @@ class ThermalCamera:
                 "缺少硬件驱动，请先执行：python -m pip install -r requirements.txt"
             ) from exc
 
+        # 打开传感器时要读 EEPROM(0x2400)，MLX90640 会做时钟拉伸，位带 I2C 下
+        # 偶发「No such device or address」（这次没收到 ACK），属瞬态错误，重试即可。
+        # 每次重试重新开一条 SMBus，避免复用处于异常状态的句柄。
         self._address = address
-        self._i2c = self._build_i2c(i2c_bus, i2c_frequency)
-        try:
-            self._mlx = adafruit_mlx90640.MLX90640(self._i2c, address=address)
-            refresh = getattr(adafruit_mlx90640.RefreshRate, RATE_NAMES[rate_hz])
-            self._mlx.refresh_rate = refresh
-            self.serial_number = tuple(self._mlx.serial_number)
-        except Exception as exc:
-            deinit = getattr(self._i2c, "deinit", None)
-            if callable(deinit):
-                deinit()
-            raise RuntimeError(
-                f"无法打开 MLX90640 (I2C 7 位地址 0x{address:02X})：{exc}"
-            ) from exc
+        last_error: Exception | None = None
+        for attempt in range(1, open_retries + 1):
+            self._i2c = self._build_i2c(i2c_bus, i2c_frequency)
+            try:
+                self._mlx = adafruit_mlx90640.MLX90640(self._i2c, address=address)
+                refresh = getattr(adafruit_mlx90640.RefreshRate, RATE_NAMES[rate_hz])
+                self._mlx.refresh_rate = refresh
+                self.serial_number = tuple(self._mlx.serial_number)
+                return
+            except Exception as exc:
+                last_error = exc
+                deinit = getattr(self._i2c, "deinit", None)
+                if callable(deinit):
+                    deinit()
+                time.sleep(0.2 * attempt)
+        raise RuntimeError(
+            f"连续 {open_retries} 次打开 MLX90640 失败 (I2C 地址 0x{address:02X})：{last_error}"
+        ) from last_error
 
     @staticmethod
     def _build_i2c(i2c_bus: int | None, i2c_frequency: int):
