@@ -4,6 +4,45 @@ import math
 import time
 import os
 
+
+def _clamp(value, low, high):
+    return low if value < low else high if value > high else value
+
+
+def _temperature_to_rgb(value, min_t, max_t):
+    """把摄氏温度映射到冷->热 RGB（蓝->青->绿->黄->红），供热成像模式复用。"""
+    if max_t <= min_t:
+        return (128, 128, 128)
+    a = min_t + (max_t - min_t) * 0.2121
+    b = min_t + (max_t - min_t) * 0.3182
+    c = min_t + (max_t - min_t) * 0.4242
+    d = min_t + (max_t - min_t) * 0.8182
+
+    red = _clamp(255.0 * (value - b) / (c - b), 0.0, 255.0)
+    if value < a:
+        green = _clamp(255.0 * (value - min_t) / (a - min_t), 0.0, 255.0)
+    elif value <= c:
+        green = 255.0
+    else:
+        green = _clamp(255.0 * (value - d) / (c - d), 0.0, 255.0)
+
+    if value <= b:
+        blue = _clamp(255.0 * (value - b) / (a - b), 0.0, 255.0)
+    elif value <= d:
+        blue = 0.0
+    else:
+        blue = _clamp(240.0 * (value - d) / (max_t - d), 0.0, 240.0)
+    return (round(red), round(green), round(blue))
+
+
+def _build_thermal_lut(min_t, max_t, levels=256):
+    """按温度范围生成 RGB 查找表。"""
+    if levels < 2:
+        raise ValueError("levels must be at least 2")
+    return [_temperature_to_rgb(min_t + (max_t - min_t) * i / (levels - 1),
+                                min_t, max_t) for i in range(levels)]
+
+
 class StereoARDisplay:
     def __init__(self, width=1920, height=1080, ipd_cm=6.5, fullscreen=None):
         # 平滑缩放提示需在 pygame.init 与 set_mode 之前设置，放大时减少锯齿
@@ -135,6 +174,21 @@ class StereoARDisplay:
             return None
         screen_x = center_x + (x_rel * self.focal_length / z_rel)
         screen_y = self.center_y - (y * self.focal_length / z_rel)
+        if 0 <= screen_x < self.width and 0 <= screen_y < self.height:
+            return (int(screen_x), int(screen_y))
+        return None
+
+    def project_point_mono(self, x, y, z):
+        """单视口投影（AR 眼镜自己渲染双目，我们只输出整屏单视角）。
+
+        用 2 倍焦距保持与单眼相同的水平 FOV，画面填满整个屏幕。
+        """
+        z_rel = z
+        if z_rel <= 0.1:
+            return None
+        f = self.focal_length * 2.0
+        screen_x = self.width // 2 + (x * f / z_rel)
+        screen_y = self.center_y - (y * f / z_rel)
         if 0 <= screen_x < self.width and 0 <= screen_y < self.height:
             return (int(screen_x), int(screen_y))
         return None
@@ -479,6 +533,369 @@ class StereoARDisplay:
 
     
    
+    # ---------- 点云透视视图（4D 成像雷达） ----------
+    def draw_pointcloud(self, points, humans, obstacles, frame_stats=None):
+        """点云透视（X 光 / 透视）视图：左右眼分屏，点云 + 人体辉光标记。
+
+        "透视效果"的实现手法（纯软件渲染，树莓派 4B 可 20~30fps）：
+          - 深度排序：远点先画、近点后画，近处遮挡远处，形成纵深；
+          - 深度渐隐：远处点更暗更小、向灭点收敛，营造"看穿进房间"的深度感；
+          - 地面网格：单向透视网格（水平深度线 + 向灭点汇聚的径向线）；
+          - 人体辉光：多层同心圆模拟光晕，在黑烟/黑暗背景下有"穿透"观感。
+
+        参数均为显示坐标系（x=左右, y=高度, z=前方，单位 m）：
+          points    : [{'x','y','z','v','cls'}, ...]
+          humans    : [{'x','y','z','v','state'}, ...]
+          obstacles : [{'x','y','z','n_points'}, ...]
+          frame_stats: 可选，帧头统计信息 dict
+        """
+        self.screen.fill((5, 5, 10))
+
+        cls_color = {
+            'dyn_hi': (255, 205, 60),
+            'dyn_lo': (180, 150, 50),
+            'long_hi': (40, 220, 255),
+            'short_hi': (120, 255, 180),
+            'long_lo': (30, 150, 180),
+            'short_lo': (90, 180, 140),
+        }
+
+        for eye in ('left', 'right'):
+            center_x = self.center_x_left if eye == 'left' else self.center_x_right
+            self._draw_ground_grid(center_x)
+
+            # 深度排序：远处(z 大)先画，近处后画（近处遮挡远处）
+            ordered = sorted(points, key=lambda p: p.get('z', 0.0), reverse=True)
+            for p in ordered:
+                pos = self.project_point(p['x'], p['y'], p['z'], eye)
+                if pos is None:
+                    continue
+                sx, sy = pos
+                z = max(0.1, p['z'])
+                fade = max(0.0, min(1.0, 1.0 - z / 12.0))
+                base = cls_color.get(p.get('cls', 'dyn_lo'), (180, 180, 180))
+                c = (int(base[0] * fade), int(base[1] * fade), int(base[2] * fade))
+                r = max(1, int(3 * self.ui_scale * 8.0 / z))
+                pygame.draw.circle(self.screen, c, (sx, sy), r)
+
+            # 障碍点（更暗更小，避免与人体争抢注意力）
+            for o in obstacles:
+                pos = self.project_point(o['x'], o['y'], o['z'], eye)
+                if pos is None:
+                    continue
+                sx, sy = pos
+                z = max(0.1, o['z'])
+                fade = max(0.0, min(1.0, 1.0 - z / 12.0))
+                c = (int(120 * fade), int(120 * fade), int(140 * fade))
+                pygame.draw.circle(self.screen, c, (sx, sy),
+                                   max(1, int(2 * self.ui_scale * 6.0 / z)))
+
+            # 人体辉光标记（最上层）
+            for h in humans:
+                pos = self.project_point(h['x'], h['y'], h['z'], eye)
+                if pos is None:
+                    continue
+                sx, sy = pos
+                state = h.get('state', 'breathing')
+                col = (255, 80, 60) if state == 'moving' else (40, 220, 255)
+                self._draw_glow_marker(sx, sy, h['z'], col)
+                # 距离标签
+                font = self._font(max(16, int(24 * self.ui_scale)))
+                label = font.render(f"{h['z']:.1f}m", True, col)
+                self.screen.blit(label, (sx + int(10 * self.ui_scale),
+                                         sy - int(10 * self.ui_scale)))
+
+        if frame_stats:
+            self._draw_frame_stats(frame_stats)
+
+    def draw_pointcloud_mono(self, points, humans, obstacles, frame_stats=None,
+                             ultrasonic=None):
+        """单视口透视视图：点云 + 顶部角度刻度 + 底部三弧形距离条。
+
+        参数：
+          points    : [{'x','y','z','v','cls'}, ...] 显示系坐标
+          humans    : [{'x','y','z','state'}, ...]
+          obstacles : [{'x','y','z','n_points'}, ...]
+          ultrasonic: [{'angle':-45/0/45,'distance':m}, ...] 底部弧形条数据源
+        """
+        self.screen.fill((5, 5, 10))
+
+        cls_color = {
+            'dyn_hi': (255, 205, 60),
+            'dyn_lo': (180, 150, 50),
+            'long_hi': (40, 220, 255),
+            'short_hi': (120, 255, 180),
+            'long_lo': (30, 150, 180),
+            'short_lo': (90, 180, 140),
+        }
+
+        center_x = self.width // 2
+        self._draw_ground_grid(center_x, half=self.width // 2,
+                               f=self.focal_length * 2.0)
+
+        # 顶部角度刻度区：刻度线从 tick_base_y 向下延伸 tick_len，点云不可侵入
+        tick_len = int(20 * self.ui_scale)
+        tick_bottom = self.tick_base_y + tick_len + int(12 * self.ui_scale)
+        # 底部距离条区：bar_base_y 上下 bar_half_h，点云不可越界（穿模）
+        bar_top = self.bar_base_y - self.bar_half_h - int(16 * self.ui_scale)
+
+        # 深度排序：远处(z 大)先画，近处后画（近处遮挡远处）
+        ordered = sorted(points, key=lambda p: p.get('z', 0.0), reverse=True)
+        for p in ordered:
+            pos = self.project_point_mono(p['x'], p['y'], p['z'])
+            if pos is None:
+                continue
+            sx, sy = pos
+            # 过滤：与顶部刻度重合的点（太靠上）与穿模到距离条的点（太靠下）
+            if sy < tick_bottom or sy > bar_top:
+                continue
+            z = max(0.1, p['z'])
+            fade = max(0.0, min(1.0, 1.0 - z / 12.0))
+            base = cls_color.get(p.get('cls', 'dyn_lo'), (180, 180, 180))
+            c = (int(base[0] * fade), int(base[1] * fade), int(base[2] * fade))
+            r = max(1, int(3 * self.ui_scale * 8.0 / z))
+            pygame.draw.circle(self.screen, c, (sx, sy), r)
+
+        # 障碍点（更暗更小）
+        for o in obstacles:
+            pos = self.project_point_mono(o['x'], o['y'], o['z'])
+            if pos is None:
+                continue
+            sx, sy = pos
+            if sy < tick_bottom or sy > bar_top:
+                continue
+            z = max(0.1, o['z'])
+            fade = max(0.0, min(1.0, 1.0 - z / 12.0))
+            c = (int(120 * fade), int(120 * fade), int(140 * fade))
+            pygame.draw.circle(self.screen, c, (sx, sy),
+                               max(1, int(2 * self.ui_scale * 6.0 / z)))
+
+        # 人体包围框（框住疑似人体的点云，最上层）
+        for h in humans:
+            state = h.get('state', 'breathing')
+            col = (255, 80, 60) if state == 'moving' else (40, 220, 255)
+            self._draw_bbox_mono(h, col)
+
+        # HUD：顶部角度刻度 + 底部三弧形距离条（后画，压住点云）
+        self._draw_mono_hud(center_x, ultrasonic)
+
+        if frame_stats:
+            self._draw_frame_stats(frame_stats)
+
+    def _draw_bbox_mono(self, h, color):
+        """在单视口透视视图里画一个 3D 包围框，框住疑似人体点云。
+
+        h 需含显示系坐标：x=左右, y=高度, z=前方距离，以及可选边界
+        x_min/x_max/y_min/y_max/z_min/z_max。缺边界时用中心点 ± 固定尺寸兜底。
+        """
+        cx = h.get('x', 0.0)
+        cy = h.get('y', 1.2)   # 高度
+        cz = h.get('z', 2.0)   # 前方距离
+        # 兜底尺寸：人体约 0.5m 宽、1.6m 高、0.5m 深
+        x_min = h.get('x_min', cx - 0.25)
+        x_max = h.get('x_max', cx + 0.25)
+        y_min = h.get('y_min', max(0.0, cy - 0.8))
+        y_max = h.get('y_max', cy + 0.8)
+        z_min = h.get('z_min', max(0.2, cz - 0.25))
+        z_max = h.get('z_max', cz + 0.25)
+
+        # 8 个顶点（近面 z_min 和远面 z_max）
+        corners = [
+            (x_min, y_min, z_min), (x_max, y_min, z_min),
+            (x_max, y_max, z_min), (x_min, y_max, z_min),
+            (x_min, y_min, z_max), (x_max, y_min, z_max),
+            (x_max, y_max, z_max), (x_min, y_max, z_max),
+        ]
+        pts = []
+        for c in corners:
+            p = self.project_point_mono(c[0], c[1], c[2])
+            pts.append(p)
+        if any(p is None for p in pts):
+            return
+        p = pts
+        # 12 条边
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),   # 近面
+            (4, 5), (5, 6), (6, 7), (7, 4),   # 远面
+            (0, 4), (1, 5), (2, 6), (3, 7),   # 连接
+        ]
+        for a, b in edges:
+            pygame.draw.line(self.screen, color, p[a], p[b], 2)
+
+        # 距离标签画在框顶部中点（近面）
+        font = self._font(max(16, int(24 * self.ui_scale)))
+        label = font.render(f"{cz:.1f}m", True, color)
+        label_pos = ((p[2][0] + p[3][0]) // 2, p[2][1] - label.get_height() - 4)
+        self.screen.blit(label, label_pos)
+
+    def _draw_mono_hud(self, center_x, ultrasonic=None):
+        """单视口 HUD：顶部等距角度刻度 + 底部三弧形距离条。"""
+        hud_blue = self.colors['hud_blue']
+        arc_half = self.arc_half
+        arc_bow = self.arc_bow
+
+        # ---- 顶部角度刻度（与 _build_hud 相同的弧形排布）----
+        num_ticks = 7
+        tick_len = int(20 * self.ui_scale)
+        for i in range(num_ticks):
+            t = -1.0 + 2.0 * i / (num_ticks - 1)
+            x_pos = int(center_x + t * arc_half)
+            y_top = int(self.tick_base_y - arc_bow * t * t)
+            f = 1.0 - self.depth_fade * t * t
+            col = (int(hud_blue[0] * f), int(hud_blue[1] * f), int(hud_blue[2] * f))
+            tick_w = 2 if f > 0.7 else 1
+            pygame.draw.line(self.screen, col, (x_pos, y_top),
+                             (x_pos, y_top + tick_len), tick_w)
+
+        # ---- 底部三弧形距离条（左/中/右，超声波距离）----
+        if not ultrasonic:
+            return
+        dist_map = {'left': None, 'center': None, 'right': None}
+        for u in ultrasonic:
+            ang = u.get('angle')
+            d = u.get('distance')
+            if d is None or d <= 0:
+                continue
+            if -50 <= ang <= -30:
+                dist_map['left'] = d
+            elif 30 <= ang <= 50:
+                dist_map['right'] = d
+            elif -15 <= ang <= 15:
+                dist_map['center'] = d
+
+        color_near = (255, 50, 50)
+        color_mid = (255, 200, 50)
+        bar_t_centers = [-2.0 / 3.0, 0.0, 2.0 / 3.0]
+        bar_half_w = 0.28
+        dirs = [('L', dist_map['left']), ('C', dist_map['center']),
+                ('R', dist_map['right'])]
+        for idx, (label, dist) in enumerate(dirs):
+            if dist is None or dist > 6.0:
+                continue
+            tc = bar_t_centers[idx]
+            base_color = color_near if dist <= 1.2 else color_mid
+            fade = 1.0 - self.depth_fade * tc * tc
+            fill_color = (int(base_color[0] * fade), int(base_color[1] * fade),
+                          int(base_color[2] * fade))
+            pts_top = []
+            pts_bot = []
+            seg = 24
+            for j in range(seg + 1):
+                t = tc + bar_half_w * (-1.0 + 2.0 * j / seg)
+                sx = int(round(center_x + t * arc_half))
+                yc = self.bar_base_y + arc_bow * t * t
+                pts_top.append((sx, int(round(yc - self.bar_half_h))))
+                pts_bot.append((sx, int(round(yc + self.bar_half_h))))
+            poly = pts_top + pts_bot[::-1]
+            pygame.gfxdraw.filled_polygon(self.screen, poly, fill_color)
+            pygame.gfxdraw.aapolygon(self.screen, poly, (220, 220, 220))
+            font = self._font(max(16, int(28 * self.ui_scale)))
+            text_surf = font.render(f"{dist:.1f}m", True, hud_blue)
+            shadow_surf = font.render(f"{dist:.1f}m", True, (0, 0, 0))
+            text_rect = text_surf.get_rect(
+                center=(center_x + tc * arc_half,
+                        self.bar_base_y + arc_bow * tc * tc))
+            self.screen.blit(shadow_surf, (text_rect.x + 2, text_rect.y + 2))
+            self.screen.blit(text_surf, text_rect)
+
+    def draw_thermal(self, temperatures, low, high, center_label=None, smooth=True):
+        """热成像模式：把 32x24 温度帧渲染成铺满屏幕的平滑热图。
+
+        与旧版裸色块不同，这里先渲染成 32x24 小图，再用 smoothscale 平滑
+        插值放大到全屏，效果接近 show_graph.py 的 bicubic 插值，但无需
+        matplotlib，树莓派上更轻量。
+
+        参数：
+          temperatures : 768 个摄氏温度值（MLX90640 32x24 原始帧，行优先）
+          low/high     : 色阶范围
+          center_label : 可选，叠加在底部的文字（如中心/峰值温度）
+          smooth       : True=平滑插值，False=保留像元马赛克
+        """
+        if len(temperatures) != 768:
+            return
+        self.screen.fill((0, 0, 0))
+        lut = _build_thermal_lut(low, high)
+        span = high - low
+
+        # 1. 渲染 32x24 小图（每个像元一个像素）
+        small = pygame.Surface((32, 24))
+        for y in range(24):
+            for x in range(32):
+                v = temperatures[y * 32 + x]
+                idx = int(_clamp((v - low) * 255.0 / span, 0.0, 255.0))
+                small.set_at((x, y), lut[idx])
+
+        # 2. 平滑插值放大到全屏（保持 4:3，居中）
+        scale = min(self.width / 32, self.height / 24)
+        w = int(32 * scale)
+        h = int(24 * scale)
+        if smooth:
+            try:
+                big = pygame.transform.smoothscale(small, (w, h))
+            except Exception:
+                big = pygame.transform.scale(small, (w, h))
+        else:
+            big = pygame.transform.scale(small, (w, h))
+        self.screen.blit(big, ((self.width - w) // 2, (self.height - h) // 2))
+
+        if center_label:
+            font = self._font(max(18, int(24 * self.ui_scale)))
+            s = font.render(center_label, True, (255, 255, 255))
+            self.screen.blit(s, (8, self.height - s.get_height() - 8))
+
+    def _draw_ground_grid(self, center_x, cam_h=1.6, max_z=12.0, half=None, f=None):
+        """绘制单向透视地面网格：水平深度线 + 向灭点汇聚的径向线。"""
+        grid = (36, 42, 52)
+        f = self.focal_length if f is None else f
+        half = self.half_width // 2 if half is None else half   # 单眼半宽（设计 1920 时 = 480px）
+        # 水平深度线（z 固定，地面 y = -cam_h）
+        for z0 in (1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0):
+            sy = self.center_y + (cam_h * f / z0)
+            if sy < 0 or sy > self.height:
+                continue
+            fade = max(0.25, 1.0 - z0 / max_z)
+            c = (int(grid[0] * fade), int(grid[1] * fade), int(grid[2] * fade))
+            pygame.draw.line(self.screen, c,
+                             (max(0, center_x - half), int(sy)),
+                             (min(self.width, center_x + half), int(sy)), 1)
+        # 径向线（x 固定，从近端向灭点汇聚）
+        for xi in (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0):
+            z_near = 0.5
+            sx_near = center_x + (xi * f / z_near)
+            sy_near = self.center_y + (cam_h * f / z_near)
+            pygame.draw.line(self.screen, grid,
+                             (int(sx_near), int(sy_near)),
+                             (center_x, self.center_y), 1)
+
+    def _draw_glow_marker(self, sx, sy, z, color, size_scale=1.0):
+        """多层同心圆模拟光晕，无 alpha 混合，树莓派软渲染友好。"""
+        zc = max(0.5, z)
+        r = max(3, int(6 * self.ui_scale * 6.0 / zc * size_scale))
+        pygame.draw.circle(self.screen,
+                           (int(color[0] * 0.25), int(color[1] * 0.25), int(color[2] * 0.25)),
+                           (sx, sy), int(r * 2.2))
+        pygame.draw.circle(self.screen,
+                           (int(color[0] * 0.55), int(color[1] * 0.55), int(color[2] * 0.55)),
+                           (sx, sy), int(r * 1.5))
+        pygame.draw.circle(self.screen, color, (sx, sy), r)
+        pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), max(1, r // 3))
+
+    def _draw_frame_stats(self, stats):
+        """左上角叠加帧头统计（帧号/点数/处理耗时），调试用。"""
+        font = self._font(20)
+        lines = [
+            f"frame {stats.get('frame_id', '?')}  "
+            f"pts {stats.get('n_points', '?')}  tracks {stats.get('n_tracks', '?')}",
+        ]
+        if stats.get('bb_ms') is not None:
+            lines.append(f"bb {stats['bb_ms']}ms post {stats.get('postbb_ms')} "
+                         f"tx {stats.get('tx_ms')} int {stats.get('interval_ms')}ms")
+        y = 10
+        for ln in lines:
+            s = font.render(ln, True, self.colors['hud_blue'])
+            self.screen.blit(s, (10, y))
+            y += 24
+
     # ---------- 主绘制入口 ----------
     def draw_obstacles(self, obstacles, fps=None):
         """根据当前模式绘制障碍物；人体图标由 scan_results 固定驱动。

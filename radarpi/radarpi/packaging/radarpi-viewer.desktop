@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=radarpi 雷达上位机
+Name[en]=radarpi radar console
+Comment=4D 成像毫米波雷达 pygame 上位机
+Comment[en]=4D imaging mmWave radar console (pygame)
+# Terminal=true 便于看到连接信息与处理器输出；出错时也能直接看到原因
+Exec=radarpi view
+Terminal=true
+Categories=Utility;Science;Engineering;
+Keywords=radar;mmwave;radarpi;点云;
+StartupNotify=false

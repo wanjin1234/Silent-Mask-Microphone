@@ -1,0 +1,25 @@
+# radarpi：USB 转串口适配规则
+#
+# 解决的问题（Raspberry Pi OS 上非常常见）：
+#   1) ModemManager 会把 USB 串口当成调制解调器去探测，抢读雷达数据；
+#   2) brltty（盲文终端服务）会抢占 CH34x/FTDI 串口，导致设备节点消失；
+#   3) 普通用户默认没有串口读写权限。
+#
+# 安装后执行 `sudo udevadm control --reload-rules && sudo udevadm trigger` 生效。
+
+# 让 ModemManager / brltty 忽略这些 USB 串口
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="1a86", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{BRLTTY_BRAILLE_DRIVER}="none"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{BRLTTY_BRAILLE_DRIVER}="none"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="10c4", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="067b", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# 串口设备权限：dialout 组可读写，并给出稳定别名 /dev/radar
+KERNEL=="ttyUSB[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0660", GROUP="dialout", SYMLINK+="radar"
+KERNEL=="ttyUSB[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout", SYMLINK+="radar"
+KERNEL=="ttyACM[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0660", GROUP="dialout", SYMLINK+="radar"
+KERNEL=="ttyACM[0-9]*", SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0660", GROUP="dialout", SYMLINK+="radar"
+KERNEL=="ttyCH343USB[0-9]*", SUBSYSTEM=="tty", MODE="0660", GROUP="dialout", SYMLINK+="radar"
+
+# 3 Mbit/s 高速串口对 USB 延迟敏感：把延迟定时器压到 1ms，减少点云成帧抖动
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
+ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ch343", ATTR{latency_timer}="1"

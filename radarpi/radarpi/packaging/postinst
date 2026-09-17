@@ -1,0 +1,84 @@
+#!/bin/sh
+# radarpi 安装后配置：建用户、修权限、处理串口抢占、启动服务。
+set -e
+
+BRUTTLY_RULE="/usr/lib/udev/rules.d/85-brltty.rules"
+BRUTTLY_BAK="${BRUTTLY_RULE}.disabled-by-radarpi"
+RELOGIN=0
+
+case "$1" in
+configure)
+    # 1) 专用于运行服务的系统用户（无家目录、不能登录）
+    if ! getent passwd radarpi >/dev/null 2>&1; then
+        if ! getent group radarpi >/dev/null 2>&1; then
+            adduser --system --group --no-create-home --home /var/lib/radarpi \
+                    --gecos "radarpi radar console" radarpi >/dev/null 2>&1 || true
+        else
+            adduser --system --no-create-home --home /var/lib/radarpi \
+                    --gecos "radarpi radar console" radarpi >/dev/null 2>&1 || true
+        fi
+    fi
+    if getent group dialout >/dev/null 2>&1; then
+        usermod -aG dialout radarpi >/dev/null 2>&1 || true
+    fi
+
+    # 2) 目录
+    install -d -m 0755 /etc/radarpi
+    install -d -m 0755 -o radarpi -g dialout /var/lib/radarpi 2>/dev/null \
+        || install -d -m 0775 /var/lib/radarpi
+
+    # 3) 把安装者加入 dialout，日常用不着 sudo
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        if ! id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx dialout; then
+            usermod -aG dialout "$SUDO_USER" >/dev/null 2>&1 && RELOGIN=1 || true
+        fi
+    fi
+
+    # 4) brltty 会抢占 USB 串口（CH34x/FTDI 尤其明显），临时停用它的 udev 规则
+    #    卸载时 postrm 会自动恢复，属可逆操作
+    if [ -f "$BRUTTLY_RULE" ]; then
+        mv "$BRUTTLY_RULE" "$BRUTTLY_BAK" 2>/dev/null || true
+        echo "radarpi: 已停用 brltty 的 udev 规则（它会抢占 USB 串口），卸载时会自动恢复。"
+    fi
+
+    # 5) udev / systemd 生效
+    if [ -x /usr/bin/udevadm ] || command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+        udevadm trigger --subsystem-match=tty >/dev/null 2>&1 || true
+    fi
+
+    if [ "${RADARPI_NO_SERVICE:-0}" = "1" ]; then
+        STARTED=0
+    elif command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable radarpi-web.service >/dev/null 2>&1 || true
+        systemctl restart radarpi-web.service >/dev/null 2>&1 \
+            || systemctl start radarpi-web.service >/dev/null 2>&1 || true
+        STARTED=1
+    else
+        STARTED=0
+    fi
+
+    IPADDR=$(hostname -I 2>/dev/null | awk '{print $1}')
+    cat <<EOF
+
+=====================================================================
+radarpi 安装完成
+---------------------------------------------------------------------
+  查看状态:   systemctl status radarpi-web
+  查看日志:   journalctl -u radarpi-web -f
+  网页上位机: http://${IPADDR:-<树莓派IP>}:8080/
+  环境体检:   radarpi doctor
+  端口识别:   radarpi ports
+EOF
+    if [ "$STARTED" = "0" ]; then
+        echo "  注意: 当前环境没有 systemd，请手动运行： radarpi serve"
+    fi
+    if [ "$RELOGIN" = "1" ]; then
+        echo "  注意: 已把 $SUDO_USER 加入 dialout 组，需要重新登录（或重启）后才生效。"
+    fi
+    echo "====================================================================="
+    ;;
+esac
+
+exit 0

@@ -29,7 +29,7 @@ from collections import deque
 import pigpio
 
 TRIG_PINS = [22, 24, 5]
-ECHO_PINS = [23, 25, 6]
+ECHO_PINS = [26, 25, 6]   # 左路 ECHO 原为 23（物理16），该引脚损坏，改到 26（物理37）
 ANGLES = [-45, 0, 45]
 
 # 声速 343 m/s，往返：距离(cm) = 时间(us) / 58.3
