@@ -9176,8 +9176,16 @@ def run_send(args):
                 time.sleep(min(wait, 0.05))
                 continue
             now = time.time()
+            # 正常按一帧的时长推进；落后超过一帧才按 1.5 倍追赶。
+            # **不要写成 max(next_send + step, now)**：那样一旦落后（生产端是
+            # 实时的，落后是常态）就把节拍重置成"现在"，下一帧立刻发 → 变成
+            # "突发送一段 + 空档" → 电脑端播放器频繁 underrun，听感就是
+            # "音频块被一段段截断、失真"（实测踩过）。真有 1 秒以上的大落后
+            # （断线重连）才重新对表，不补发历史音频。
             step = catch_up if now - next_send > frame_dur else frame_dur
-            next_send = max(next_send + step, now)
+            next_send += step
+            if next_send < now - 1.0:
+                next_send = now
             try:
                 # 网络上走 μ-law（如果协商成功）：编码只在这一处，下游全是 s16le
                 ok = link.send_audio(
