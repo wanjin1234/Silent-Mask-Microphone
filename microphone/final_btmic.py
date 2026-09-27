@@ -9113,6 +9113,10 @@ def run_send(args):
         write_status(args.status_file, state="stopped", transport=args.transport)
         _exit_cleanly()
     fmt = apply_codec_choice(link, fmt)     # 电脑端支持就切 μ-law（数据减半）
+    # stdin 来的是**管道里的 s16le**（降噪/增益那几级都是 s16le），所以切块必须按
+    # s16le 的帧长算；用 fmt.frame_bytes（μ-law 只有一半）会把每帧切成 100ms →
+    # 电脑端按 200ms/帧 播，内容变成 0.5 倍速（低沉、块状、失真）。实测踩过。
+    pcm_frame_bytes = int(fmt.rate * fmt.frame_ms / 1000) * fmt.channels * 2
     q = deque()
     q_lock = threading.Lock()
     st = {"read": 0, "sent": 0, "dropped": 0, "bytes": 0}
@@ -9121,7 +9125,13 @@ def run_send(args):
     started = time.time()
 
     def stdin_reader():
-        """按帧长切 stdin；队列满就丢最旧的（延迟优先于完整性）。"""
+        """按帧长切 stdin；队列满就丢最旧的（延迟优先于完整性）。
+
+        切块必须用 **s16le 的帧长**：stdin 上游（降噪/增益那几级）都是 s16le，
+        而 `fmt.frame_bytes` 是**编码后**的大小——μ-law 只有一半，用它切块会把
+        每帧切成 100ms（而不是 200ms）→ 电脑端按 200ms/帧 播，内容变成 0.5 倍速
+        （听感：低沉、块状、失真）。实测踩过。
+        """
         buf = b""
         while not stop.is_set():
             try:
@@ -9132,8 +9142,8 @@ def run_send(args):
                 feof.set()
                 break
             buf += chunk
-            while len(buf) >= fmt.frame_bytes:
-                frame, buf = buf[: fmt.frame_bytes], buf[fmt.frame_bytes:]
+            while len(buf) >= pcm_frame_bytes:
+                frame, buf = buf[:pcm_frame_bytes], buf[pcm_frame_bytes:]
                 with q_lock:
                     q.append(frame)
                     st["read"] += 1
