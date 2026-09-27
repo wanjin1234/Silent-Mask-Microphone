@@ -839,6 +839,11 @@ Description=Silent Mask - Bluetooth Microphone (BlueALSA HFP + DeepFilterNet)
 After=bluetooth.service bluealsa.service
 Wants=bluetooth.service
 StartLimitIntervalSec=0
+# 这里**故意不写 Conflicts=**：systemd 的 Conflicts 是双向的，网络模式在"没有网络
+# 连接"时会去 `systemctl start bt-mic`（智能切换蓝牙），一旦两边互相 Conflicts，
+# 这一句就会让 systemd 把网络服务自己停掉（实测：Stopping bt-mic-net.service）。
+# 两个服务互斥改由程序自己保证：网络模式在开会话前 net_auto_bt_stop()，
+# 蓝牙模式启动时用 --switch 停掉对方（--switch / --net-install 都会显式停对方）。
 
 [Service]
 Type=simple
@@ -846,7 +851,12 @@ ExecStart={python} {script}
 Restart=always
 RestartSec=10
 Nice=-5
-TimeoutStopSec=30
+# 停止要快：这个脚本会拉起 bt-agent / gdbus 之类辅助进程，只发 SIGTERM 时它们
+# 不跟着退，systemd 会等满 TimeoutStopSec 再把 unit 标成 failed（实测 30 秒 +
+# "Failed with result 'timeout'"）。mixed = 主进程收 SIGTERM，其余辅助进程直接
+# SIGKILL，1 秒内干净停下——网络模式要切过来时得马上腾出麦克风。
+KillMode=mixed
+TimeoutStopSec=8
 
 [Install]
 WantedBy=multi-user.target
@@ -7920,6 +7930,7 @@ import random
 import select
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -7937,6 +7948,40 @@ DEFAULT_PEER_TIMEOUT = 20  # 秒：多久收不到对端任何一帧就认为对
 
 def log(msg):
     print("[net] %s" % msg, file=sys.stderr, flush=True)
+
+def local_iface(ip):
+    """本机 IP → 网卡名（判断"走的是 4G 还是 WiFi"用）。
+
+    树莓派上常同时有 wlan0（局域网）和 ppp0（4G 拨号）：同一台电脑既可能在局域网
+    里直连（走 wlan0），也可能经公网 broker 走 4G（走 ppp0），光看"连上了"分不出
+    来，所以把出口网卡名一起报出来。
+    """
+    if not ip:
+        return ""
+    try:
+        out = subprocess.run(["ip", "-4", "-brief", "addr"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and any(p.split("/")[0] == ip for p in parts[2:]):
+            return parts[0]
+    return ""
+
+
+def via_text(ip):
+    """出口 IP 说成人话：ppp0(10.x.x.x) 4G/蜂窝、wlan0(192.168.x.x) 局域网/普通网络。"""
+    if not ip:
+        return "?"
+    name = local_iface(ip)
+    if name.startswith("ppp"):
+        kind = "4G/蜂窝"
+    elif name.startswith(("wlan", "eth", "enx")):
+        kind = "局域网/普通网络"
+    else:
+        kind = "未知"
+    return "%s(%s) %s" % (name, ip, kind) if name else "%s（网卡名未识别）" % ip
 
 
 def _exit_cleanly():
@@ -8323,6 +8368,7 @@ class TcpLink(BaseLink):
         self.host = host
         self.port = int(port)
         self.sock = None
+        self.local_ip = ""
         self.parser = FrameParser()
         self.send_lock = threading.Lock()
 
@@ -8342,6 +8388,10 @@ class TcpLink(BaseLink):
         # 可读，不用 settimeout：那是整条 socket 的属性，会让另一个线程正在进行的
         # sendall 也"超时即失败"，于是帧被静默丢掉（MQTT 那边踩过这个坑）
         self.sock.settimeout(1.0)
+        try:
+            self.local_ip = self.sock.getsockname()[0]
+        except OSError:
+            self.local_ip = ""
         self.last_recv = time.time()
         self.dead.clear()
         threading.Thread(target=self._read_loop, daemon=True).start()
@@ -8351,6 +8401,7 @@ class TcpLink(BaseLink):
         self.send_ctrl({
             "t": "hello", "ver": 1, "ch": self.channel, "name": self.name,
             "token": self.token, "audio": audio_fmt,
+            "via": via_text(getattr(self, "local_ip", "")),
         })
         deadline = time.time() + wait
         while time.time() < deadline:
@@ -8456,12 +8507,17 @@ class MqttLink(BaseLink):
         self.subscribe_topics = [self.ctrl_rx] + ([self.audio_rx] if self.audio_rx else [])
         self.client_id = client_id or ("btmic-%s-%04x" % (self.channel, random.getrandbits(16)))
         self.client = None
+        self.local_ip = ""
         self.pend_ts = {}   # 我们自己发出的 ping 时间戳（用来算往返）
 
     def connect(self, timeout=10):
         self.client = MiniMQTT(self.host, self.port, self.client_id, self.keepalive)
         self.client.connect(timeout)
         self.client.subscribe(self.subscribe_topics)
+        try:
+            self.local_ip = self.client.sock.getsockname()[0]
+        except OSError:
+            self.local_ip = ""
         self.dead.clear()
         self.last_recv = time.time()
         threading.Thread(target=self._read_loop, daemon=True).start()
@@ -8503,6 +8559,7 @@ class MqttLink(BaseLink):
         hello = {
             "t": "hello", "ver": 1, "ch": self.channel, "name": self.name,
             "token": self.token, "audio": audio_fmt,
+            "via": via_text(getattr(self, "local_ip", "")),
         }
         self.send_ctrl(hello)
         deadline = time.time() + wait
@@ -8572,6 +8629,54 @@ def make_link(args, channel):
     return TcpLink(args.host, args.port, **common)
 
 
+# ---------------- 连接重试（服务化场景的关键） ----------------
+#
+# 原来握手失败 = 子进程退出 = 整场会话失败重来（还要重新加载降噪模型 5~7 秒）。
+# 于是"树莓派先开机、电脑端后启动服务"时树莓派一直连不上（用户实测报过）。
+# 现在把重试放进子进程内部：连不上就每 NET_RETRY_SECS 秒重试一次，无限重试，
+# 电脑端一出现就自动接上；会话中途掉线也走同一条重连路径（状态文件会显示
+# state=reconnecting，日志里能看到"连不上…重试"）。
+
+NET_RETRY_SECS = float(os.environ.get("NET_RETRY_SECS", "4"))
+
+
+def connect_with_retry(args, channel, fmt, stop=None, feof=None):
+    """连到 Windows 端（握手成功才返回 link）；连不上就一直等。
+
+    stop 置位 → 放弃并返回 None（父进程要求退出）
+    feof 置位 → 上游音频已结束，不再无意义地重试
+    """
+    attempt = 0
+    while not (stop is not None and stop.is_set()):
+        attempt += 1
+        link = make_link(args, channel)
+        try:
+            link.connect(timeout=args.connect_timeout)
+            info = link.handshake(fmt.as_dict(), wait=max(3.0, float(args.wait)))
+            log("已连上 Windows 端%s（第 %d 次尝试）"
+                % ("（%s）" % info.get("peer") if info.get("peer") else "", attempt))
+            return link
+        except (OSError, socket.timeout) as exc:
+            try:
+                link.close()
+            except Exception:
+                pass
+            if attempt == 1 or attempt % 5 == 0:
+                log("连不上（%s）：%.0f 秒后重试（第 %d 次）。电脑端要先点「启动服务」；"
+                    "MQTT 模式还要令牌/主题一致" % (exc, NET_RETRY_SECS, attempt))
+            # 每次都写状态文件：父进程靠它判断"网络连接没了"，好把麦克风还给蓝牙
+            write_status(args.status_file, state="reconnecting",
+                         transport=args.transport, attempts=attempt,
+                         last_error=str(exc)[:120])
+            if feof is not None and feof.is_set():
+                return None
+            if stop is not None:
+                stop.wait(NET_RETRY_SECS)
+            else:
+                time.sleep(NET_RETRY_SECS)
+    return None
+
+
 # ---------------- 音频格式 ----------------
 
 
@@ -8622,13 +8727,12 @@ def apply_gain(level, path):
 
 def run_send(args):
     fmt = Fmt(args.rate, args.channels, args.frame_ms)
-    link = make_link(args, "up")
-    log("上行发送：%s，音频 %s" % (link.describe(), fmt))
-    link.connect()
-    info = link.handshake(fmt.as_dict())
-    log("已连上 Windows 端%s" % ("（%s）" % info.get("peer") if info.get("peer") else ""))
-
+    log("上行发送：音频 %s" % fmt)
     stop = threading.Event()
+    link = connect_with_retry(args, "up", fmt, stop=stop)   # 等电脑端上线
+    if link is None:
+        write_status(args.status_file, state="stopped", transport=args.transport)
+        _exit_cleanly()
     q = deque()
     q_lock = threading.Lock()
     st = {"read": 0, "sent": 0, "dropped": 0, "bytes": 0}
@@ -8669,9 +8773,12 @@ def run_send(args):
     next_send = time.time()
     while not stop.is_set():
         if not link.alive():
-            log("与 Windows 的连接已断开（%.0f 秒内没有收到任何数据）"
+            log("与 Windows 的连接已断开（%.0f 秒内没有收到任何数据），开始重连"
                 % link.peer_timeout)
-            break
+            link = connect_with_retry(args, "up", fmt, stop=stop, feof=feof)
+            if link is None:
+                break
+            continue
         with q_lock:
             frame = q.popleft() if q else None
         if frame is not None:
@@ -8716,6 +8823,7 @@ def run_send(args):
             })
             write_status(
                 args.status_file, state="sending", transport=link.kind,
+                via=via_text(link.local_ip),
                 peer=link.peer or "-", audio=str(fmt), sent_frames=st["sent"],
                 dropped_frames=st["dropped"], backlog_ms=backlog_ms,
                 level_db=round(last_level, 1),
@@ -8744,11 +8852,11 @@ def run_send(args):
 
 def run_recv(args):
     fmt = Fmt(args.rate, args.channels, args.frame_ms)
-    link = make_link(args, "down")
-    log("下行接收：%s，音频 %s" % (link.describe(), fmt))
-    link.connect()
-    info = link.handshake(fmt.as_dict())
-    log("已连上 Windows 端%s" % ("（%s）" % info.get("peer") if info.get("peer") else ""))
+    log("下行接收：音频 %s" % fmt)
+    link = connect_with_retry(args, "down", fmt)   # 等电脑端上线
+    if link is None:
+        write_status(args.status_file, state="stopped", transport=args.transport)
+        _exit_cleanly()
 
     out = sys.stdout.buffer
     try:
@@ -8775,9 +8883,12 @@ def run_recv(args):
 
     while True:
         if not link.alive():
-            log("与 Windows 的连接已断开（%.0f 秒内没有收到任何音频）"
+            log("与 Windows 的连接已断开（%.0f 秒内没有收到任何音频），开始重连"
                 % link.peer_timeout)
-            break
+            link = connect_with_retry(args, "down", fmt)
+            if link is None:
+                break
+            continue
         data = link.recv_audio(timeout=0.02)
         if data is not None:
             q.append(data)
@@ -8846,6 +8957,7 @@ def run_recv(args):
             write_status(
                 args.status_file,
                 state="playing" if playing else "waiting-audio",
+                via=via_text(link.local_ip),
                 transport=link.kind, peer=link.peer or "-", audio=str(fmt),
                 recv_frames=st["recv"], played_frames=st["played"],
                 dropped_frames=st["dropped"], starved_frames=st["starved"],
@@ -9017,6 +9129,17 @@ NET_PPP = os.environ.get("NET_PPP", "0").strip().lower() not in (
     "no",
 )
 NET_PPP_APN = os.environ.get("NET_PPP_APN", "").strip()
+# 智能蓝牙切换（NET_AUTO_BT，默认开）：没有网络连接时把蓝牙服务拉起来（手机/
+# 电脑随时能用蓝牙连），一旦探测到电脑端在线就停掉蓝牙服务、腾出麦克风给网络
+# 管道（两种模式都要独占同一块声卡，不能同时跑）。NET_AUTO_BT=0 关掉这个行为。
+NET_AUTO_BT = os.environ.get("NET_AUTO_BT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "off",
+    "no",
+)
+# 与电脑断开多久算"没有网络连接"（到点结束会话、把麦克风还给蓝牙）
+NET_OFFLINE_SECS = float(os.environ.get("NET_OFFLINE_SECS", "15"))
 # 下行交给 aplay 的采样率（默认 48000）：低速下行（8k/12k/16k）会先在树莓派这边
 # 重采样到它再播。原因是实测这类 USB 声卡按低速率播"慢于实时"（10 秒数据要 12.5
 # 秒），会导致抖动缓冲堆满、大量丢帧。只认 44.1k 的声卡改成 44100。
@@ -9429,9 +9552,27 @@ def run_net_session(settings, venv_python, mode, mic_device, mic_channels,
     )
     last_mixer_check = time.time()
     last_note = time.time()
+    offline_since = None      # 与电脑断开多久了（两路子进程都在重连即算断开）
     try:
         while True:
             time.sleep(1)
+            # 对端还在不在：上行/下行的网络桥都进入"重连中"就说明网络连接没了。
+            # 到了 NET_OFFLINE_SECS 就主动结束会话——这样麦克风被释放，外层的
+            # net_auto_bt_start() 才能把蓝牙服务拉回来（"没网络时蓝牙可用"）。
+            # 用状态文件判断而不是另开探测连接：省一条连接，也反映的是子进程的真实状态。
+            if NET_AUTO_BT:
+                up_st = read_net_stat(NET_UP_STATUS_FILE).get("state", "")
+                dn_st = read_net_stat(NET_DOWN_STATUS_FILE).get("state", "")
+                if up_st in ("reconnecting", "stopped") and \
+                   dn_st in ("reconnecting", "stopped"):
+                    if offline_since is None:
+                        offline_since = time.time()
+                    elif time.time() - offline_since >= NET_OFFLINE_SECS:
+                        print("  -> 与电脑的连接已断开 %.0f 秒，结束会话"
+                              "（随后自动恢复蓝牙连接）" % NET_OFFLINE_SECS)
+                        return "peer-gone"
+                else:
+                    offline_since = None
             # 上行侧：arecord/降噪/增益/net-send 任一退出都要收场重来
             dead_up = [(label, p) for label, p in procs if p.poll() is not None]
             if dead_up:
@@ -9519,13 +9660,10 @@ def run_net_mode():
     print("  -> 网络桥脚本已写出: %s" % NET_BRIDGE)
     net_4g_report(verbose=False)
 
-    if NET_PPP:
-        # NET_PPP=1：先自己把 4G 拨起来（服务化/无人值守时用；拨号要 30~50 秒）
-        print_status("NET_PPP=1：先建立 4G 串口拨号")
-        ppp_ok, ppp_note = net_4g_ppp_up()
-        print("  -> %s" % ppp_note)
-        if not ppp_ok:
-            print("  !! 拨号没成功，仍继续（也许 WiFi/有线已经能上网）")
+    # 网络模式要独占声卡：万一是从蓝牙模式切过来的（或上一次会话留下的蓝牙服务还在
+    # 跑），先把它停下来，否则下面探测麦克风会一直 "Device or resource busy"。
+    # 正常情况下开机时蓝牙服务是关的（--net-install 里已 disable），这一句是空操作。
+    net_auto_bt_stop(note="网络模式启动：先接管声卡（蓝牙服务先停下）")
 
     print_status("探测麦克风")
     mic_device, mic_channels = None, 1
@@ -9563,11 +9701,44 @@ def run_net_mode():
         target=_select_denoise_mode, args=(venv_python, pre_ch), daemon=True
     ).start()
 
+    # 先探一下电脑在不在：在的话直接进会话，不必"先起蓝牙、再关蓝牙"来回折腾。
+    # 电脑还没上线（树莓派先开机就是这样）才把蓝牙服务拉起来，让手机/电脑能先用蓝牙。
+    peer_now, _out = net_probe_peer(settings, venv_python, quiet=True)
+    if peer_now:
+        print("  -> Windows 电脑已在线，直接进入会话")
+    else:
+        # 没有网络连接：让蓝牙可用（NET_AUTO_BT=0 时不动蓝牙服务）
+        net_auto_bt_start()
+
+    if NET_PPP:
+        # NET_PPP=1：把 4G 拨起来（服务化/无人值守时用；拨号要 30~50 秒）。
+        # 放在蓝牙之后：拨号慢，先让蓝牙可用，用户不用干等这一分钟。
+        # 已经在线就跳过：重拨要先给 pppd 发 +++/ATH 拉回命令模式，而 pppd 正占着
+        # 串口，这一步可能把好链路打断（服务重启时尤其明显）
+        print_status("NET_PPP=1：检查 4G 链路")
+        already = False
+        info = run("ip -brief addr show ppp0", check=False, timeout=8, verbose=False)
+        if info is not None and info.returncode == 0 and "ppp0" in (info.stdout or ""):
+            probe = run("ping -c 2 -W 3 223.5.5.5", check=False, timeout=12,
+                        verbose=False)
+            already = bool(probe and probe.returncode == 0)
+        if already:
+            print("  -> ppp0 已在线且能上网，跳过拨号")
+        else:
+            ppp_ok, ppp_note = net_4g_ppp_up()
+            print("  -> %s" % ppp_note)
+            if not ppp_ok:
+                print("  !! 拨号没成功，仍继续（也许 WiFi/有线已经能上网）")
+
     session = 0
     while True:
         session += 1
         print_status("会话 %d：等待 Windows 电脑上线（%s:%s）"
                      % (session, settings["host"], settings["port"]))
+        if NET_AUTO_BT:
+            print("     等待期间蓝牙连接仍可用；电脑端一上线就自动改用网络")
+        # 等电脑期间就把降噪模型加载好：连上之后立刻能出声，不用再等 5~7 秒
+        warmup = start_denoise_warmup(venv_python, pre_ch)
         while True:
             ok, _out = net_probe_peer(settings, venv_python)
             if ok:
@@ -9579,7 +9750,8 @@ def run_net_mode():
         play_notify_tone("bt")  # 复用"已连接"两声音，现场听得出进度
 
         set_gain_level_file(15)  # 增益归满档，之后由 Windows 界面滑块改
-        warmup = start_denoise_warmup(venv_python, pre_ch)
+        # 有网络连接：关蓝牙、腾出麦克风（两种模式互斥，必须让一边先停）
+        net_auto_bt_stop()
         try:
             reason = run_net_session(
                 settings, venv_python, _select_denoise_mode(venv_python, pre_ch),
@@ -9590,6 +9762,8 @@ def run_net_mode():
         print_status("会话 %d 结束（原因: %s）" % (session, reason))
         if reason == "interrupted":
             raise KeyboardInterrupt
+        # 回到"没有网络连接"状态：把蓝牙服务拉回来（手机/电脑可以重新用蓝牙）
+        net_auto_bt_start()
         print("  -> 程序保持运行，等待电脑重新连接")
         time.sleep(3)
 
@@ -10275,6 +10449,11 @@ NET_SERVICE_UNIT_TEMPLATE = """[Unit]
 Description=Raspberry Pi 网络麦克风（降噪音频 ↔ Windows，final_btmic --net）
 After=network-online.target
 Wants=network-online.target
+# 这里**故意不写 Conflicts=bt-mic.service**：systemd 的 Conflicts 是双向的，而本服务
+# 在"没有网络连接"时会主动 `systemctl start bt-mic.service`（智能切换蓝牙）。写了之后
+# 这一句会被 systemd 当成"bt-mic 起来 → 网络服务该停"，于是每次自动拉起蓝牙就把自己
+# 停掉（实测日志：=== 没有网络连接：启动蓝牙服务 === 紧跟着 Stopping bt-mic-net.service）。
+# 互斥由程序负责：会话开始前 net_auto_bt_stop()；切换用 sudo python3 {script_name} --switch bt|net
 
 [Service]
 Type=simple
@@ -10297,7 +10476,8 @@ def install_net_systemd_unit():
     python = sys.executable or "/usr/bin/python3"
     script = os.path.abspath(__file__)
     unit = NET_SERVICE_UNIT_TEMPLATE.format(
-        python=python, script=script, workdir=os.path.dirname(script) or "/"
+        python=python, script=script, workdir=os.path.dirname(script) or "/",
+        script_name=os.path.basename(script),
     )
     with open(NET_SERVICE_UNIT_PATH, "w", encoding="utf-8") as f:
         f.write(unit)
@@ -10306,6 +10486,22 @@ def install_net_systemd_unit():
         print("  !! 还没有 %s：请先把对端地址写进去，否则服务起来连不上" % CONFIG_FILE)
         print("     例: echo 'NET_HOST=192.168.1.100' | sudo tee -a %s" % CONFIG_FILE)
     run("systemctl daemon-reload", check=False, verbose=False)
+    # 两个服务互斥：先把蓝牙模式停掉，否则网络模式会因"麦克风被占用"起不来
+    # （两个服务都要独占同一块声卡，实测第二个 arecord 直接 Device or busy）
+    bt_active = run("systemctl is-active bt-mic.service", check=False,
+                    timeout=10, verbose=False)
+    bt_enabled = run("systemctl is-enabled bt-mic.service", check=False,
+                     timeout=10, verbose=False)
+    if (bt_active and bt_active.stdout.strip() == "active") or \
+       (bt_enabled and bt_enabled.stdout.strip() == "enabled"):
+        print("  -> 检测到蓝牙模式服务 bt-mic.service 已启用，先停掉它"
+              "（两种模式互斥，不能同时跑）")
+        run("systemctl stop bt-mic.service 2>/dev/null || true", check=False,
+            verbose=False)
+        run("systemctl disable bt-mic.service 2>/dev/null || true",
+            check=False, verbose=False)
+        print("     想切回蓝牙模式： sudo python3 %s --switch bt"
+              % os.path.basename(__file__))
     run("systemctl enable bt-mic-net.service", check=False, verbose=False)
     run("systemctl restart bt-mic-net.service", check=False, verbose=False)
     time.sleep(2)
@@ -10321,6 +10517,135 @@ def install_net_systemd_unit():
     print("  提示：蓝牙模式与网络模式是两个服务，别同时启用（会抢声卡）")
 
 
+def _bt_service_state():
+    """蓝牙服务的 systemd 状态（active/inactive/failed/deactivating…）。"""
+    r = run("systemctl is-active bt-mic.service", check=False, timeout=10,
+            verbose=False)
+    return (r.stdout.strip() if r else "") or "unknown"
+
+
+def _bt_service_active():
+    """蓝牙模式服务是否在跑（它一跑就占着麦克风）。"""
+    return _bt_service_state() == "active"
+
+
+def _bt_service_reset_failed():
+    """清掉 failed 状态。
+
+    蓝牙脚本停的时候会留下 bt-agent/gdbus 这类辅助进程，systemd 等不到它们退出会
+    把 unit 标成 failed（见 SERVICE_UNIT_TEMPLATE 里 KillMode=mixed 的说明）。
+    failed 状态不影响 start，但 `systemctl status` 看着像出错，而且会占着
+    StartLimit 的计数——每次切换前清一下，最省事。
+    """
+    run("systemctl reset-failed bt-mic.service 2>/dev/null || true",
+        check=False, verbose=False)
+
+
+def net_auto_bt_start(verbose=True):
+    """没有网络连接时：把蓝牙服务拉起来，让蓝牙连接可用。
+
+    蓝牙模式的启动本身要 10~30 秒（配置 bluetoothd/bluealsa + 等麦克风），所以
+    这里等到它 active 再返回，日志里能看到进度。
+    """
+    if not NET_AUTO_BT or not os.path.exists(SERVICE_UNIT_PATH):
+        return False
+    if _bt_service_active():
+        return True
+    if verbose:
+        print_status("没有网络连接：启动蓝牙服务（手机/电脑可继续用蓝牙）")
+    _bt_service_reset_failed()
+    run("systemctl start bt-mic.service 2>/dev/null || true", check=False,
+        verbose=False)
+    for _ in range(20):          # 最多等 60 秒
+        time.sleep(3)
+        if _bt_service_active():
+            if verbose:
+                print("  -> 蓝牙已就绪（bt-mic.service active）")
+            return True
+    if verbose:
+        print("  !! 蓝牙服务 60 秒内没起来（不影响网络模式）："
+              "journalctl -u bt-mic -n 30 看原因")
+    return False
+
+
+def net_auto_bt_stop(verbose=True, note=None):
+    """有网络连接（或网络模式要接管声卡）时：停掉蓝牙服务，让出麦克风/声卡。"""
+    if not NET_AUTO_BT or not os.path.exists(SERVICE_UNIT_PATH):
+        return True
+    if not _bt_service_active():
+        _bt_service_reset_failed()
+        return True
+    if verbose:
+        print_status(note or "检测到网络连接：关闭蓝牙服务，腾出麦克风给网络模式")
+    run("systemctl stop bt-mic.service 2>/dev/null || true", check=False,
+        verbose=False)
+    for _ in range(10):          # 最多等 30 秒
+        time.sleep(2)
+        if not _bt_service_active():
+            if verbose:
+                print("  -> 蓝牙已停止（麦克风空出来了）")
+            time.sleep(2)        # 再给驱动一点时间释放设备
+            _bt_service_reset_failed()
+            return True
+    if verbose:
+        print("  !! 蓝牙服务没停下来，网络管道可能拿不到麦克风")
+    return False
+
+
+def switch_mode(target):
+    """`--switch bt|net`：在两种模式之间切换。
+
+    为什么必须"切"而不是"同时开"：蓝牙模式和网络模式都要**独占同一块麦克风与
+    播放设备**（同一时刻只能有一个进程打开 plughw:3,0——实测第二个 arecord 直接报
+    "Device or resource busy"），所以它们互斥。这条命令做的就是：停并禁用一边、
+    启用并启动另一边，最后打印两边状态。两个 unit 里也都写了 Conflicts=，即使手工
+    启动也不会同时跑。
+    """
+    target = (target or "").strip().lower()
+    here = os.path.basename(__file__)
+    if target not in ("bt", "net"):
+        print("用法: sudo python3 %s --switch bt|net" % here)
+        print("  bt  = 蓝牙模式（电脑/手机连蓝牙）")
+        print("  net = 网络模式（Windows 客户端经 TCP/MQTT/4G）")
+        return 2
+    if target == "net" and not os.path.exists(NET_SERVICE_UNIT_PATH):
+        print("!! 还没安装网络模式服务，先跑: sudo python3 %s --net-install" % here)
+        return 2
+    if target == "bt" and not os.path.exists(SERVICE_UNIT_PATH):
+        print("!! 蓝牙模式服务不存在，先跑: sudo python3 %s --install" % here)
+        return 2
+
+    def state(unit):
+        a = run("systemctl is-active %s" % unit, check=False, timeout=10, verbose=False)
+        e = run("systemctl is-enabled %s" % unit, check=False, timeout=10,
+                verbose=False)
+        return (a.stdout.strip() if a else "?"), (e.stdout.strip() if e else "?")
+
+    if target == "net":
+        off, on = "bt-mic.service", "bt-mic-net.service"
+        label = "网络"
+    else:
+        off, on = "bt-mic-net.service", "bt-mic.service"
+        label = "蓝牙"
+    print("=== 切换到%s模式：停 %s → 启 %s ===" % (label, off, on))
+    run("systemctl stop %s 2>/dev/null || true" % off, check=False, verbose=False)
+    run("systemctl disable %s 2>/dev/null || true" % off, check=False, verbose=False)
+    run("systemctl enable %s 2>/dev/null || true" % on, check=False, verbose=False)
+    run("systemctl restart %s 2>/dev/null || true" % on, check=False, verbose=False)
+    time.sleep(3)
+    for unit in (on, off):
+        a, e = state(unit)
+        print("  %-22s active=%-9s enabled=%s" % (unit, a, e))
+    a_on, _ = state(on)
+    if a_on != "active":
+        print("  !! %s 没起来。看日志： journalctl -u %s -n 50" % (on, on))
+        return 1
+    print("  -> 已切到%s模式（另一种模式已停用；两者都要独占声卡，不能同时跑）" % label)
+    if target == "net":
+        print("     网络模式读 /etc/default/bt-mic 里的 NET_* 配置；NET_PPP=1 会先拨 4G")
+    return 0
+
+
 def uninstall_net_systemd_unit():
     print_status("卸载 systemd 服务 bt-mic-net.service")
     run("systemctl disable bt-mic-net.service 2>/dev/null || true", check=False,
@@ -10330,6 +10655,19 @@ def uninstall_net_systemd_unit():
     if os.path.exists(NET_SERVICE_UNIT_PATH):
         os.remove(NET_SERVICE_UNIT_PATH)
     run("systemctl daemon-reload", check=False, verbose=False)
+    # 蓝牙模式的单元文件还在的话，顺手恢复它（两种模式互斥，退出网络模式
+    # 通常就是想回到蓝牙模式）
+    if os.path.exists(SERVICE_UNIT_PATH):
+        print("  -> 检测到蓝牙模式服务仍存在，恢复它（enable + start）")
+        run("systemctl enable bt-mic.service 2>/dev/null || true", check=False,
+            verbose=False)
+        run("systemctl start bt-mic.service 2>/dev/null || true", check=False,
+            verbose=False)
+        time.sleep(2)
+        st = run("systemctl is-active bt-mic.service", check=False, timeout=10,
+                 verbose=False)
+        print("     bt-mic.service: %s"
+              % (st.stdout.strip() if st else "?"))
     print("  -> 已卸载")
 
 
@@ -10390,6 +10728,10 @@ def main():
             sys.exit(2)
         sys.exit(net_4g_setup())
     ensure_root()
+    if "--switch" in sys.argv:
+        # 蓝牙模式与网络模式互斥（都要独占同一块声卡），一条命令切换
+        _RESTORED = True
+        sys.exit(switch_mode(_argv_value("--switch")))
     try:
         sys.stdout.reconfigure(line_buffering=True)
         sys.stderr.reconfigure(line_buffering=True)
