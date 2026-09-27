@@ -4,9 +4,11 @@ __pycache__/
 *.pcm
 *.wav
 btmic_selftest.txt
-build/
-dist/
-*.spec
+/build/
+/dist/
+/*.spec
+# 注意：上面几条只针对仓库根目录的构建产物；各模块自己的 dist/（如
+# view/radarpi/dist/*.deb 这种要发布的包）仍然入库，故用 /build/ /dist/ 精确限定
 
 # Python 虚拟环境（view/ 下有一个几百 MB 的 .venv）
 .venv/
