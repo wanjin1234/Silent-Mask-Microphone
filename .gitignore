@@ -21,3 +21,6 @@ microphone/windows/btmic_net_gui.json
 # 4G 模块的厂商资料：Luatools_v2.rar 有 133MB，超过 GitHub 单文件上限 100MB。
 # 需要请到合宙官方下载：https://docs.openluat.com/air780eg/
 microphone/4G File/
+
+# 自检脚本的临时产物
+microphone/tests/pi_st_*.txt

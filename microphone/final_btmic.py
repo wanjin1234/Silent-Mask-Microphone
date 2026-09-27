@@ -788,6 +788,7 @@ DOWNMIX_SCRIPT = Path("/tmp/df_downmix.py")
 GAIN_SCRIPT = Path("/tmp/bt_gain.py")
 DOWNLINK_METER_SCRIPT = Path("/tmp/bt_downlink_meter.py")
 DOWNLINK_MIX_SCRIPT = Path("/tmp/bt_downlink_mix.py")
+DOWNLINK_DUP_SCRIPT = Path("/tmp/bt_downlink_dup.py")  # 一个下行送多个播放设备时用
 UPLINK_MIX_SCRIPT = Path("/tmp/bt_uplink_mix.py")  # HEADPHONE_CAPTURE_RATE != 16k 时用
 GAIN_LEVEL_FILE = "/tmp/bt_gain_level"  # 0~15，15=满增益
 DENOISE_STATUS_FILE = "/tmp/bt_denoise_status"  # 当前降噪模式/实测 RTF（--status 可查）
@@ -2598,6 +2599,22 @@ def select_playback_device(mic_device=None):
         return None, "缺少 aplay（请安装 alsa-utils）"
     mic_card = _playback_card(mic_device) if mic_device else None
     if PLAYBACK_DEVICE:
+        # 配置里写了多个设备 = "这几个孔都送"（见 DOWNLINK_DUP_SCRIPT）：这是明确的
+        # 指令，不再拿"同卡时钟冲突"去否决它，只说一声要注意的地方
+        devices = split_playback_devices(PLAYBACK_DEVICE)
+        if devices:
+            if len(devices) > 1:
+                for dev in devices:
+                    ok, err = test_alsa_playback(dev)
+                    if not ok:
+                        print("  !! PLAYBACK_DEVICE 里的 %s 打不开：%s" % (dev, err))
+                same = [d for d in devices
+                        if mic_card is not None and _playback_card(d) == mic_card]
+                if same:
+                    print("  !! 注意：%s 与麦克风同一张声卡——同一路 USB 时钟既采又放"
+                          "会互相挤（放音 underrun/麦克风 overrun），镜像那一路容易断续"
+                          % "、".join(same))
+                return PLAYBACK_DEVICE, "配置的 PLAYBACK_DEVICE（多设备）"
         ok, err = test_alsa_playback(PLAYBACK_DEVICE)
         same_as_mic = (
             mic_card is not None and _playback_card(PLAYBACK_DEVICE) == mic_card
@@ -2786,9 +2803,46 @@ def amixer_set(card, ctl, value):
 
 
 def _playback_card(playback_device):
-    """从 plughw:C,D / hw:C,D 里取声卡号。"""
-    m = re.search(r"(?:plug)?hw:(\d+)", playback_device or "")
-    return m.group(1) if m else "0"
+    """从设备名里取声卡号（数字形式 hw:C,D 与名字形式 hw:CARD=xxx 都要认）。
+
+    名字形式很要紧：配置里推荐写 `plughw:CARD=Audio,DEV=0`（卡号每次开机会变，
+    名字不会），而"放音和麦克风是不是同一张卡"的判断全靠这个函数。以前只认数字，
+    名字形式一律返回 "0"，于是"配置把放音送到麦克风自己那张卡"这种最典型的
+    "耳机插着没声音"完全检测不出来（实测踩到：放音送到麦克风所在的 card2，
+    耳机插在 card3 上，一声没有）。
+    """
+    dev = playback_device or ""
+    m = re.search(r"(?:plug)?hw:(\d+)", dev)
+    if m:
+        return m.group(1)
+    m = re.search(r"CARD=([\w.-]+)", dev)
+    if m:
+        return card_index_by_id(m.group(1))
+    return "0"
+
+
+def card_index_by_id(card_id):
+    """按声卡 id（/proc/asound/cards 里的 `Audio` / `Audio_1`）查出卡号。
+
+    /proc/asound/<id> 是指向 cardN 的符号链接，读它最省事，也自动跟着卡号漂移。
+    """
+    link = "/proc/asound/%s" % card_id
+    try:
+        target = os.path.basename(os.path.realpath(link))
+    except OSError:
+        target = ""
+    if target.startswith("card") and target[4:].isdigit():
+        return target[4:]
+    # 退路：直接读 /proc/asound/cards 匹配 "[id ]"
+    try:
+        for line in Path("/proc/asound/cards").read_text(
+                encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]", line)
+            if m and m.group(2) == card_id:
+                return m.group(1)
+    except OSError:
+        pass
+    return "0"
 
 
 def list_mixer_control_names(card):
@@ -3661,6 +3715,225 @@ def write_downlink_meter_script(path, rate, channels):
         DOWNLINK_METER_SCRIPT_CONTENT.replace("__RATE__", str(rate))
         .replace("__CHANNELS__", str(channels))
         .replace("__HEARTBEAT__", repr(float(heartbeat)))
+    )
+
+
+# 下行"一送多"：同一路音频同时写到多个播放设备。
+#   PLAYBACK_DEVICE 可以写多个（逗号/空格分隔），第一个是**主设备**，由后面的
+#   aplay 直接消费（保持既有的背压与丢帧行为），其余的是**镜像**，各起一个 aplay。
+#   为什么需要它：这台机器上插着两张同名 USB 声卡（`Audio` / `Audio_1`）+ HAT 的
+#   3.5mm 孔，耳机插在哪个孔只有现场才知道（实测：插在 `Audio_1` 的孔上，而配置
+#   指向 `Audio` → 数据一路写进 card2、耳机里一声没有）。镜像之后插哪个孔都响。
+#   镜像之间时钟不同步（USB 声卡 ±100ppm 很常见），所以每个镜像各有一个有界队列，
+#   满了丢最旧的：宁可那一路偶尔跳一下，也不能反压住主设备、拖垮整条下行。
+DOWNLINK_DUP_SCRIPT_CONTENT = r"""
+import collections
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+CMDS = __CMDS__              # 镜像设备的 aplay 命令行（列表的列表）
+BUF_BYTES = __BUF_BYTES__    # 每个镜像的排队上限（字节，约 = 秒数 * 采样率 * 2）
+
+
+class Mirror:
+    def __init__(self, idx, cmd, buf_bytes):
+        self.idx = idx
+        self.cmd = cmd
+        self.buf = buf_bytes
+        self.q = collections.deque()
+        self.lock = threading.Lock()
+        self.nbytes = 0
+        self.dropped = 0
+        self.dead = False
+        self.total = 0
+
+        def _pdeathsig():
+            # 父进程（本脚本）被 SIGKILL 时内核直接把 aplay 也杀掉：否则一旦本进程
+            # 被强杀，镜像 aplay 会变成孤儿进程一直占着那张声卡，下一场会话就
+            # "Device or resource busy" 了（Windows 上不支持 preexec_fn，跳过）
+            if os.name != "posix":
+                return
+            try:
+                import ctypes
+                ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)
+            except Exception:
+                pass
+
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, bufsize=0,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                preexec_fn=_pdeathsig if os.name == "posix" else None,
+            )
+        except OSError as exc:
+            print("[dup] 镜像 %d 起不来（%s）：%s"
+                  % (idx, " ".join(cmd), exc), file=sys.stderr, flush=True)
+            self.dead = True
+            self.proc = None
+            return
+        print("[dup] 镜像 %d: %s" % (idx, " ".join(cmd)),
+              file=sys.stderr, flush=True)
+        # 镜像自己的报错也要进日志：aplay 打不开那张卡（被别的进程占了、设备没了）
+        # 只有它自己知道，不看这一行就会变成"镜像一声不响地没声音"
+        threading.Thread(target=self._drain, daemon=True).start()
+        threading.Thread(target=self._feed, daemon=True).start()
+
+    def _drain(self):
+        try:
+            for raw in iter(self.proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    print("[dup] 镜像 %d: %s" % (self.idx, line),
+                          file=sys.stderr, flush=True)
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def push(self, data):
+        # 入队。队列超过上限就丢最旧的——绝不能在这里阻塞：主设备那条路
+        # （本进程 stdout）才是节奏，镜像跟不上只能牺牲它自己。
+        if self.dead:
+            return
+        with self.lock:
+            self.q.append(data)
+            self.nbytes += len(data)
+            while self.nbytes > self.buf and len(self.q) > 1:
+                old = self.q.popleft()
+                self.nbytes -= len(old)
+                self.dropped += len(old)
+
+    def _feed(self):
+        # 严格**不阻塞**地往镜像写：设备慢/卡死（实测 HAT 的 3.5mm 孔会让 aplay
+        # 一直不消费）时，绝不能让这一路把整条下行拖住。所以写管道用的是
+        # 非阻塞 fd + 小块：写不进去就等一小会儿再试，实在写不进去就丢这一块。
+        # 早期版本用阻塞写 + 关闭时从别的线程关 stdin，会直接卡死（自检脚本
+        # test_dup.py 里"镜像启动慢 1.5 秒"那条用例逮到的就是这个）。
+        fd = self.proc.stdin.fileno() if self.proc.stdin else None
+        if fd is None:
+            return
+        try:
+            os.set_blocking(fd, False)
+        except (OSError, ValueError):
+            pass
+        stuck_since = None
+        while True:
+            with self.lock:
+                data = self.q.popleft() if self.q else None
+                if data is None:
+                    self.nbytes = 0
+            if data is None:
+                if self.dead:
+                    break
+                time.sleep(0.005)
+                continue
+            try:
+                os.write(fd, data)
+                self.total += len(data)
+                stuck_since = None
+            except BlockingIOError:
+                # 管道满了：放回队头，等设备吃一点再写；队列自己的上限会丢最旧的
+                with self.lock:
+                    self.q.appendleft(data)
+                    self.nbytes += len(data)
+                if stuck_since is None:
+                    stuck_since = time.time()
+                elif time.time() - stuck_since > 3.0:
+                    # 3 秒都吃不下一块（≈85ms 音频）：这一路基本是卡死了，
+                    # 别再攒了，只保留最新的、把老的丢掉
+                    with self.lock:
+                        while len(self.q) > 1:
+                            old = self.q.popleft()
+                            self.nbytes -= len(old)
+                            self.dropped += len(old)
+                    stuck_since = time.time()
+                time.sleep(0.005)
+            except (BrokenPipeError, OSError) as exc:
+                print("[dup] 镜像 %d 写失败（%s）：这一路不再送"
+                      % (self.idx, exc), file=sys.stderr, flush=True)
+                self.dead = True
+                break
+
+    def close(self):
+        # 先让队列里剩的送完（最多等 0.5 秒）：设备正常时不该在收尾时砍掉尾巴
+        deadline = time.time() + 0.5
+        while time.time() < deadline:
+            with self.lock:
+                if self.nbytes <= 0:
+                    break
+            time.sleep(0.01)
+        self.dead = True
+        if self.proc is None:
+            return
+        time.sleep(0.02)      # 让 _feed 自己看到 dead 退出（它每 5ms 查一次）
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+    def report(self):
+        if self.proc is None:
+            return ""
+        note = "，丢 %d 字节" % self.dropped if self.dropped else ""
+        return "镜像 %d 送出 %d 字节%s" % (self.idx, self.total, note)
+
+
+def main():
+    mirrors = [Mirror(i + 1, cmd, BUF_BYTES) for i, cmd in enumerate(CMDS)]
+
+    def _stop(_sig, _frm):
+        for m in mirrors:
+            m.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    total = 0
+    try:
+        while True:
+            try:
+                data = stdin.read1(8192)
+            except (AttributeError, OSError):
+                data = stdin.read(8192)
+            if not data:
+                break
+            stdout.write(data)         # 主设备：保持既有背压
+            stdout.flush()
+            total += len(data)
+            for m in mirrors:
+                m.push(data)
+    except (BrokenPipeError, OSError):
+        pass
+    for m in mirrors:
+        m.close()
+    notes = [m.report() for m in mirrors]
+    print("[dup] 下行转发结束：主设备 %d 字节；%s"
+          % (total, "；".join(n for n in notes if n)),
+          file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def write_downlink_dup_script(path, cmds, buf_seconds=0.5):
+    """写出下行"一送多"脚本（cmds 是镜像设备的 aplay 命令行列表）。"""
+    path.write_text(
+        DOWNLINK_DUP_SCRIPT_CONTENT.replace("__CMDS__", repr(list(cmds)))
+        .replace("__BUF_BYTES__", str(int(max(0.1, buf_seconds) * 96000)))
     )
 
 
@@ -9377,6 +9650,28 @@ def build_net_uplink_pipeline(settings, mic_device, venv_python, mode, mic_chann
 # ---------------- 网络模式的下行（Windows → 耳机口） ----------------
 
 
+def split_playback_devices(value):
+    """把 PLAYBACK_DEVICE 拆成设备列表（可写多个，逗号/分号/空格分隔）。
+
+    第一个是主设备，其余是镜像（同一路音频同时送过去，见 DOWNLINK_DUP_SCRIPT）。
+    注意 ALSA 的名字里本来就有逗号（`plughw:2,0`、`plughw:CARD=Audio,DEV=0`），
+    所以纯数字或 `KEY=值` 的片段要粘回上一个设备名，不能当成新设备。
+    """
+    out = []
+    for part in re.split(r"[,\s;]+", (value or "").strip()):
+        if not part:
+            continue
+        if out and re.fullmatch(r"\d+|[A-Za-z_]+=[^=]*", part):
+            out[-1] = out[-1] + "," + part
+        else:
+            out.append(part)
+    uniq = []
+    for dev in out:
+        if dev not in uniq:
+            uniq.append(dev)
+    return uniq
+
+
 def build_net_downlink_player(settings, playback_device, mic_device, venv_python):
     """下行：net-recv（网络收）→ [重采样] → 电平表 → aplay（耳机口）。
 
@@ -9386,13 +9681,16 @@ def build_net_downlink_player(settings, playback_device, mic_device, venv_python
     rate = settings["down_rate"]
     channels = settings["down_channels"]
     out_rate, out_channels = rate, channels
+    devices = split_playback_devices(playback_device)
+    primary = devices[0] if devices else ""
+    mirrors = devices[1:]
     # 设备原生速率：低速率（8k/12k/16k）直接交给 ALSA 的 plug 层，在这类廉价 USB
     # 声卡上会"消费慢于实时"——实测 plughw:2,0（KT USB 声卡）播 8000Hz 时 10 秒的
     # 数据要 12.5 秒才播完（16000Hz 要 11.3 秒，48000Hz 才 10.26 秒）。后果是下行
     # 抖动缓冲堆满、丢 70%+ 的帧，听感断续发闷。所以先在树莓派这边重采样到设备原生
     # 速率（默认 48000，NET_HP_RATE 可改），再让 aplay 按原生速率播。
     native_rate = settings.get("hp_rate") or NET_HP_RATE
-    if playback_device and mic_device and same_sound_card(playback_device, mic_device):
+    if primary and mic_device and same_sound_card(primary, mic_device):
         # 麦克风与耳机口同一张声卡：收发共用一路 I2S 时钟，只能同一个采样率
         # （沿用蓝牙模式那条实测结论）。下行按采集采样率重采样过去。
         if rate != MIC_CAPTURE_RATE or channels != 1:
@@ -9426,20 +9724,33 @@ def build_net_downlink_player(settings, playback_device, mic_device, venv_python
         stages.append(("hp-meter", [venv_python, str(DOWNLINK_METER_SCRIPT)]))
     except OSError:
         pass
-    stages.append(
-        (
-            "hp-play",
-            [
-                "aplay", "-t", "raw", "-D", playback_device, "-f", FORMAT,
-                "-r", str(out_rate), "-c", str(out_channels),
-                "--period-time", str(HP_PERIOD_TIME_US),
-                "--buffer-time", str(HP_BUFFER_TIME_US),
-            ],
-        )
-    )
+
+    def _aplay_cmd(dev, buffer_us=HP_BUFFER_TIME_US):
+        return [
+            "aplay", "-t", "raw", "-D", dev, "-f", FORMAT,
+            "-r", str(out_rate), "-c", str(out_channels),
+            "--period-time", str(HP_PERIOD_TIME_US),
+            "--buffer-time", str(buffer_us),
+        ]
+
+    if mirrors:
+        # 一送多：主设备还是最后一环的 aplay（保持既有背压），镜像由 dup 阶段另起
+        # aplay 喂；镜像的 ALSA 缓冲给大一倍，让它自己先吸收时钟差
+        try:
+            write_downlink_dup_script(
+                DOWNLINK_DUP_SCRIPT,
+                [_aplay_cmd(dev, HP_BUFFER_TIME_US * 2) for dev in mirrors],
+            )
+            stages.append(("hp-dup", [venv_python, str(DOWNLINK_DUP_SCRIPT)]))
+            print("  -> 下行同时送 %d 个播放设备：主 %s，镜像 %s"
+                  % (len(devices), primary, "、".join(mirrors)))
+        except OSError as exc:
+            print("  !! 无法写出下行一分多脚本（%s）：只送主设备 %s" % (exc, primary))
+    stages.append(("hp-play", _aplay_cmd(primary)))
     return {
         "rate": rate, "channels": channels,
         "out_rate": out_rate, "out_channels": out_channels,
+        "devices": devices,
         "stages": stages,
     }
 
@@ -9604,10 +9915,11 @@ def run_net_session(settings, venv_python, mode, mic_device, mic_channels,
             # 耳机口混音看门狗（声卡驱动会在开采集流时把音量复位）
             if playback_device and time.time() - last_mixer_check >= HP_MIXER_CHECK_SECS:
                 last_mixer_check = time.time()
-                drift = hp_mixer_drift(playback_device)
-                if drift:
-                    print("  !! 耳机口混音被改回默认（%s），重新设置" % drift)
-                    apply_playback_mixer(playback_device)
+                for dev in split_playback_devices(playback_device):
+                    drift = hp_mixer_drift(dev)
+                    if drift:
+                        print("  !! 耳机口混音被改回默认（%s：%s），重新设置" % (dev, drift))
+                        apply_playback_mixer(dev)
             # 心跳：每 15 秒把两条网络通路的关键计数打到日志里。没有这个心跳时
             # "链路在动但没声音"和"链路卡死了"在日志里长得一模一样（蓝牙那一轮
             # 排查就卡在这里），所以网络模式沿用同一套做法
@@ -9683,13 +9995,25 @@ def run_net_mode():
         print_status("探测耳机（扬声器）输出设备")
         playback_device, why = select_playback_device(mic_device)
         if playback_device:
+            devices = split_playback_devices(playback_device)
             print(f"  -> 耳机口播放设备: {playback_device}（{why}）")
-            print_playback_choices(playback_device, mic_device)
-            apply_playback_mixer(playback_device,
-                                 cross_route=same_sound_card(playback_device, mic_device))
-            _NOTIFY_DEVICE[0] = playback_device
-            if PLAYBACK_VOLUME_MAX and not same_sound_card(playback_device, mic_device):
-                maximize_playback_volume(mic_device)
+            if len(devices) > 1:
+                print("     共 %d 个（第一个是主设备，其余镜像）：%s"
+                      % (len(devices), "、".join(devices)))
+                print("     为什么要多个：这台机器上有两张同名 USB 声卡 + HAT 的 3.5mm 孔，"
+                      "耳机插在哪个孔只有现场知道；\n"
+                      "     镜像之后插哪个孔都能听见（只留一个就写单个设备名，比如 "
+                      "PLAYBACK_DEVICE=plughw:CARD=Audio_1,DEV=0）")
+            print_playback_choices(devices[0], mic_device)
+            for dev in devices:
+                # 混音逐张卡设置：音量/开关归位（驱动默认音量小、名字没预置都要覆盖）
+                apply_playback_mixer(dev, cross_route=same_sound_card(dev, mic_device))
+            _NOTIFY_DEVICE[0] = devices[0]
+            if PLAYBACK_VOLUME_MAX:
+                for dev in devices:
+                    if not same_sound_card(dev, mic_device):
+                        maximize_playback_volume(mic_device)
+                        break
         else:
             print(f"  !! 未找到可用的播放设备（{why}）：只能上行（麦克风→电脑）")
     else:

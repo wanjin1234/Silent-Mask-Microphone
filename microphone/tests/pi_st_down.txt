@@ -1,0 +1,12 @@
+updated=2026-09-27 15:18:05
+state=playing
+via=127.0.0.1（网卡名未识别）
+transport=tcp
+peer=127.0.0.1
+audio=48000 Hz 2 ch 40ms（7680 字节/帧）
+recv_frames=285
+played_frames=285
+dropped_frames=0
+starved_frames=1
+jbuf_ms=40
+level_db=-66.8
