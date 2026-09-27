@@ -24,3 +24,8 @@ microphone/4G File/
 
 # 自检脚本的临时产物
 microphone/tests/pi_st_*.txt
+
+# PyInstaller 中间产物（exe 本身要提交，build/dist 不要）
+microphone/windows/build/
+microphone/windows/dist/
+microphone/windows/*.spec

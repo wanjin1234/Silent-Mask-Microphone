@@ -857,18 +857,39 @@ class AudioIO:
 
     @staticmethod
     def resample(x, src_rate, dst_rate, np):
-        """线性插值重采样（仅在设备拒绝目标采样率时的兜底路径上用）。"""
+        """重采样（仅在设备拒绝目标采样率时的兜底路径上用）。
+
+        降采样（比如下行的 48kHz → 8kHz）**必须先抗混叠低通**：线性插值直接
+        抽点会把超过目标奈奎斯特的内容折回可听频段，听感是沙哑/刺啦的失真。
+        这里用窗函数 sinc 低通（单边 32 抽头）+ 线性插值，块内足够干净。
+        上采样时线性插值本身够用，保持原来的轻量做法。
+        """
         if src_rate == dst_rate:
             return x
         n_in, ch = x.shape
         n_out = int(round(n_in * dst_rate / float(src_rate)))
         if n_out <= 1:
             return x[:1]
+        y = x
+        if dst_rate < src_rate and n_in > 8:
+            taps = 256                     # 单边 128：过渡带够窄，才有足够的
+                                           # 阻带衰减压住混叠（64 抽头实测只剩
+                                           # 约 -10dB，5kHz 折回 3kHz 还是听得见）
+            fc = 0.42 * dst_rate / float(src_rate)
+            n = np.arange(taps) - (taps - 1) / 2.0
+            h = (2 * fc * np.sinc(2 * fc * n) * np.hamming(taps)).astype("float32")
+            h /= h.sum()
+            pad = taps // 2
+            padded = np.concatenate([np.repeat(x[:1], pad, axis=0), x,
+                                     np.repeat(x[-1:], pad, axis=0)])
+            y = np.empty_like(x)
+            for c in range(ch):
+                y[:, c] = np.convolve(padded[:, c], h, mode="valid")[:n_in]
         idx = np.linspace(0, n_in - 1, n_out)
         i0 = np.floor(idx).astype(np.int64)
         i1 = np.clip(i0 + 1, 0, n_in - 1)
         frac = (idx - i0)[:, None]
-        return (x[i0] * (1 - frac) + x[i1] * frac).astype("float32")
+        return (y[i0] * (1 - frac) + y[i1] * frac).astype("float32")
 
 
 class Player:
@@ -1213,10 +1234,20 @@ class NetServer:
         # 回一条 welcome：TCP 下是握手的应答，MQTT 下让树莓派不用干等下一次心跳
         link.send_ctrl({"t": "welcome", "ok": True, "name": "windows",
                         "ch": link.channel, "peer": "windows"})
-        # 树莓派上线/换了格式：把当前滑块值推过去（麦克风增益），并重起播放
+        # 树莓派上线/换了格式：把当前滑块值推过去（麦克风增益），并重起播放/采集
         if link.channel == "up":
             if self.player is None or changed:
                 self._start_player(link)
+        elif link.channel == "down":
+            # 下行（电脑声音 → 树莓派）必须**等 hello 里的格式到了**再起采集：
+            # 树莓派要拿这些数据在它的声卡上放出来，采样率/声道/帧长都以它宣布的
+            # 为准。以前没有这一支，采集线程由 _supervise_loop 按 peer_online()
+            # 起，而"对端在线"会被树莓派的控制帧（pong）提前点亮——hello 还没到
+            # 就开采集，于是用界面里那套（比如 16kHz）发过去，树莓派按 8kHz 播：
+            # **半速 + 低八度**（听感"失真、非常低沉"），数据量还翻倍、抖动缓冲
+            # 丢一半的帧。2026-09-27 实测定位到这一处。
+            if self.recorder is None or changed:
+                self._start_recorder(link)
         self.send_gain(self.get_conf().get("remote_gain", 15))
 
     # ---- 音频引擎管理 ----
@@ -1226,15 +1257,25 @@ class NetServer:
         while not self.stop.is_set():
             up = self.links.get("up")
             down = self.links.get("down")
-            # 上行：树莓派在线 → 起播放线程
-            if up is not None and up.peer_online() and self.player is None:
+            # 上行：树莓派在线（且已经宣布了格式）→ 起播放线程
+            if (up is not None and up.fmt.get("rate") and up.peer_online()
+                    and self.player is None):
                 self._start_player(up)
             if self.player is not None and (up is None or not up.peer_online()):
                 self._stop_player()
-            # 下行：树莓派在线 → 起采集线程，把电脑声音发过去
-            if down is not None and down.peer_online() and self.recorder is None:
+            # 下行：树莓派在线**并且宣布了格式**→ 起采集线程，把电脑声音发过去。
+            # 注意这里必须等 fmt：没有格式时起的采集会用界面上的设置值，与树莓派
+            # 的实际播放格式不一致（变调/半速，见 _on_hello 里的说明）。
+            if (down is not None and down.fmt.get("rate") and down.peer_online()
+                    and self.recorder is None):
                 self._start_recorder(down)
-            if self.recorder is not None and (down is None or not down.peer_online()):
+            want_rate = int(down.fmt.get("rate") or 0) if down is not None else 0
+            want_ch = int(down.fmt.get("channels") or 1) if down is not None else 0
+            if self.recorder is not None and (
+                    down is None or not down.peer_online()
+                    or not want_rate
+                    or (self.recorder.wire_rate, self.recorder.wire_channels)
+                    != (want_rate, want_ch)):
                 self._stop_recorder()
             # 控制帧：取出 hello 之类的通知（ping/pong 的往返在 push_ctrl 里算）
             for ch, link in list(self.links.items()):
