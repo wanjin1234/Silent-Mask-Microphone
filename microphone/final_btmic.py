@@ -9861,7 +9861,8 @@ def run_net_session(settings, venv_python, mode, mic_device, mic_channels,
                                  settings["frame_ms"]),
         down="%d Hz %d ch" % (settings["down_rate"], settings["down_channels"]),
     )
-    last_mixer_check = time.time()
+    last_mixer_check = 0.0   # 0 = 会话第一轮就查一次（蓝牙脚本刚把音量写成 0 时，
+                             # 别让用户先听 15 秒的"没声音"再等看门狗救回来）
     last_note = time.time()
     offline_since = None      # 与电脑断开多久了（两路子进程都在重连即算断开）
     try:
