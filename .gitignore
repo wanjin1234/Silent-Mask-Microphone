@@ -8,9 +8,14 @@ build/
 dist/
 *.spec
 
-# 本机界面设置（含设备名，运行后自动生成）
-windows/btmic_net_gui.json
+# Python 虚拟环境（view/ 下有一个几百 MB 的 .venv）
+.venv/
+venv/
+env/
 
-# 4G 模块的厂商资料（Luatools 139MB、固件包等，GitHub 单文件上限 100MB）。
-# 需要的话请到合宙官方下载：https://docs.openluat.com/air780eg/
-4G File/
+# 本机界面设置（含设备名，运行后自动生成）
+microphone/windows/btmic_net_gui.json
+
+# 4G 模块的厂商资料：Luatools_v2.rar 有 133MB，超过 GitHub 单文件上限 100MB。
+# 需要请到合宙官方下载：https://docs.openluat.com/air780eg/
+microphone/4G File/

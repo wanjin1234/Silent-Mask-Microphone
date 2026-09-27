@@ -1,0 +1,325 @@
+import time
+import pygame
+import os
+import json
+import threading
+from simulated_sensors import SimulatedSensorHub
+# UPS HAT (E) 电池监测（可选：无 smbus / 非树莓派时自动禁用）
+try:
+    import ups_battery
+except Exception:
+    ups_battery = None
+# try to use real C4002 driver if available; set RADAR_PORTS env var to comma-separated ports (e.g. /dev/ttyUSB0,/dev/ttyUSB1,/dev/ttyUSB2)
+try:
+    from c4002_parser import RealSensorHub
+    ports_env = os.getenv('RADAR_PORTS')
+    # RADAR_ANGLES：显式指定每个端口对应的角度（逗号分隔），顺序与 RADAR_PORTS 一致。
+    # 例如 RADAR_PORTS=/dev/serial/by-path/p1,/dev/serial/by-path/p2,/dev/serial/by-path/p3
+    #     RADAR_ANGLES=-45,0,45
+    angles_env = os.getenv('RADAR_ANGLES')
+    angles = None
+    if angles_env:
+        try:
+            angles = [float(a.strip()) for a in angles_env.split(',') if a.strip()]
+        except Exception:
+            angles = None
+    if ports_env:
+        ports = [p.strip() for p in ports_env.split(',') if p.strip()]
+        sensor_hub = RealSensorHub(ports=ports, angles=angles)
+    else:
+        # default to common USB ports for 3 sensors if running on Linux/embedded (user confirmed /dev/ttyUSB0-2)
+        try:
+            if os.name != 'nt':
+                fallback_ports = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2']
+                sensor_hub = RealSensorHub(ports=fallback_ports, angles=angles)
+            else:
+                sensor_hub = SimulatedSensorHub()
+        except Exception:
+            sensor_hub = SimulatedSensorHub()
+except Exception:
+    sensor_hub = SimulatedSensorHub()
+from data_fusion import DataFusion
+from stereo_ar_display import StereoARDisplay
+try:
+    from gpio_button import GpioButton
+except Exception:
+    GpioButton = None
+
+# 人体静止扫描参数（均可通过环境变量覆盖）
+# 扫描时长：只检测移动的人（挥手/走动）。雷达上报约 1Hz，3s 能采到约 3 帧，
+# 覆盖一个挥手周期，降低峰值恰好落在采样折返点上的漏检概率。
+SCAN_DURATION = float(os.getenv('C4002_SCAN_DURATION', '3.0'))       # 扫描时长 s
+SCAN_MOTION_MIN = int(os.getenv('C4002_SCAN_MOTION_MIN', '1'))       # 判「有人」所需运动命中帧数（1=任一帧达标即判）
+
+
+def _robust_distance(dists):
+    """IQR 离群剔除后取中位数，作为一次扫描的单点距离估计。
+
+    场景：静止扫描约 2 秒，读入一二十帧距离，大部分接近真值、少量因多径跳变。
+    中位数绝对稳健、IQR 自动适应数据分布，无需人工设阈值，专治"大部分准、少量离群"。
+    """
+    if not dists:
+        return 0.0
+    sd = sorted(dists)
+    n = len(sd)
+
+    def quantile(p):
+        idx = p * (n - 1)
+        lo = int(idx)
+        hi = min(lo + 1, n - 1)
+        frac = idx - lo
+        return sd[lo] * (1.0 - frac) + sd[hi] * frac
+
+    q1 = quantile(0.25)
+    q3 = quantile(0.75)
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    kept = [d for d in sd if lo <= d <= hi]
+    if not kept:            # 极端情况全部被剔除，退回原始样本
+        kept = sd
+    return kept[len(kept) // 2]
+
+def _save_and_shutdown(battery_status, state, battery=None):
+    """低电压时保存运行状态到磁盘，随后切断 UPS 输出并关机（UPS HAT (E)）。"""
+    try:
+        save_dir = os.getenv('UPS_SAVE_DIR', 'logs')
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, 'last_state.json')
+        payload = {
+            'event': 'low_voltage_shutdown',
+            'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'battery': battery_status,
+            'scan_results': state.get('scan_results', []),
+        }
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        print(f'[UPS] 已保存运行状态到 {path}')
+    except Exception as e:
+        print(f'[UPS] 保存运行状态失败：{e}')
+    # 把缓冲数据刷到磁盘
+    try:
+        os.sync()
+    except Exception:
+        pass
+    print('[UPS] 电量过低，正在关机…')
+    # UPS HAT (E)：写 0x55 切断输出，保护电池不再过放（数据已 sync 落盘）。
+    if battery is not None:
+        try:
+            battery.power_off()
+            print('[UPS] 已发送 UPS 断电指令')
+        except Exception as e:
+            print(f'[UPS] UPS 断电指令失败：{e}')
+    # 兜底：正常系统关机（断电指令失败时）
+    if ups_battery is not None:
+        ups_battery.shutdown_system()
+
+def sensor_worker(lock, state, scan_trigger, stop_event):
+    """后台采集线程：串口/超声波读取、扫描证据聚合、融合均在此执行。
+
+    超声波 measure() 每次最多阻塞 50~80ms、三路串行可达 150ms+，若放在渲染
+    主循环会导致帧率骤降、扫描弧动画"跳格"。移入独立线程后，渲染主循环只做
+    读取共享状态 + 绘制，稳定跑满 60fps。
+    """
+    fusion = DataFusion()
+    SENSOR_HZ = float(os.getenv('C4002_SENSOR_HZ', '20'))
+    SENSOR_INTERVAL = 1.0 / SENSOR_HZ
+
+    scan_active = False
+    scan_start = 0.0
+    scan_stats = {}
+    scan_results = []
+
+    last_t = 0.0
+    while not stop_event.is_set():
+        # 处理扫描触发请求（来自主线程 SPACE / GPIO 按钮）
+        if scan_trigger.is_set():
+            scan_trigger.clear()
+            for r in sensor_hub.radars:
+                if hasattr(r, 'reset_detection'):
+                    r.reset_detection()
+            scan_active = True
+            scan_start = time.time()
+            scan_stats = {}
+            scan_results = []
+
+        now = time.time()
+        if now - last_t < SENSOR_INTERVAL:
+            time.sleep(0.001)
+            continue
+        last_t = now
+
+        # 获取雷达与超声波数据
+        if scan_active:
+            radar_data = [r.read_data() for r in sensor_hub.radars]
+        else:
+            radar_data = []
+        ultrasonic_data = [u.read_data() for u in sensor_hub.ultrasonics]
+
+        # 扫描期间逐雷达累计证据：运动证据（单帧）+ 呼吸周期检测器（窗口级物理判定），
+        # 并收集有效距离。呼吸不再依赖雷达固件学习出的 presence/target_status 字段。
+        if scan_active:
+            for d in radar_data:
+                if not d:
+                    continue
+                ang = d.get('angle')
+                if ang is None:
+                    # 无效帧（未接雷达/读不到帧）没有 angle 键，跳过
+                    continue
+                st = scan_stats.setdefault(ang, {'motion': 0, 'dists': []})
+                # 运动检测独立于 valid（距离）——挥手时速度有值但距离字段偶发为 0，
+                # 若用 valid 门控整帧会漏掉挥手。motion 只依赖 move_speed 物理量。
+                if d.get('motion') == 1:
+                    st['motion'] += 1
+                dist = d.get('distance')
+                if d.get('valid') and dist and dist > 0:
+                    st['dists'].append(dist)
+
+            if time.time() - scan_start >= SCAN_DURATION:
+                scan_active = False
+                # 每个雷达输出一个固定结果：运动证据命中帧数达标即判"有人"
+                for ang in sorted(scan_stats.keys()):
+                    st = scan_stats[ang]
+                    detected = st['motion'] >= SCAN_MOTION_MIN
+                    scan_results.append({
+                        'angle': ang,
+                        'detected': detected,
+                        'distance': _robust_distance(st['dists']),
+                    })
+
+        # 融合：返回障碍物（人体检测已改为手动扫描 + 固定显示，不再走实时融合）
+        obstacles_raw, _ = fusion.fuse_measurements(radar_data, ultrasonic_data)
+        # 时间滤波：仅障碍物
+        obstacles, _ = fusion.temporal_filter(obstacles_raw, [])
+
+        # 发布共享状态（供渲染主循环非阻塞读取）
+        with lock:
+            state['obstacles'] = obstacles
+            state['scan_results'] = list(scan_results)
+            state['scan_active'] = scan_active
+            state['scan_start_time'] = scan_start
+
+
+def main():
+    # reuse sensor_hub created at module import time (RealSensorHub or SimulatedSensorHub)
+    display = StereoARDisplay(1920, 1080)
+
+    running = True
+    clock = pygame.time.Clock()
+
+    # 共享状态 + 后台采集线程
+    lock = threading.Lock()
+    state = {
+        'obstacles': [],
+        'scan_results': [],
+        'scan_active': False,
+        'scan_start_time': 0.0,
+    }
+    scan_trigger = threading.Event()
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=sensor_worker, args=(lock, state, scan_trigger, stop_event), daemon=True)
+    worker.start()
+
+    # FPS 统计：每 0.5s 更新一次实测帧率，并绘制到画面左上角（设 C4002_SHOW_FPS=0 关闭）
+    show_fps = os.getenv('C4002_SHOW_FPS', '1') != '0'
+    fps_frames = 0
+    fps_t0 = time.time()
+    fps_current = 0.0
+
+    # 空闲 GPIO 按钮：按一次触发一次人体存在扫描
+    button = None
+    if GpioButton is not None:
+        try:
+            candidate = GpioButton(gpio=os.getenv('BUTTON_GPIO'))
+            if candidate.enabled:
+                button = candidate
+        except Exception:
+            button = None
+
+    # UPS HAT (E) 电池监测（I2C 0x2D）。无硬件/Windows 下自动禁用。
+    battery = ups_battery.UpsBattery() if ups_battery is not None else None
+    batt_status = None
+    last_batt_t = 0.0
+    low_voltage_streak = 0
+    shutdown_done = False
+    # 关机触发：电量百分比（BQ4050 直接给出，最可靠）；UPS_SHUTDOWN_VOLTAGE>0 时也叠加电压判定
+    shutdown_percent = float(os.getenv('UPS_SHUTDOWN_PERCENT', '10'))
+    shutdown_voltage = float(os.getenv('UPS_SHUTDOWN_VOLTAGE', '0'))
+    shutdown_consecutive = int(os.getenv('UPS_SHUTDOWN_CONSECUTIVE', '3'))
+    shutdown_enabled = os.getenv('UPS_SHUTDOWN_ENABLED', '1') != '0'
+
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_v:
+                    display.view_mode = "top" if display.view_mode == "stereo" else "stereo"
+                elif event.key == pygame.K_SPACE:
+                    scan_trigger.set()
+
+        # GPIO 按钮触发扫描
+        if button is not None and button.poll():
+            scan_trigger.set()
+
+        # 读取最新共享状态（非阻塞）
+        with lock:
+            obstacles = state['obstacles']
+            scan_results = state['scan_results']
+            scan_active = state['scan_active']
+            scan_start_time = state['scan_start_time']
+
+        # 把扫描进行状态/起始时间传给显示层（触发扫描推进弧动画）
+        display.set_scan_active(scan_active, scan_start_time if scan_active else None)
+        display.set_scan_results(scan_results)
+
+        # UPS 电池轮询（约每秒一次）+ 低电压自动保存并关机
+        if battery is not None:
+            now_b = time.time()
+            if now_b - last_batt_t >= battery.poll_seconds:
+                last_batt_t = now_b
+                st = battery.read()
+                if st is not None:
+                    batt_status = st
+                    percent_low = st['percent'] <= shutdown_percent
+                    voltage_low = shutdown_voltage > 0 and st['voltage'] <= shutdown_voltage
+                    trigger = (shutdown_enabled and battery.real
+                               and (percent_low or voltage_low))
+                    low_voltage_streak = low_voltage_streak + 1 if trigger else 0
+                    if low_voltage_streak >= shutdown_consecutive and not shutdown_done:
+                        shutdown_done = True
+                        _save_and_shutdown(st, state, battery)
+                        running = False
+                        break
+                else:
+                    low_voltage_streak = 0
+            display.set_battery(batt_status)
+
+        # FPS 统计：每 0.5s 重新计算一次实测帧率
+        if show_fps:
+            fps_frames += 1
+            now_f = time.time()
+            if now_f - fps_t0 >= 0.5:
+                fps_current = fps_frames / (now_f - fps_t0)
+                fps_frames = 0
+                fps_t0 = now_f
+
+        # 显示：障碍物 + 固定扫描人体图标（fps 叠加到画面左上角）
+        display.draw_obstacles(obstacles, fps_current if show_fps else None)
+
+        clock.tick(30)
+
+    stop_event.set()
+    # 等待后台采集线程退出：雷达/超声波一次测距最多阻塞几十~上百毫秒，
+    # 留足时间确保线程在解释器退出前结束，避免守护线程在 shutdown 阶段
+    # 还持有 stderr 缓冲锁导致 "could not acquire lock for stderr" 致命错误。
+    worker.join(timeout=5.0)
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()

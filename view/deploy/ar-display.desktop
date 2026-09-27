@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Silent Mask AR Display
+Comment=Wearable human-detection AR display (autostart)
+Exec=/home/wanghy25/arDisplay/run.sh
+Path=/home/wanghy25/arDisplay
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>radarpi · 4D 成像雷达上位机</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="toolbar">
+  <div class="brand">radarpi<span class="sub">4D 成像毫米波雷达</span></div>
+
+  <div class="group">
+    <span id="link-dot" class="dot"></span>
+    <span id="link-text">连接中…</span>
+    <span id="device-text" class="muted"></span>
+  </div>
+
+  <div class="group">
+    <button id="btn-start" class="primary">开始 scan start</button>
+    <button id="btn-stop">停止 scan stop</button>
+  </div>
+
+  <div class="group">
+    <label>显示</label>
+    <select id="view-select">
+      <option value="all">全部点</option>
+      <option value="dynamic">仅动态点</option>
+      <option value="micro">仅微动点</option>
+      <option value="tracks">仅航迹</option>
+    </select>
+    <button id="btn-clear" title="清空当前画面">清除</button>
+    <button id="btn-pause" title="暂停刷新（数据仍在后台接收）">暂停</button>
+  </div>
+
+  <div class="group">
+    <button id="btn-record">开始录制</button>
+    <span id="record-text" class="muted"></span>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="group">
+    <button id="btn-config">设置</button>
+    <a class="btn-link" href="/api/status" target="_blank" rel="noopener">状态 JSON</a>
+    <span id="clock" class="muted"></span>
+  </div>
+</header>
+
+<main>
+  <section id="views">
+    <div class="panel big">
+      <div class="panel-title">3D 点云（拖动旋转 / 滚轮缩放）<span id="gl-hint" class="muted"></span></div>
+      <canvas id="cv-3d"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">XY 俯视图（m）</div>
+      <canvas id="cv-xy"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">XZ 侧视图（m）</div>
+      <canvas id="cv-xz"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">YZ 正视图（m）</div>
+      <canvas id="cv-yz"></canvas>
+    </div>
+  </section>
+
+  <aside id="side">
+    <div class="panel stats">
+      <div class="panel-title">实时统计</div>
+      <table class="kv">
+        <tr><td>帧号</td><td id="st-frame">-</td><td>帧率</td><td id="st-fps">-</td></tr>
+        <tr><td>本帧点数</td><td id="st-points">-</td><td>数据率</td><td id="st-rate">-</td></tr>
+        <tr><td>帧周期</td><td id="st-period">-</td><td>帧间隔</td><td id="st-interval">-</td></tr>
+        <tr><td>BB 处理</td><td id="st-bb">-</td><td>Post-BB</td><td id="st-postbb">-</td></tr>
+        <tr><td>结果传输</td><td id="st-transfer">-</td><td>网页客户端</td><td id="st-clients">-</td></tr>
+      </table>
+      <table class="kv groups" id="group-counts"></table>
+      <div id="parse-warn" class="warn hidden"></div>
+    </div>
+
+    <div class="panel table-panel">
+      <div class="panel-title">点表
+        <label class="muted small"><input type="checkbox" id="tbl-follow" checked> 跟随最新帧</label>
+      </div>
+      <div class="table-wrap">
+        <table class="points">
+          <thead><tr><th>#</th><th>X(m)</th><th>Y(m)</th><th>Z(m)</th><th>速度(m/s)</th><th>SNR</th><th>类别</th></tr></thead>
+          <tbody id="point-body"></tbody>
+        </table>
+      </div>
+      <div class="muted small" id="table-note"></div>
+    </div>
+  </aside>
+</main>
+
+<footer id="statusbar">
+  <span id="sb-source">数据源：-</span>
+  <span id="sb-parse">解析：-</span>
+  <span id="sb-last">最近一帧：-</span>
+  <span id="sb-msg"></span>
+</footer>
+
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <strong>设置</strong>
+    <button id="drawer-close">关闭</button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-section">
+      <h4>雷达指令（对应手册「高级功能配置」）</h4>
+      <div id="cmd-list"></div>
+    </div>
+    <div class="drawer-section">
+      <h4>配置文件（<span id="conf-path" class="muted"></span>）</h4>
+      <div id="conf-list"></div>
+      <button id="conf-save" class="primary">保存到配置文件</button>
+      <div class="muted small">修改串口/端口等条目需要重启 radarpi 服务才生效。</div>
+    </div>
+    <div class="drawer-section">
+      <h4>自定义指令</h4>
+      <input id="raw-cmd" placeholder="例如 set radar_height 1.7">
+      <button id="raw-send">发送</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# thermal_ai 依赖
+#
+# 开发机（x86 Windows/Linux/macOS）：numpy + tensorflow 即可训练并跑通全部脚本。
+#   pip install -r requirements.txt
+#
+# 树莓派（aarch64）注意：PyPI 没有 aarch64 的 tensorflow CPU wheel。
+# 训练请在开发机完成并导出 .tflite，树莓派上只装轻量解释器即可推理：
+#   pip install ai-edge-litert           # 新版官方轻量包（推荐）
+#   pip install tflite-runtime           # 旧包名，部分镜像仍可用
+#   pip install tensorflow-aarch64       # 社区轮子（可选，能跑完整 TF）
+#
+# 硬件读取额外依赖（树莓派）：
+#   smbus2、adafruit-blinka、adafruit-circuitpython-mlx90640
+# 注意：读取 MLX90640 必须 smbus2；只有 pygame 显示才需要 pygame，这里不需要。
+
+numpy>=1.24
+tensorflow>=2.16; platform_machine != "aarch64"
+smbus2>=0.4
+adafruit-blinka>=8.0
+adafruit-circuitpython-mlx90640>=1.3.0

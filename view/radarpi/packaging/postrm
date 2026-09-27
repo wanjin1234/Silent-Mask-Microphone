@@ -1,0 +1,35 @@
+#!/bin/sh
+# radarpi 卸载后：恢复被停用的 brltty 规则；purge 时清理数据与用户。
+set -e
+
+BRUTTLY_RULE="/usr/lib/udev/rules.d/85-brltty.rules"
+BRUTTLY_BAK="${BRUTTLY_RULE}.disabled-by-radarpi"
+
+case "$1" in
+remove|purge)
+    # 恢复 brltty 的 udev 规则
+    if [ -f "$BRUTTLY_BAK" ] && [ ! -f "$BRUTTLY_RULE" ]; then
+        mv "$BRUTTLY_BAK" "$BRUTTLY_RULE" 2>/dev/null || true
+        echo "radarpi: 已恢复 brltty 的 udev 规则。"
+    fi
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/radarpi 2>/dev/null || true
+    rm -rf /etc/radarpi 2>/dev/null || true
+    if getent passwd radarpi >/dev/null 2>&1; then
+        deluser radarpi >/dev/null 2>&1 || true
+    fi
+    if getent group radarpi >/dev/null 2>&1; then
+        delgroup radarpi >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

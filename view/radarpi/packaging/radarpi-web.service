@@ -1,0 +1,32 @@
+[Unit]
+Description=radarpi 4D imaging radar web console
+Documentation=file:///usr/share/doc/radarpi/README.md
+After=network-online.target
+Wants=network-online.target
+# 长期无人值守：允许无限次重启（串口没插时进程会自己重试，不需要 systemd 介入）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=radarpi
+Group=dialout
+WorkingDirectory=/var/lib/radarpi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/radarpi serve
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=radarpi
+
+# /etc/radarpi 允许写（网页里保存配置），/var/lib/radarpi 用于录制文件
+ReadWritePaths=/etc/radarpi /var/lib/radarpi
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

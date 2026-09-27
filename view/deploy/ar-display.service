@@ -1,0 +1,22 @@
+[Unit]
+Description=Silent Mask Microphone AR Display
+# Lite 无桌面：在 multi-user.target（多用户命令行）后启动即可
+Wants=pigpiod.service
+After=pigpiod.service multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wanghy25/arDisplay
+ExecStart=/home/wanghy25/arDisplay/run.sh
+Restart=on-failure
+RestartSec=3
+
+# 无 X 环境：让 SDL 用 KMSDRM 驱动直接渲染到 HDMI。
+# 若你的 SDL 编译不支持 kmsdrm（启动报 SDL 视频初始化失败），删掉下面这行让它自动检测。
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_AUDIODRIVER=dummy
+# 关键：venv 里的 python 运行环境（pip 装的 pygame/serial 都在这里）
+Environment=PATH=/home/wanghy25/arDisplay/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

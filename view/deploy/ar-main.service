@@ -1,0 +1,32 @@
+[Unit]
+Description=Silent Mask Microphone Integrated Display (radar + thermal + ultrasonic)
+# 依赖 pigpiod（超声波测距 + GPIO 开关用）
+Wants=pigpiod.service
+After=pigpiod.service multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wanghy25/arDisplay
+# 用 venv 里的 python 运行集成主程序（pygame/pigpio/smbus2 都装在这里）
+ExecStart=/home/wanghy25/arDisplay/venv/bin/python3 src/main_integrated.py
+Restart=on-failure
+RestartSec=3
+
+# 全屏输出（AR 眼镜单屏铺满）
+Environment=C4002_FULLSCREEN=1
+# 禁用 SDL 音频（无音频设备，避免初始化报错）
+Environment=SDL_AUDIODRIVER=dummy
+# venv python 运行环境
+Environment=PATH=/home/wanghy25/arDisplay/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# 热成像走软件 I2C（bus 3，需 /boot/firmware/config.txt 配 dtoverlay=i2c-gpio,bus=3）
+Environment=MLX90640_I2C_BUS=3
+# 雷达 keepalive 间隔（秒），防雷达固件挂死
+Environment=RADAR_KEEPALIVE=3
+
+# 显示驱动说明：
+#   本机若已装 X 环境，用 x11；若纯终端直连 HDMI 且 pygame 已源码编译支持 KMSDRM，
+#   用 kmsdrm。若都不确定，删除下面这行让 pygame 自动检测（可能退化为 offscreen）。
+# Environment=SDL_VIDEODRIVER=x11
+
+[Install]
+WantedBy=multi-user.target
