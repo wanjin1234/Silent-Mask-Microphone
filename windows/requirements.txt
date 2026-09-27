@@ -1,0 +1,12 @@
+# 树莓派网络麦克风 · Windows 端需要的东西
+#
+# 安装（在 cmd 或 PowerShell 里执行，一次即可）：
+#     pip install -r requirements.txt
+# 国内网络慢时可以加镜像：
+#     pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 装完直接双击「启动.bat」，或者：
+#     python btmic_net_gui.py
+
+soundcard>=0.4.2
+numpy>=1.22

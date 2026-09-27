@@ -1,0 +1,16 @@
+# 运行/构建产物，不进版本库
+__pycache__/
+*.py[cod]
+*.pcm
+*.wav
+btmic_selftest.txt
+build/
+dist/
+*.spec
+
+# 本机界面设置（含设备名，运行后自动生成）
+windows/btmic_net_gui.json
+
+# 4G 模块的厂商资料（Luatools 139MB、固件包等，GitHub 单文件上限 100MB）。
+# 需要的话请到合宙官方下载：https://docs.openluat.com/air780eg/
+4G File/
