@@ -90,6 +90,44 @@ DEFAULT_CONF = {
 
 # ---- 与树莓派 net_bridge.py 完全一致的帧格式 ----
 MAGIC = b"BMND"
+
+# ---------------- G.711 μ-law（与树莓派桥脚本同一套实现） ----------------
+# 4G 一个方向只稳定跑 ~45KB/s，16kHz 单声道 PCM 要 32KB/s（贴着上限 → 队列堆积 →
+# 延迟一路上涨）。μ-law 把每个样本压成 8bit：语音带宽不变（16kHz 采样仍是 8kHz
+# 带宽）、数据减半。无状态逐样本查表，帧间不会失步。
+ULAW_BIAS = 0x84
+ULAW_CLIP = 32635
+_ULAW_DEC_TABLE = None
+
+
+def ulaw_encode(pcm_bytes):
+    np = _np_mod()
+    x = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.int32)
+    sign = np.where(x < 0, 0x80, 0)
+    m = np.minimum(np.abs(x), ULAW_CLIP) + ULAW_BIAS
+    e = np.floor(np.log2(np.maximum(m, 1))).astype(np.int32) - 7
+    np.clip(e, 0, 7, out=e)
+    mant = (m >> (e + 3)) & 0x0F
+    return ((~(sign | (e << 4) | mant)) & 0xFF).astype(np.uint8).tobytes()
+
+
+def ulaw_decode(data):
+    np = _np_mod()
+    global _ULAW_DEC_TABLE
+    if _ULAW_DEC_TABLE is None:
+        tab = []
+        for byte in range(256):
+            u = ~byte & 0xFF
+            sign, e, mant = u & 0x80, (u >> 4) & 0x07, u & 0x0F
+            v = (((mant << 3) + ULAW_BIAS) << e) - ULAW_BIAS
+            tab.append(-v if sign else v)
+        _ULAW_DEC_TABLE = np.array(tab, dtype="<i2")
+    return _ULAW_DEC_TABLE[np.frombuffer(data, dtype=np.uint8)].tobytes()
+
+
+def _np_mod():
+    import numpy
+    return numpy
 T_AUDIO = 1
 T_JSON = 2
 HEADER_LEN = 12
@@ -374,6 +412,13 @@ class BaseLink:
 
     # ---- 队列 ----
     def push_audio(self, payload, cap=None):
+        # 收到的是 μ-law 就先解码：下游（Player/录音）永远只处理 s16le，
+        # 编码只在网络这一层，管道逻辑完全不用改
+        if str(self.fmt.get("format") or "") == "ulaw" and payload:
+            try:
+                payload = ulaw_decode(payload)
+            except Exception:  # noqa: BLE001
+                pass
         with self.audio_lock:
             self.audio_q.append(payload)
             limit = cap or self.audio_cap
@@ -428,7 +473,12 @@ class BaseLink:
         raise NotImplementedError
 
     def send_audio(self, data):
-        """入队即返回（真正的发送在发送线程里做）。"""
+        """入队即返回（真正的发送在发送线程里做）。树莓派宣布 μ-law 就先编码。"""
+        if str(self.fmt.get("format") or "") == "ulaw" and data:
+            try:
+                data = ulaw_encode(data)
+            except Exception:  # noqa: BLE001
+                pass
         with self.audio_lock:
             self.tx_q.append(data)
             while len(self.tx_q) > self.tx_cap:
@@ -576,6 +626,9 @@ class TcpServerLink(BaseLink):
         self.send_ctrl({
             "t": "welcome", "ok": True, "peer": self.addr[0], "name": "windows",
             "ch": self.channel, "audio": fmt,
+            # 宣告本端支持的音频编码：树莓派看到 ulaw 才会切（数据减半、延迟更稳）。
+            # 注意这里必须如实上报——老版本没这一项，树莓派就继续用 PCM。
+            "codecs": ["s16le", "ulaw"],
         })
         self.on_hello(self, True)
         return True
@@ -1233,7 +1286,11 @@ class NetServer:
         self.on_stat()
         # 回一条 welcome：TCP 下是握手的应答，MQTT 下让树莓派不用干等下一次心跳
         link.send_ctrl({"t": "welcome", "ok": True, "name": "windows",
-                        "ch": link.channel, "peer": "windows"})
+                        "ch": link.channel, "peer": "windows",
+                        # 宣告本端支持的音频编码（数组里的 ulaw 让树莓派把数据减半）。
+                        # MQTT 模式的 welcome 就是从这一处发的——漏了这句，树莓派
+                        # 就永远切不到 μ-law（实测：只改了 TCP 那处，MQTT 下没生效）。
+                        "codecs": ["s16le", "ulaw"]})
         # 树莓派上线/换了格式：把当前滑块值推过去（麦克风增益），并重起播放/采集
         if link.channel == "up":
             if self.player is None or changed:
@@ -1293,11 +1350,14 @@ class NetServer:
             for link in list(self.links.values()):
                 if not link.handshaked:
                     continue
+                # 心跳/探测里都带上本端支持的编码：树莓派靠它决定切不切 μ-law，
+                # 而它可能只收到心跳就完成握手（只发一次 welcome 会漏掉）
+                caps = {"codecs": ["s16le", "ulaw"]}
                 if now - last_ping >= 2.0 and link.peer_online():
-                    link.send_ctrl({"t": "ping", "ts": int(now * 1000)})
+                    link.send_ctrl({"t": "ping", "ts": int(now * 1000), **caps})
                 else:
                     link.send_ctrl({"t": "hb", "peer": "windows",
-                                    "ts": int(now * 1000)})
+                                    "ts": int(now * 1000), **caps})
             if now - last_ping >= 2.0:
                 last_ping = now
             self.on_stat()

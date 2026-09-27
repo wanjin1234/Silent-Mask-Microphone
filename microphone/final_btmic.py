@@ -8912,6 +8912,61 @@ def make_link(args, channel):
 
 NET_RETRY_SECS = float(os.environ.get("NET_RETRY_SECS", "4"))
 
+# 音频编码：auto（默认）= 电脑端支持 μ-law 就用（数据减半，4G 上延迟更稳）；
+# pcm = 永远用 16bit PCM；ulaw = 强制 μ-law（电脑端不支持会明确拒绝）
+NET_CODEC = os.environ.get("NET_CODEC", "auto").strip().lower()
+
+
+def apply_codec_choice(link, fmt, verbose=True):
+    """握手后按电脑端宣告的能力决定音频编码。
+
+    电脑端在 welcome 里报 `codecs`（新版会报 ["s16le","ulaw"]）。支持 μ-law 就
+    重新宣告一次格式并切过去——电脑端收到新的 hello 会按新格式重起采集/播放
+    （两边都只在**确认对方支持**时才切换，所以老版电脑端程序不会被打乱）。
+    """
+    if NET_CODEC == "pcm":
+        return fmt
+    if getattr(link, "kind", "") != "mqtt" and NET_CODEC != "ulaw":
+        # 只在 MQTT（4G/公网中继）上启用：TCP 直连是局域网，带宽充足，
+        # 压缩没收益却多一层出错面（实测 TCP 下协商后音质反而不对）
+        return fmt
+    info = link.info if isinstance(getattr(link, "info", None), dict) else {}
+    codecs = info.get("codecs") or []
+    if not codecs:
+        # 握手可能只收到电脑的心跳（旧式 hb 里不带 codecs）。再等 3 秒看有没有
+        # 带 codecs 的控制帧——电脑端的心跳/欢迎都会带（新版本）。等不到就用 PCM，
+        # 老版电脑端因此完全不受影响。
+        deadline = time.time() + 3.0
+        while not codecs and time.time() < deadline and link.alive():
+            obj = link.recv_ctrl(timeout=0.3)
+            if not obj:
+                continue
+            if obj.get("codecs"):
+                codecs = obj["codecs"]
+                link.info = obj
+                break
+            if obj.get("t") == "hello" and isinstance(obj.get("audio"), dict)                     and obj["audio"].get("codecs"):
+                codecs = obj["audio"]["codecs"]
+                break
+    if NET_CODEC == "ulaw" and not codecs:
+        log("!! 强制 μ-law，但电脑端没报支持的编码：仍按 μ-law 发（电脑端必须是新版）")
+    elif "ulaw" not in codecs:
+        if NET_CODEC == "ulaw":
+            log("!! 电脑端不支持 μ-law（codecs=%s）：改回 PCM" % (codecs or "未上报"))
+        return fmt
+    new = fmt.with_codec("ulaw")
+    try:
+        link.send_ctrl({"t": "hello", "ver": 1, "ch": link.channel, "name": link.name,
+                        "token": link.token, "audio": new.as_dict()})
+    except OSError:
+        return fmt
+    if verbose:
+        kbps_old = fmt.bytes_per_ms * 8 * 1000 / 1024.0 / 8.0
+        kbps_new = new.bytes_per_ms * 8 * 1000 / 1024.0 / 8.0
+        log("音频改用 μ-law（数据 %.0f → %.0f KB/s，语音带宽不变）"
+            % (fmt.bytes_per_ms / 1024.0 * 1000, new.bytes_per_ms / 1024.0 * 1000))
+    return new
+
 
 def connect_with_retry(args, channel, fmt, stop=None, feof=None):
     """连到 Windows 端（握手成功才返回 link）；连不上就一直等。
@@ -8953,24 +9008,75 @@ def connect_with_retry(args, channel, fmt, stop=None, feof=None):
 # ---------------- 音频格式 ----------------
 
 
+# G.711 μ-law：把 16bit 压成 8bit，**数据减半、语音带宽不变**。
+# 为什么需要它：4G 一个方向实测只稳定跑 ~45KB/s，而 16kHz 单声道 PCM 就要 32KB/s
+# （贴着上限跑，一有波动就堆队列 → 电脑端看到的"延迟一路上涨"）。μ-law 是标准电话
+# 编码：16kHz 采样下语音带宽仍是 8kHz（听感几乎不变），数据只要 16KB/s，链路占用
+# 降到 ~35%。它无状态（逐样本查表），不会像 ADPCM 那样帧间失步，出错也不会"越滚越坏"。
+ULAW_BIAS = 0x84
+ULAW_CLIP = 32635
+_ULAW_DEC_TABLE = None
+
+
+def ulaw_encode(pcm_bytes):
+    """s16le → μ-law（逐样本，无状态）。"""
+    import numpy as np
+
+    x = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.int32)
+    sign = np.where(x < 0, 0x80, 0)
+    m = np.minimum(np.abs(x), ULAW_CLIP) + ULAW_BIAS
+    # 段号：m < 256 → 0，之后按 2 的幂分 7 段（ITU G.711 的 exp_lut 规则）。
+    # 注意别用"重构值表"当段边界（那是解码侧用的）：用错了静音会解出 260、
+    # SNR 只剩 12dB（实测踩过）。
+    e = np.floor(np.log2(np.maximum(m, 1))).astype(np.int32) - 7
+    np.clip(e, 0, 7, out=e)
+    mant = (m >> (e + 3)) & 0x0F
+    return ((~(sign | (e << 4) | mant)) & 0xFF).astype(np.uint8).tobytes()
+
+
+def ulaw_decode(data):
+    """μ-law → s16le。"""
+    import numpy as np
+
+    global _ULAW_DEC_TABLE
+    if _ULAW_DEC_TABLE is None:
+        tab = []
+        for byte in range(256):
+            u = ~byte & 0xFF
+            sign, e, mant = u & 0x80, (u >> 4) & 0x07, u & 0x0F
+            v = (((mant << 3) + ULAW_BIAS) << e) - ULAW_BIAS
+            tab.append(-v if sign else v)
+        _ULAW_DEC_TABLE = np.array(tab, dtype="<i2")
+    idx = np.frombuffer(data, dtype=np.uint8)
+    return _ULAW_DEC_TABLE[idx].tobytes()
+
+
 class Fmt:
-    def __init__(self, rate, channels, frame_ms):
+    def __init__(self, rate, channels, frame_ms, codec="s16le"):
         self.rate = max(1, int(rate))
         self.channels = max(1, int(channels))
         self.frame_ms = max(5, int(frame_ms))
-        self.frame_bytes = int(self.rate * self.frame_ms / 1000) * self.channels * 2
-        self.bytes_per_ms = self.rate * self.channels * 2 / 1000.0
+        self.codec = codec if codec in ("s16le", "ulaw") else "s16le"
+        self.sample_bytes = 1 if self.codec == "ulaw" else 2
+        self.frame_bytes = (
+            int(self.rate * self.frame_ms / 1000) * self.channels * self.sample_bytes
+        )
+        self.bytes_per_ms = self.rate * self.channels * self.sample_bytes / 1000.0
 
     def as_dict(self):
         return {
             "rate": self.rate, "channels": self.channels,
             "frame_ms": self.frame_ms, "frame_bytes": self.frame_bytes,
-            "format": "s16le",
+            "format": self.codec,
         }
 
+    def with_codec(self, codec):
+        return Fmt(self.rate, self.channels, self.frame_ms, codec)
+
     def __str__(self):
-        return "%d Hz %d ch %dms（%d 字节/帧）" % (
-            self.rate, self.channels, self.frame_ms, self.frame_bytes)
+        return "%d Hz %d ch %dms %s（%d 字节/帧）" % (
+            self.rate, self.channels, self.frame_ms,
+            "μ-law" if self.codec == "ulaw" else "PCM", self.frame_bytes)
 
 
 # ---------------- 增益控制（Windows 侧音量 → 树莓派采集增益） ----------------
@@ -9006,6 +9112,7 @@ def run_send(args):
     if link is None:
         write_status(args.status_file, state="stopped", transport=args.transport)
         _exit_cleanly()
+    fmt = apply_codec_choice(link, fmt)     # 电脑端支持就切 μ-law（数据减半）
     q = deque()
     q_lock = threading.Lock()
     st = {"read": 0, "sent": 0, "dropped": 0, "bytes": 0}
@@ -9042,7 +9149,12 @@ def run_send(args):
     # 不控速时，积压会"一口气全发出去"形成突发，公共 broker 对突发常常直接
     # 丢弃（实测：本地 sent=66 全部成功、对端只收到 45），匀速发 + 队列吸收
     # 卡顿才是稳的
-    pace = fmt.frame_ms / 1500.0
+    # 发送节拍：**正常按一帧的时长**（frame_ms），只有已经落后时才允许 1.5 倍追赶。
+    # 这里原来写的是 `pace = frame_ms/1.5` 并且每帧 `next_send += pace`——那等于
+    # 长期按 1.5 倍速发：电脑端收到 1.5 倍数据，播放队列顶到上限、丢三分之一，
+    # 链路也多占 50%（实测踩过：电脑端收到 7.5 帧/秒、音频内容 0.75 倍速）。
+    frame_dur = fmt.frame_ms / 1000.0
+    catch_up = frame_dur / 1.5
     next_send = time.time()
     while not stop.is_set():
         if not link.alive():
@@ -9051,6 +9163,7 @@ def run_send(args):
             link = connect_with_retry(args, "up", fmt, stop=stop, feof=feof)
             if link is None:
                 break
+            next_send = time.time()      # 重连后重新对表，不补发断线期间的音频
             continue
         with q_lock:
             frame = q.popleft() if q else None
@@ -9063,9 +9176,12 @@ def run_send(args):
                 time.sleep(min(wait, 0.05))
                 continue
             now = time.time()
-            next_send = max(next_send + pace, now)
+            step = catch_up if now - next_send > frame_dur else frame_dur
+            next_send = max(next_send + step, now)
             try:
-                ok = link.send_audio(frame)
+                # 网络上走 μ-law（如果协商成功）：编码只在这一处，下游全是 s16le
+                ok = link.send_audio(
+                    ulaw_encode(frame) if fmt.codec == "ulaw" else frame)
             except OSError as exc:
                 log("发送失败：%s" % exc)
                 break
@@ -9130,6 +9246,8 @@ def run_recv(args):
     if link is None:
         write_status(args.status_file, state="stopped", transport=args.transport)
         _exit_cleanly()
+    fmt = apply_codec_choice(link, fmt)     # 电脑端会按新格式编码发过来
+    log("下行接收：音频 %s" % fmt)
 
     out = sys.stdout.buffer
     try:
@@ -9144,7 +9262,9 @@ def run_recv(args):
     target_frames = max(1, int(round(float(args.jitter_ms) / fmt.frame_ms)))
     max_frames = max(target_frames + 1,
                      int(round(float(args.max_latency_ms) / fmt.frame_ms)))
-    silent = b"\x00" * fmt.frame_bytes
+    # 静音填充按 s16le 的帧长：下游（重采样/电平表/aplay）都是 s16le 管道，
+    # 用 μ-law 的 frame_bytes（只有一半）补出来的静音会短一半
+    silent = b"\x00" * (int(fmt.rate * fmt.frame_ms / 1000) * fmt.channels * 2)
     q = deque()
     st = {"recv": 0, "played": 0, "dropped": 0, "starved": 0, "bytes": 0}
     playing = False
@@ -9164,6 +9284,8 @@ def run_recv(args):
             continue
         data = link.recv_audio(timeout=0.02)
         if data is not None:
+            if fmt.codec == "ulaw":          # 解码只在这一处，下游全是 s16le
+                data = ulaw_decode(data)
             q.append(data)
             st["recv"] += 1
             last_audio = time.time()
@@ -9213,8 +9335,12 @@ def run_recv(args):
                 break
             st["played"] += 1
             st["bytes"] += len(frame)
-            # 按"实际收到的时长"推进：即便电脑端帧长与约定不一致，也不会越走越偏
-            next_due += max(5, len(frame)) / fmt.bytes_per_ms / 1000.0
+            # 按"这一帧代表多少音频时长"推进：即便电脑端帧长与约定不一致，也不会
+            # 越走越偏。**必须用解码后的字节数算**（PCM 每样本 2 字节）：用编码后的
+            # bytes_per_ms 时，μ-law 会把每帧当成两倍时长 → 播放速度减半、抖动缓冲
+            # 堆满丢一半帧（实测踩过：听到的是"慢一半 + 断续"）。
+            pcm_bytes_per_ms = fmt.rate * fmt.channels * 2 / 1000.0
+            next_due += max(5, len(frame)) / pcm_bytes_per_ms / 1000.0
             if next_due < now - 1.0:
                 next_due = now  # 落后超过 1 秒就重新对表，不追补历史
         if now - last_stat >= 1.0:
